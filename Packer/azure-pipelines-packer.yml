@@ -1,0 +1,109 @@
+# HPC Image Builder Pipeline
+# Author: ian-treleaven-outlook
+# Date: 2025-10-23
+# Description: Build HPC images using ADO pipeline (no SP needed)
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - '*.pkr.hcl'
+    - 'scripts/**'
+    - 'azure-pipelines-packer.yml'
+
+pr: none
+
+parameters:
+  - name: buildTarget
+    displayName: 'Build Target'
+    type: string
+    default: 'azure'
+    values:
+      - azure
+      - docker
+      
+  - name: osFamily
+    displayName: 'OS Family'
+    type: string
+    default: 'ubuntu'
+    values:
+      - ubuntu
+      - alma
+      - azurelinux
+      
+  - name: osVersion
+    displayName: 'OS Version'
+    type: string
+    default: '22.04'
+    
+  - name: gpuType
+    displayName: 'GPU Type'
+    type: string
+    default: 'nvidia-a100'
+    values:
+      - none
+      - nvidia-a100
+      - nvidia-h100
+      - amd-mi300x
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  PACKER_VERSION: '1.11.0'
+  AZURE_RESOURCE_GROUP: 'hpc-images-rg'
+  AZURE_IMAGE_GALLERY: 'HPCImageGallery'
+
+jobs:
+- job: PackerBuild
+  displayName: 'Build ${{ parameters.osFamily }} ${{ parameters.osVersion }} - ${{ parameters.gpuType }}'
+  timeoutInMinutes: 90
+  
+  steps:
+  - checkout: self
+    
+  - task: Bash@3
+    displayName: 'Install Packer'
+    inputs:
+      targetType: 'inline'
+      script: |
+        wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip
+        unzip -q packer_${PACKER_VERSION}_linux_amd64.zip
+        sudo mv packer /usr/local/bin/
+        packer version
+        
+  - task: Bash@3
+    displayName: 'Initialize Packer'
+    inputs:
+      targetType: 'inline'
+      script: packer init hpc.pkr.hcl
+      
+  - task: AzureCLI@2
+    displayName: 'Build Image'
+    inputs:
+      azureSubscription: 'HPCScrub1_ServiceConn'  # Your existing connection
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Setup Azure resources
+        az group create --name "$(AZURE_RESOURCE_GROUP)" --location eastus || true
+        az sig create --resource-group "$(AZURE_RESOURCE_GROUP)" --gallery-name "$(AZURE_IMAGE_GALLERY)" || true
+        
+        # Export credentials for Packer
+        export ARM_CLIENT_ID="${servicePrincipalId}"
+        export ARM_CLIENT_SECRET="${servicePrincipalKey}"
+        export ARM_TENANT_ID="${tenantId}"
+        export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+        
+        # Run Packer build
+        packer build \
+          -var "build_target=${{ parameters.buildTarget }}" \
+          -var "os_family=${{ parameters.osFamily }}" \
+          -var "os_version=${{ parameters.osVersion }}" \
+          -var "gpu_type=${{ parameters.gpuType }}" \
+          -var "azure_resource_group=$(AZURE_RESOURCE_GROUP)" \
+          -var "azure_image_gallery=$(AZURE_IMAGE_GALLERY)" \
+          hpc.pkr.hcl
+      addSpnToEnvironment: true
