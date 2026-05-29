@@ -75,3 +75,4 @@ fi
 export COMPONENT_VERSIONS=$(jq -r . $TOP_DIR/versions.json)
 
 source ${UTILS_DIR}/utilities.sh
+source ${UTILS_DIR}/logger.sh 
