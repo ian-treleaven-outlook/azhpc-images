@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# Short-flag implementation of the azhpc CLI spec.
+#!/bin/bash
+# Long-flag implementation of the azhpc CLI spec.
 
 set -euo pipefail
 
