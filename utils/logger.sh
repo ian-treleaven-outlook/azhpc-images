@@ -19,16 +19,33 @@
 : "${LOG_FILE:=}"
 : "${RUN_ID:=${BUILD_BUILDID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo unknown)}}"
 : "${IMPLEMENTATION:=bash}"
+: "${VERSION:=}"
+: "${BUILD_COMMIT:=}"
+: "${VENDOR:=}"
+: "${GPU:=}"
+: "${OS:=}"
+: "${FIPS:=false}"
 
 if [[ -z "${LOG_FORMAT}" ]]; then
     if [[ -t 1 ]]; then LOG_FORMAT=text; else LOG_FORMAT=json; fi
 fi
 
+# Redact known token-shaped values
+_redact(){
+    local s=$1
+    # Bearer tokens in URLs / headers
+    s=$(echo "$s" | sed -E 's#(bearer[[:space:]]+)[A-Za-z0-9._\-]+#\1[REDACTED]#gi')
+    # Common token-shaped query params
+    s=$(echo "$s" | sed -E 's#((sig|sas|token|key)=)[A-Za-z0-9._%\-]+#\1[REDACTED]#gi')
+    printf '%s' "$s"
+}
+
 # Internal: emit a single log record. Callers should use log_info/warn/debug/error.
 _log(){
     local level=$1
     local op=$2
-    local message=$3
+    local message
+    message=$(_redact "$3")
 
     if [[ "${level}" = "debug" && "${LOG_LEVEL}" != "debug" ]]; then
         return 0
@@ -46,11 +63,20 @@ _log(){
             --arg msg "${message}" \
             --arg run_id "${RUN_ID}" \
             --arg impl "${IMPLEMENTATION}" \
-            '{ts:$ts, level:$level, op:$op, msg:$msg, run_id:$run_id, implementation:$impl}')
+            --arg version "${VERSION}" \
+            --arg commit "${BUILD_COMMIT}" \
+            --arg vendor "${VENDOR}" \
+            --arg gpu "${GPU}" \
+            --arg os_name "${OS}" \
+            --argjson fips "${FIPS}" \
+            '{ts:$ts, level:$level, op:$op, msg:$msg,
+            run_id:$run_id, implementation:$impl,
+            version:$version, commit:$commit,
+            vendor:$vendor, gpu:$gpu, os:$os_name, fips:$fips}')
     else
         local upper_level
         upper_level=$(echo "${level}" | tr '[:lower:]' '[:upper:]')
-        printf -v line '%s  %-5s  %-20s %s' "${ts}" "${upper_level}" "${op}" "${message}"
+        printf -v line '%s  %-5s  %-14s %s' "${ts}" "${upper_level}" "${op}" "${message}"
     fi
 
     printf '%s\n' "${line}"
@@ -94,4 +120,19 @@ log_debug(){
 ############################################################################
 log_error(){
     _log error "$1" "$2"
+}
+
+log_error_detail(){
+    # $1 op, $2 message, $3 multi-line stderr or stack
+    if [[ "${LOG_FORMAT}" = "json" ]]; then
+        # emit a richer record with the detail field
+        local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        jq -cn --arg ts "$ts" --arg op "$1" --arg msg "$(_redact "$2")" \
+               --arg detail "$(_redact "$3")" \
+            '{ts:$ts, level:"error", op:$op, msg:$msg, error_detail:$detail}'
+    else
+        log_error "$1" "$2"
+        # indent the detail so each line is visually distinct
+        printf '%s\n' "$3" | sed 's/^/    | /'
+    fi
 }

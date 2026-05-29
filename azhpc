@@ -17,6 +17,8 @@ verbose=false
 log_format=""
 show_version=false
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/utils/logger.sh"
+
 print_help() {
     cat <<'EOF'
 azhpc - Build HPC/AI Linux images for Azure
@@ -50,7 +52,7 @@ EOF
 }
 
 die() {
-    echo "azhpc: error: $*" >&2
+    log_error "cli" "$1"
     exit "${2:-1}"
 }
 
@@ -84,8 +86,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Display version info
 if [[ "$show_version" == true ]]; then
-    echo "azhpc $VERSION (commit $BUILD_COMMIT, built $BUILD_DATE)"
+    cat <<EOF
+azhpc $VERSION
+commit:  $BUILD_COMMIT
+built:   $BUILD_DATE
+runtime: GNU Bash ${BASH_VERSION%%(*}
+EOF
     exit 0
 fi
 
@@ -132,23 +140,23 @@ fi
 
 effective_spec="${spec:-<azhpc-images default versions.json>}"
 
-if [[ "$verbose" == true || "$dry_run" == true ]]; then
-    cat >&2 <<EOF
-Build plan:
-  vendor      = $vendor
-  gpu         = $gpu
-  os          = $os
-  fips        = $fips
-  spec        = $effective_spec
-  log_format  = $log_format
-  verbose     = $verbose
-  dry_run     = $dry_run
-EOF
+export VERSION BUILD_COMMIT VENDOR="$vendor" GPU="$gpu" OS="$os" FIPS="$fips"
+export LOG_FORMAT="$log_format"
+export RUN_ID
+export LOG_FILE="${LOG_FILE:-/tmp/azhpc-${RUN_ID}.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
+if [[ "$verbose" == true ]]; then 
+    export LOG_LEVEL=debug; 
 fi
 
+log_info "resolve-config" "Effective build: vendor=$vendor gpu=$gpu os=$os fips=$fips spec=$effective_spec"
+log_debug "resolve-config" "log_format=$log_format dry_run=$dry_run run_id=$RUN_ID"
+
 if [[ "$dry_run" == true ]]; then
+    log_info "dry-run" "Dry-run requested; not executing build steps"
     exit 0
 fi
 
-echo "azhpc: image built successfully (vendor=$vendor gpu=$gpu os=$os fips=$fips)"
-exit 0
+log_info "build-image" "Starting image build"
+# Build steps...
+log_info "build-image" "Image built successfully"
