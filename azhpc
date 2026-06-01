@@ -35,7 +35,8 @@ OPTIONS:
                               NVidia    : A100+ | GB200 | GB300 | VR200
                               AMD       : MI300 | MI400 | MI500
                               Microsoft : MAIA200
-    --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 | Alma9 | Nix25
+    --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
+                                       Alma9 | Alma8 | Rocky9 | Rocky8 
     --fips                  Build a FIPS-compliant image (default: non-FIPS)
     --dry-run               Validate args and print build plan; do not build
     -v, --verbose           Verbose (debug-level) logging
@@ -123,8 +124,8 @@ esac
 
 # OS validation
 case "$os" in
-    Ubuntu24|Ubuntu22|Azure3|Alma9|Nix25) ;;
-    *) die "unsupported os '$os' (Ubuntu24|Ubuntu22|Azure3|Alma9|Nix25)" 1 ;;
+    Ubuntu24|Ubuntu22|Azure3|Alma9|Alma8|Rocky9|Rocky8) ;;
+    *) die "unsupported os '$os' (Ubuntu24|Ubuntu22|Azure3|Alma9|Alma8|Rocky9|Rocky8)" 1 ;;
 esac
 
 # Log format default + validation
@@ -163,6 +164,33 @@ if [[ "$dry_run" == true ]]; then
     exit 0
 fi
 
-log_info "build-image" "Starting image build"
-# Build steps...
+# Translate CLI flags into install.sh inputs
+case "$os" in
+    Ubuntu24) distro_dir="distros/ubuntu24.04" ;;
+    Ubuntu22) distro_dir="distros/ubuntu22.04" ;;
+    Alma9)    distro_dir="distros/almalinux9.7" ;;
+    Alma8)    distro_dir="distros/almalinux8.10" ;;
+    Rocky9)   distro_dir="distros/rocky9.7" ;;
+    Rocky8)   distro_dir="distros/rocky8.10" ;;
+    Azure3)   distro_dir="distros/azurelinux3.0" ;;
+    *)        die "internal: no distro mapping for '$os'" 1 ;;
+esac
+
+case "$vendor" in
+    NVidia) gpu_arg="NVIDIA" ;;
+    AMD)    gpu_arg="AMD" ;;
+    # Microsoft path probably needs a different code path; ask Ian
+esac
+
+sku_arg="$gpu"  # CLI's "--gpu" value is the repo's SKU
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log_info "build-image" "Invoking $distro_dir/install.sh GPU=$gpu_arg SKU=$sku_arg"
+
+(
+    cd "$repo_root/$distro_dir"
+    ./install.sh "$gpu_arg" "$sku_arg"
+) || die "build failed in $distro_dir/install.sh" 3
+
 log_info "build-image" "Image built successfully"
