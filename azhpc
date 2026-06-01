@@ -31,9 +31,11 @@ USAGE:
 OPTIONS:
     --spec <PATH>           Path to versions.json (optional)
     --vendor <VENDOR>       Hardware vendor: NVidia | AMD 
-    --gpu <GPU>             GPU model. Valid values depend on --vendor:
-                              NVidia    : A100+ | GB200 | GB300 | VR200
-                              AMD       : MI300 | MI400 | MI500
+    --gpu <SKU>             Target GPU. Values with dedicated build paths
+                            are marked (*); others use the generic path.
+                                NVidia : GB200* | GB300* | NCv6* | V100*
+                                         A100 | H100 | H200 | VR200
+                                AMD    : MI300 | MI400 | MI500
     --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
                                        Alma9 | Alma8 | Rocky9 | Rocky8 
     --fips                  Build a FIPS-compliant image (default: non-FIPS)
@@ -111,12 +113,22 @@ fi
 # Vendor / GPU validation
 case "$vendor" in
     NVidia)
-        case "$gpu" in A100+|GB200|GB300|VR200) ;;
-            *) die "GPU '$gpu' not valid for vendor NVidia" 1 ;; esac ;;
+        case "$gpu" in
+            GB200|GB300|NCv6|V100|A100|H100|H200|VR200) ;;
+            *) die "GPU '$gpu' not valid for vendor NVidia" 1 ;;
+        esac ;;
     AMD)
-        case "$gpu" in MI300|MI400|MI500) ;;
-            *) die "GPU '$gpu' not valid for vendor AMD" 1 ;; esac ;;
+        case "$gpu" in
+            MI300|MI400|MI500) ;;
+            *) die "GPU '$gpu' not valid for vendor AMD" 1 ;;
+        esac ;;
     *) die "unsupported vendor '$vendor' (NVidia|AMD)" 1 ;;
+esac
+
+# Warn if the GPU doesn't have a dedicated build path
+case "$gpu" in
+    GB200|GB300|NCv6|V100) ;;  # dedicated path
+    *) log_warn "resolve-config" "SKU '$gpu' has no dedicated build path; using generic $vendor build" ;;
 esac
 
 # OS validation
@@ -179,7 +191,7 @@ case "$vendor" in
     *)      die "internal: no GPU arg mapping for vendor '$vendor'" 1 ;;
 esac
 
-sku_arg="$gpu"  # CLI's "--gpu" value is the repo's SKU
+sku_arg="$gpu" 
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
