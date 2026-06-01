@@ -30,11 +30,10 @@ USAGE:
 
 OPTIONS:
     --spec <PATH>           Path to versions.json (optional)
-    --vendor <VENDOR>       Hardware vendor: NVidia | AMD | Microsoft
+    --vendor <VENDOR>       Hardware vendor: NVidia | AMD 
     --gpu <GPU>             GPU model. Valid values depend on --vendor:
                               NVidia    : A100+ | GB200 | GB300 | VR200
                               AMD       : MI300 | MI400 | MI500
-                              Microsoft : MAIA200
     --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
                                        Alma9 | Alma8 | Rocky9 | Rocky8 
     --fips                  Build a FIPS-compliant image (default: non-FIPS)
@@ -117,9 +116,7 @@ case "$vendor" in
     AMD)
         case "$gpu" in MI300|MI400|MI500) ;;
             *) die "GPU '$gpu' not valid for vendor AMD" 1 ;; esac ;;
-    Microsoft)
-        [[ "$gpu" == "MAIA200" ]] || die "GPU '$gpu' not valid for vendor Microsoft" 1 ;;
-    *) die "unsupported vendor '$vendor' (NVidia|AMD|Microsoft)" 1 ;;
+    *) die "unsupported vendor '$vendor' (NVidia|AMD)" 1 ;;
 esac
 
 # OS validation
@@ -179,7 +176,7 @@ esac
 case "$vendor" in
     NVidia) gpu_arg="NVIDIA" ;;
     AMD)    gpu_arg="AMD" ;;
-    # Microsoft path probably needs a different code path; ask Ian
+    *)      die "internal: no GPU arg mapping for vendor '$vendor'" 1 ;;
 esac
 
 sku_arg="$gpu"  # CLI's "--gpu" value is the repo's SKU
