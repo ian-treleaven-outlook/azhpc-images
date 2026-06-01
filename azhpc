@@ -5,7 +5,7 @@ set -euo pipefail
 
 VERSION="0.1.0"
 BUILD_COMMIT="dev"
-BUILD_DATE="$(date -u +%Y-%m-%d)"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 spec=""
 vendor=""
@@ -17,6 +17,7 @@ verbose=false
 log_format=""
 show_version=false
 
+#Load the log functions
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/utils/logger.sh"
 
 print_help() {
@@ -62,7 +63,6 @@ need_value() {
     [[ $# -ge 2 && -n "${2:-}" && "${2:0:1}" != "-" ]] \
         || die "option $1 requires an argument" 1
 }
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --spec)         need_value "$@"; spec="$2"; shift 2 ;;
@@ -88,15 +88,21 @@ done
 
 # Display version info
 if [[ "$show_version" == true ]]; then
+    bash_short="${BASH_VERSION%%(*}"
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64)  arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+    esac
+    platform="$(uname -s | tr '[:upper:]' '[:lower:]')/${arch}"
     cat <<EOF
-azhpc $VERSION
-commit:  $BUILD_COMMIT
-built:   $BUILD_DATE
-runtime: GNU Bash ${BASH_VERSION%%(*}
+azhpc $VERSION (bash${bash_short}, ${platform})
+  commit:   $BUILD_COMMIT
+  built:    $BUILD_DATE
+  runtime:  GNU Bash ${bash_short}
 EOF
     exit 0
 fi
-
 # Required args
 [[ -n "$vendor" ]] || die "--vendor is required" 1
 [[ -n "$gpu"    ]] || die "--gpu is required" 1
