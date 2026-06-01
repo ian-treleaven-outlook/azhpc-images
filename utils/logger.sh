@@ -122,17 +122,24 @@ log_error(){
     _log error "$1" "$2"
 }
 
+############################################################################
+# @Brief    : Log an ERROR-level message together with a multi-line detail
+#             block (e.g. captured stderr or a stack trace). In JSON mode the
+#             detail is emitted as an `error_detail` field on the record; in
+#             text mode the detail is printed below the error, indented.
+# @Args     : (1) op       Operation name in kebab-case
+#             (2) message  Single-line summary of the error
+#             (3) detail   Multi-line stderr or stack trace
+# @RetVal   : 0
+############################################################################
 log_error_detail(){
-    # $1 op, $2 message, $3 multi-line stderr or stack
     if [[ "${LOG_FORMAT}" = "json" ]]; then
-        # emit a richer record with the detail field
         local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         jq -cn --arg ts "$ts" --arg op "$1" --arg msg "$(_redact "$2")" \
                --arg detail "$(_redact "$3")" \
             '{ts:$ts, level:"error", op:$op, msg:$msg, error_detail:$detail}'
     else
         log_error "$1" "$2"
-        # indent the detail so each line is visually distinct
         printf '%s\n' "$3" | sed 's/^/    | /'
     fi
 }
