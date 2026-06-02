@@ -128,7 +128,7 @@ esac
 # Warn if the GPU doesn't have a dedicated build path
 case "$gpu" in
     GB200|GB300|NCv6|V100) ;;  # dedicated path
-    *) log_warn "resolve-config" "SKU '$gpu' has no dedicated build path; using generic $vendor build" ;;
+    *) log_warn "resolve-config" "GPU '$gpu' has no dedicated build path; using generic $vendor build" ;;
 esac
 
 # OS validation
@@ -195,8 +195,9 @@ sku_arg="$gpu"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-log_info "build-image" "Invoking $distro_dir/install.sh GPU=$gpu_arg SKU=$sku_arg"
+log_info "build-image" "Invoking $distro_dir/install.sh GPU=$gpu_arg GPU=$sku_arg"
 
+# Build the image
 (
     cd "$repo_root/$distro_dir"
     ./install.sh "$gpu_arg" "$sku_arg"
