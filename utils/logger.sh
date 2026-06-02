@@ -76,12 +76,30 @@ _log(){
     else
         local upper_level
         upper_level=$(echo "${level}" | tr '[:lower:]' '[:upper:]')
-        printf -v line '%s  %-5s  %-14s %s' "${ts}" "${upper_level}" "${op}" "${message}"
+
+        # Short HH:MM:SS for terminal; full ISO ts kept for the file
+        local ts_short=${ts:11:8}
+
+        # Colorize the level only when stdout is a TTY
+        local lvl_pretty="${upper_level}"
+        if [[ -t 1 ]]; then
+            local c_reset=$'\e[0m'
+            case "${level}" in
+                debug) lvl_pretty=$'\e[2;37m'"${upper_level}${c_reset}" ;;  # dim grey
+                info)  lvl_pretty=$'\e[36m'"${upper_level}${c_reset}"   ;;  # cyan
+                warn)  lvl_pretty=$'\e[33m'"${upper_level}${c_reset}"   ;;  # yellow
+                error) lvl_pretty=$'\e[31m'"${upper_level}${c_reset}"   ;;  # red
+            esac
+        fi
+
+        printf -v line     '%s  %-14b  %-14s | %s' "${ts_short}" "${lvl_pretty}" "${op}" "${message}"
+        printf -v line_raw '%s  %-5s  %-14s | %s' "${ts}"        "${upper_level}" "${op}" "${message}"
     fi
 
     printf '%s\n' "${line}"
     if [[ -n "${LOG_FILE}" ]]; then
-        printf '%s\n' "${line}" >> "${LOG_FILE}"
+        # File gets the uncolored, full-timestamp version
+        printf '%s\n' "${line_raw:-$line}" >> "${LOG_FILE}"
     fi
 }
 
