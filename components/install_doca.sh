@@ -48,7 +48,7 @@ PIN
     # We deliberately do not touch `libopenmpi3` at all: on AMD/ROCm builds,
     # `libopenmpi3t64` is already installed (indirect dep of mivisionx-dev) and
     # provides it. Same pattern as ucx-provides-libucx0 in install_rocm.sh.
-    apt-get install -y equivs
+    DEBIAN_FRONTEND=noninteractive apt-get install -y equivs
     openmpi_version=$(apt-cache show openmpi 2>/dev/null | awk '/^Version:/ {print $2; exit}')
     if [[ -z "$openmpi_version" ]]; then
         echo "ERROR: could not read openmpi version from DOCA repo" >&2
@@ -80,7 +80,10 @@ EOF
     )
     rm -f /tmp/hpcx-provides-openmpi_*_all.deb /tmp/hpcx-provides-openmpi
 
-    apt-get -y install doca-ofed
+    DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        install doca-ofed
 elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
     rpm -i $DOCA_FILE
     dnf clean all

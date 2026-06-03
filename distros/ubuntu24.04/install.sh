@@ -9,6 +9,9 @@ fi
 
 export GPU=$1
 export SKU=$2
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
 
 if [[ "$#" -gt 0 ]]; then
    if [[ "$GPU" != "NVIDIA" && "$GPU" != "AMD" ]]; then
