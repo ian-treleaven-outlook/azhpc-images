@@ -2,6 +2,9 @@
 set -ex
 
 source ${UTILS_DIR}/utilities.sh
+source ${UTILS_DIR}/logger.sh
+
+log_info install-doca "starting DOCA-OFED installation for ${DISTRIBUTION} (${ARCHITECTURE})"
 
 doca_metadata=$(get_component_config "doca")
 DOCA_VERSION=$(jq -r '.version' <<< $doca_metadata)
@@ -9,10 +12,16 @@ DOCA_SHA256=$(jq -r '.sha256' <<< $doca_metadata)
 DOCA_URL=$(jq -r '.url' <<< $doca_metadata)
 DOCA_FILE=$(basename ${DOCA_URL})
 
+log_info install-doca "target DOCA version ${DOCA_VERSION}"
+log_debug install-doca "package URL ${DOCA_URL}"
+
+log_info install-doca "downloading and verifying DOCA package"
 download_and_verify $DOCA_URL $DOCA_SHA256
 
 if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
+    log_info install-doca "installing DOCA on Ubuntu via apt"
     dpkg -i $DOCA_FILE
+    log_info install-doca "registered DOCA-HOST apt repository"
 
     # we prefer distro-shipped dkms and ignore the one from DOCA, unless there is evidence to the contrary
     cat > /etc/apt/preferences.d/doca-dkms-pin <<PIN
@@ -20,7 +29,9 @@ Package: dkms
 Pin: release l=DOCA-HOST*
 Pin-Priority: -1
 PIN
+    log_info install-doca "pinned distro-shipped dkms over DOCA-HOST dkms"
 
+    log_info install-doca "refreshing apt package index"
     apt-get update
 
     # Install a single equivs marker package telling apt that HPC-X provides Open MPI,
@@ -48,10 +59,11 @@ PIN
     # We deliberately do not touch `libopenmpi3` at all: on AMD/ROCm builds,
     # `libopenmpi3t64` is already installed (indirect dep of mivisionx-dev) and
     # provides it. Same pattern as ucx-provides-libucx0 in install_rocm.sh.
+    log_info install-doca "building hpcx-provides-openmpi marker (blocks DOCA's openmpi.deb and Canonical openmpi)"
     DEBIAN_FRONTEND=noninteractive apt-get install -y equivs
     openmpi_version=$(apt-cache show openmpi 2>/dev/null | awk '/^Version:/ {print $2; exit}')
     if [[ -z "$openmpi_version" ]]; then
-        echo "ERROR: could not read openmpi version from DOCA repo" >&2
+        log_error install-doca "could not read openmpi version from DOCA repo"
         exit 1
     fi
     cat > /tmp/hpcx-provides-openmpi <<EOF
@@ -80,21 +92,26 @@ EOF
     )
     rm -f /tmp/hpcx-provides-openmpi_*_all.deb /tmp/hpcx-provides-openmpi
 
+    log_info install-doca "installing doca-ofed metapackage (MOFED userspace + kernel modules)"
     DEBIAN_FRONTEND=noninteractive apt-get -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
         install doca-ofed
 elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
+    log_info install-doca "installing DOCA on Azure Linux 3.0 via dnf"
     rpm -i $DOCA_FILE
     dnf clean all
+    log_info install-doca "installing doca-ofed metapackage"
     dnf -y install doca-ofed
 else
+    log_info install-doca "installing DOCA on RHEL-family via dnf"
     # RHEL-family: AlmaLinux, Rocky Linux, RHEL, etc.
     rpm -i $DOCA_FILE
     dnf clean all
 
     # Backup
     cp /etc/dnf/dnf.conf /etc/dnf/dnf.conf.bak
+    log_debug install-doca "temporarily clearing global dnf excludes for doca-ofed install"
     sed -i '/^exclude=/d' /etc/dnf/dnf.conf
     dnf -y install doca-ofed
     # Restore exclusion
@@ -120,7 +137,7 @@ else
             | awk '$2 ~ /^doca/ {print $1}' | sort -u
     )
     if [[ ${#doca_pkgs[@]} -eq 0 ]]; then
-        echo "ERROR: no packages found from doca* repos after doca-ofed install" >&2
+        log_error install-doca "no packages found from doca* repos after doca-ofed install"
         exit 1
     fi
     mapfile -t baseos_pkgs < <(
@@ -132,7 +149,7 @@ else
             <(printf '%s\n' "${baseos_pkgs[@]}")
     )
     if [[ ${#baseos_conflicts[@]} -gt 0 ]]; then
-        echo "Pinning ${#baseos_conflicts[@]} baseos package(s) shadowed by DOCA: ${baseos_conflicts[*]}"
+        log_warn install-doca "pinning ${#baseos_conflicts[@]} baseos package(s) shadowed by DOCA: ${baseos_conflicts[*]}"
         dnf config-manager --save \
             --setopt="baseos.excludepkgs=${baseos_conflicts[*]}" \
             >/dev/null
@@ -142,6 +159,7 @@ fi
 write_component_version "DOCA" $DOCA_VERSION
 OFED_VERSION=$(ofed_info | sed -n '1,1p' | awk -F'-' 'OFS="-" {print $3,$4}' | tr -d ':')
 write_component_version "OFED" $OFED_VERSION
+log_info install-doca "installed DOCA ${DOCA_VERSION} (OFED ${OFED_VERSION})"
 
 # Create systemd drop-in configuration for openibd.service
 # This adds restart on failure and ensures it starts after udev settles
@@ -155,9 +173,11 @@ Wants=systemd-udev-settle.service
 Restart=on-failure
 RestartSec=5
 EOF
+log_info install-doca "configured openibd.service drop-in (restart-on-failure, after udev settle)"
 
 if [[ "${NODE_TYPE:-azure-vm}" == "baremetal" ]]; then
     echo -e "\n# Load IPoIB\nIPOIB_LOAD=no" | sudo tee -a /etc/infiniband/openib.conf
+    log_info install-doca "baremetal node: disabled IPoIB autoload"
 fi
 
 # Enable only; do not restart at build time. Restarting openibd here probes
@@ -165,3 +185,6 @@ fi
 # SKUs) and is not required before possible tests post-reboot.
 systemctl daemon-reload
 systemctl enable openibd
+
+log_info install-doca "enabled openibd; deferring start until post-reboot"
+log_info install-doca "DOCA-OFED installation complete"
