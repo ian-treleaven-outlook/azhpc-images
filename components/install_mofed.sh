@@ -2,8 +2,12 @@
 set -ex
 
 source ${UTILS_DIR}/utilities.sh
+source ${UTILS_DIR}/logger.sh
+
+log_info install-mofed "starting MOFED installation for ${DISTRIBUTION} (${ARCHITECTURE})"
 
 if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
+    log_info install-mofed "installing MOFED build dependencies (kernel headers, dev libs)"
     # Packages for MOFED
     tdnf install -y iptables-devel \
         libdb-devel \
@@ -19,8 +23,9 @@ if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
         lsof \
         automake \
         autoconf
-    
+
     if [ "$ARCHITECTURE" = "aarch64" ]; then
+        log_info install-mofed "installing mlnx-ofa kernel modules (aarch64 / HWE variant)"
         tdnf install -y mlnx-ofa_kernel \
                     mlnx-ofa_kernel-hwe-modules \
                     mlnx-ofa_kernel-hwe-devel \
@@ -35,6 +40,7 @@ if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
                     xpmem \
                     xpmem-hwe-modules
     else
+        log_info install-mofed "installing mlnx-ofa kernel modules (x86_64 / standard variant)"
         tdnf install -y mlnx-ofa_kernel \
                     mlnx-ofa_kernel-modules \
                     mlnx-ofa_kernel-devel \
@@ -48,9 +54,9 @@ if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
                     srp \
                     xpmem \
                     xpmem-modules
-    fi     
+    fi
 
-
+    log_info install-mofed "installing MOFED userspace libraries (libibverbs, librdmacm, ucx, perftest, etc.)"
     tdnf install -y libibumad \
                     infiniband-diags \
                     libibverbs \
@@ -102,9 +108,9 @@ SOURCE_VERSION=$(ofed_info | sed -n '1,1p' | awk -F'-' 'OFS="-" {print $3,$4}' |
 # SOURCE_VERSION refers to the upstream Mellanox source version, as reported by ofed_info.
 #   - Example: "0.7.0"
 #
-echo "INSTALLED MOFED!! Release Version: ${MOFED_VERSION}, Source Version: ${SOURCE_VERSION}"
+log_info install-mofed "installed MOFED release ${MOFED_VERSION} (upstream source ${SOURCE_VERSION})"
 
-# Sanity check consumes the source package version printed by ofed_info. 
+# Sanity check consumes the source package version printed by ofed_info.
 # Therefore, though we use release version in versions.json for tdnf install, we need to write the SOURCE_VERSION to the component version file.
 write_component_version "OFED" $SOURCE_VERSION
 
@@ -120,6 +126,10 @@ Wants=systemd-udev-settle.service
 Restart=on-failure
 RestartSec=5
 EOF
+log_info install-mofed "configured openibd.service drop-in (restart-on-failure, after udev settle)"
 
 systemctl daemon-reload
 systemctl enable openibd
+
+log_info install-mofed "enabled openibd; deferring start until post-reboot"
+log_info install-mofed "MOFED installation complete"
