@@ -2,6 +2,9 @@
 set -ex
 
 source ${UTILS_DIR}/utilities.sh
+source ${UTILS_DIR}/logger.sh
+
+log_info install-mpis "starting MPI stack installation (HPC-X, MVAPICH, OpenMPI, IntelMPI) for ${DISTRIBUTION} (${ARCHITECTURE})"
 
 # Load gcc
 set CC=/usr/bin/gcc
@@ -14,11 +17,14 @@ PMIX_VERSION=$(jq -r '.version' <<< $pmix_metadata)
 
 if [[ "$GPU" == "AMD" ]]; then
     # AMD has regression on higher versions of HPC-X
+    log_info install-mpis "AMD GPU build: using pinned older HPC-X (regression on newer HPC-X)"
     hpcx_metadata=$(get_component_config "hpcx_amd")
 elif ! sku_has_infiniband; then
     # Non-IB SKUs skip DOCA-OFED. Use inbox HPC-X (UCX linked against kernel-native rdma-core)
+    log_info install-mpis "non-IB SKU: using inbox HPC-X (UCX linked against kernel-native rdma-core)"
     hpcx_metadata=$(get_component_config "hpcx_inbox")
 else
+    log_info install-mpis "IB SKU: using standard HPC-X"
     hpcx_metadata=$(get_component_config "hpcx")
 fi
 HPCX_VERSION=$(jq -r '.version' <<< $hpcx_metadata)
@@ -28,9 +34,11 @@ HPCX_DOWNLOAD_URL=$(jq -r '.url' <<< $hpcx_metadata)
 TARBALL=$(basename $HPCX_DOWNLOAD_URL)
 HPCX_FOLDER=$(basename $HPCX_DOWNLOAD_URL .tbz)
 
+log_info install-mpis "downloading and verifying HPC-X ${HPCX_VERSION}"
 download_and_verify ${HPCX_DOWNLOAD_URL} ${HPCX_SHA256}
 tar -xvf ${TARBALL}
 
+log_debug install-mpis "rewriting /build-result/ paths in hcoll/ucx pkgconfig files to /opt/"
 sed -i "s/\/build-result\//\/opt\//" ${HPCX_FOLDER}/hcoll/lib/pkgconfig/hcoll.pc
 sed -i "s/\/build-result\//\/opt\//" ${HPCX_FOLDER}/ucx/lib/pkgconfig/*.pc
 mv ${HPCX_FOLDER} ${INSTALL_PREFIX}
@@ -39,24 +47,29 @@ HCOLL_PATH=${HPCX_PATH}/hcoll
 UCX_PATH=${HPCX_PATH}/ucx
 LIBFABRIC_PATH=/opt/libfabric
 write_component_version "HPCX" $HPCX_VERSION
+log_info install-mpis "installed HPC-X ${HPCX_VERSION} to ${HPCX_PATH}"
 
 # rebuild HPCX with PMIx
 # Baremetal nodes use PMIx bundled inside HPC-X because standalone PMIx
 # conflicts with the Mellanox OpenMPI package on Nebius nodes.
 # Azure VMs (and azurelinux3.0) use the separately installed PMIx package.
 if [[ $DISTRIBUTION == "azurelinux3.0" || "${NODE_TYPE:-azure-vm}" == "baremetal" ]]; then
+    log_info install-mpis "rebuilding HPC-X OpenMPI with bundled PMIx (azurelinux3.0 or baremetal node)"
     ${HPCX_PATH}/utils/hpcx_rebuild.sh --with-hcoll --ompi-extra-config "--with-pmix --enable-orterun-prefix-by-default"
 elif ! sku_uses_ucx; then
     PMIX_PATH=${INSTALL_PREFIX}/pmix/${PMIX_VERSION:0:-2}
+    log_info install-mpis "rebuilding HPC-X OpenMPI without UCX, with libfabric (non-UCX SKU; PMIx=${PMIX_PATH})"
     ${HPCX_PATH}/utils/hpcx_rebuild.sh --ompi-extra-config "--with-pmix=${PMIX_PATH} --enable-orterun-prefix-by-default --without-ucx --with-ofi=${LIBFABRIC_PATH}"
 else
     PMIX_PATH=${INSTALL_PREFIX}/pmix/${PMIX_VERSION:0:-2}
+    log_info install-mpis "rebuilding HPC-X OpenMPI with hcoll and external PMIx (${PMIX_PATH})"
     ${HPCX_PATH}/utils/hpcx_rebuild.sh --with-hcoll --ompi-extra-config "--with-pmix=${PMIX_PATH} --enable-orterun-prefix-by-default"
 fi
 cp -r ${HPCX_PATH}/ompi/tests ${HPCX_PATH}/hpcx-rebuild
 
 if [[ $DISTRIBUTION == almalinux* ]] || [[ $DISTRIBUTION == rocky* ]] || [[ $DISTRIBUTION == rhel* ]] || [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
     # exclude ucx from updates
+    log_info install-mpis "pinning ucx* against dnf updates (HPC-X must own UCX)"
     dnf_pin_packages "ucx*"
 fi
 
@@ -64,6 +77,7 @@ fi
 # Skip on GB-family nodes (ubuntu24.04 and azurelinux3.0) — MVAPICH is not supported
 # on those distribution/SKU-family combinations.
 if ! [[ ("${DISTRIBUTION}" == "ubuntu24.04" || "${DISTRIBUTION}" == "azurelinux3.0") && "${SKU_FAMILY}" == "gb-family" ]]; then
+    log_info install-mpis "building MVAPICH from source"
     mvapich_metadata=$(get_component_config "mvapich")
     MVAPICH_VERSION=$(jq -r '.version' <<< $mvapich_metadata)
     MVAPICH_SHA256=$(jq -r '.sha256' <<< $mvapich_metadata)
@@ -71,6 +85,7 @@ if ! [[ ("${DISTRIBUTION}" == "ubuntu24.04" || "${DISTRIBUTION}" == "azurelinux3
     TARBALL=$(basename $MVAPICH_DOWNLOAD_URL)
     MVAPICH_FOLDER=$(basename $MVAPICH_DOWNLOAD_URL .tar.gz)
 
+    log_info install-mpis "downloading and verifying MVAPICH ${MVAPICH_VERSION}"
     download_and_verify $MVAPICH_DOWNLOAD_URL $MVAPICH_SHA256
     tar -xvf ${TARBALL}
     pushd ${MVAPICH_FOLDER}
@@ -86,16 +101,23 @@ if ! [[ ("${DISTRIBUTION}" == "ubuntu24.04" || "${DISTRIBUTION}" == "azurelinux3
     if sku_uses_ucx; then
         mvapich_transport_args="--with-ucx=${UCX_PATH}"
         MVAPICH_TRANSPORT_LIB_PATH="${UCX_PATH}/lib"
+        log_info install-mpis "configuring MVAPICH with UCX transport (${UCX_PATH})"
     else
         mvapich_transport_args="--with-device=ch4:ofi --with-libfabric=${LIBFABRIC_PATH}"
         MVAPICH_TRANSPORT_LIB_PATH="${LIBFABRIC_PATH}/lib"
+        log_info install-mpis "configuring MVAPICH with libfabric transport (${LIBFABRIC_PATH})"
     fi
+    log_info install-mpis "compiling MVAPICH (make -j$(nproc))"
     ./configure $(if [[ $DISTRIBUTION == *"ubuntu"* ]] || [[ $DISTRIBUTION == "azurelinux3.0" ]]; then echo "FFLAGS=-fallow-argument-mismatch"; fi) --prefix=${INSTALL_PREFIX}/mvapich-${MVAPICH_VERSION} --enable-g=none --enable-fast=yes ${mvapich_transport_args} && make -j$(nproc) && make install
     popd
     write_component_version "MVAPICH" ${MVAPICH_VERSION}
+    log_info install-mpis "installed MVAPICH ${MVAPICH_VERSION}"
+else
+    log_info install-mpis "skipping MVAPICH (gb-family on ${DISTRIBUTION} — unsupported combination)"
 fi
 
 # Install Open MPI
+log_info install-mpis "building standalone OpenMPI from source"
 ompi_metadata=$(get_component_config "ompi")
 OMPI_VERSION=$(jq -r '.version' <<< $ompi_metadata)
 OMPI_SHA256=$(jq -r '.sha256' <<< $ompi_metadata)
@@ -103,51 +125,66 @@ OMPI_DOWNLOAD_URL=$(jq -r '.url' <<< $ompi_metadata)
 TARBALL=$(basename $OMPI_DOWNLOAD_URL)
 OMPI_FOLDER=$(basename $OMPI_DOWNLOAD_URL .tar.gz)
 
+log_info install-mpis "downloading and verifying OpenMPI ${OMPI_VERSION}"
 download_and_verify $OMPI_DOWNLOAD_URL $OMPI_SHA256
 tar -xvf $TARBALL
 cd $OMPI_FOLDER
 if [[ "${NODE_TYPE:-azure-vm}" == "baremetal" ]]; then
     PMIX_FLAG="--with-pmix"
+    log_debug install-mpis "baremetal: OpenMPI uses bundled PMIx"
 else
     PMIX_FLAG="--with-pmix=${PMIX_PATH}"
+    log_debug install-mpis "azure-vm: OpenMPI uses external PMIx (${PMIX_PATH})"
 fi
 # OMPI_TRANSPORT_LIB_PATH: see MVAPICH_TRANSPORT_LIB_PATH above. Same rationale —
 # pin runtime UCX/libfabric to the install Open MPI was linked against.
 if sku_uses_ucx; then
+    log_info install-mpis "configuring OpenMPI with UCX + hcoll (Mellanox-optimized platform)"
     ./configure LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HCOLL_PATH}/lib --prefix=${INSTALL_PREFIX}/openmpi-${OMPI_VERSION} --with-ucx=${UCX_PATH} --with-hcoll=${HCOLL_PATH} ${PMIX_FLAG} --enable-mpirun-prefix-by-default --with-platform=contrib/platform/mellanox/optimized
     OMPI_TRANSPORT_LIB_PATH="${UCX_PATH}/lib"
 else
     # Drop --with-ucx, --with-hcoll (uses UCX internally), --with-platform (Mellanox-specific).
+    log_info install-mpis "configuring OpenMPI without UCX, with libfabric (non-UCX SKU)"
     ./configure --prefix=${INSTALL_PREFIX}/openmpi-${OMPI_VERSION} --without-ucx --with-ofi=${LIBFABRIC_PATH} ${PMIX_FLAG} --enable-mpirun-prefix-by-default
     OMPI_TRANSPORT_LIB_PATH="${LIBFABRIC_PATH}/lib"
 fi
-make -j$(nproc) 
+log_info install-mpis "compiling OpenMPI (make -j$(nproc))"
+make -j$(nproc)
 make install
 cd ..
 write_component_version "OMPI" ${OMPI_VERSION}
+log_info install-mpis "installed OpenMPI ${OMPI_VERSION}"
 
 if [[ $DISTRIBUTION == almalinux* ]] || [[ $DISTRIBUTION == rocky* ]] || [[ $DISTRIBUTION == rhel* ]] || [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
     # exclude openmpi, perftest from updates
+    log_info install-mpis "pinning openmpi/perftest against dnf updates"
     dnf_pin_packages "openmpi" "perftest"
 fi
 
 if [[ "$ARCHITECTURE" != "aarch64" ]]; then
     # Install Intel MPI
+    log_info install-mpis "installing Intel MPI (x86_64 only)"
     impi_metadata=$(get_component_config "impi")
     IMPI_VERSION=$(jq -r '.version' <<< $impi_metadata)
     IMPI_SHA256=$(jq -r '.sha256' <<< $impi_metadata)
     IMPI_DOWNLOAD_URL=$(jq -r '.url' <<< $impi_metadata)
     IMPI_OFFLINE_INSTALLER=$(basename $IMPI_DOWNLOAD_URL)
 
+    log_info install-mpis "downloading and verifying Intel MPI ${IMPI_VERSION} offline installer"
     download_and_verify $IMPI_DOWNLOAD_URL $IMPI_SHA256
+    log_info install-mpis "running Intel MPI offline installer (silent, EULA accepted)"
     bash $IMPI_OFFLINE_INSTALLER -s -a -s --eula accept
 
     impi_2021_version=${IMPI_VERSION:0:-2}
     mv ${INSTALL_PREFIX}/intel/oneapi/mpi/${impi_2021_version}/etc/modulefiles/mpi ${INSTALL_PREFIX}/intel/oneapi/mpi/${impi_2021_version}/etc/modulefiles/impi
     write_component_version "IMPI" ${IMPI_VERSION}
-fi    
+    log_info install-mpis "installed Intel MPI ${IMPI_VERSION}"
+else
+    log_info install-mpis "skipping Intel MPI (aarch64 unsupported)"
+fi
 
 # Setup module files for MPIs
+log_info install-mpis "writing modulefiles for hpcx, hpcx-pmix, mvapich, openmpi, impi"
 MPI_MODULE_FILES_DIRECTORY=${MODULE_FILES_DIRECTORY}/mpi
 mkdir -p ${MPI_MODULE_FILES_DIRECTORY}
 
@@ -221,7 +258,7 @@ setenv          MPI_HOME        /opt/mvapich-${MVAPICH_VERSION}
 ${MVAPICH_NON_UCX_EXTRAS}
 EOF
     ln -s ${MPI_MODULE_FILES_DIRECTORY}/mvapich-${MVAPICH_VERSION} ${MPI_MODULE_FILES_DIRECTORY}/mvapich
-fi    
+fi
 
 # OpenMPI
 # On non-UCX SKUs, Open MPI standalone (built --without-ucx --with-ofi) has the same
@@ -270,12 +307,13 @@ EOF
     ln -s ${MPI_MODULE_FILES_DIRECTORY}/impi_${impi_2021_version} ${MPI_MODULE_FILES_DIRECTORY}/impi-2021
 
     if [[ $DISTRIBUTION == "almalinux8.10" ]] || [[ $DISTRIBUTION == "rocky8.10" ]] || [[ $DISTRIBUTION == rhel8* ]]; then
+        log_warn install-mpis "applying Intel MPI EL8 race-condition workaround (I_MPI_STARTUP_MODE=pmi_shm)"
         cat << EOF >> ${MPI_MODULE_FILES_DIRECTORY}/impi_${impi_2021_version}
 # see https://community.intel.com/t5/Intel-MPI-Library/Suspected-unfixed-Intel-MPI-race-condition-in-collectives/td-p/1693452 for Intel MPI bug
 setenv          I_MPI_STARTUP_MODE         pmi_shm
 EOF
     fi
-fi    
+fi
 
 
 
@@ -286,3 +324,5 @@ ln -s ${MPI_MODULE_FILES_DIRECTORY}/openmpi-${OMPI_VERSION} ${MPI_MODULE_FILES_D
 # cleanup downloaded tarballs and other installation files/folders
 rm -rf *.tbz *.tar.gz *offline.sh
 rm -rf -- */
+
+log_info install-mpis "MPI stack installation complete"
