@@ -26,6 +26,18 @@
 : "${OS:=}"
 : "${FIPS:=false}"
 
+# When no LOG_FILE was provided, give this run its own timestamped log file so
+# every invocation is captured separately. LOG_DIR is overridable via the
+# environment. Exporting LOG_FILE lets child component scripts (which re-source
+# this file) inherit the same path, so a whole run lands in one file.
+if [[ -z "${LOG_FILE}" ]]; then
+    : "${LOG_DIR:=/var/log/azhpc}"
+    if mkdir -p "${LOG_DIR}" 2>/dev/null; then
+        LOG_FILE="${LOG_DIR}/azhpc_$(date +%Y%m%d-%H%M%S).log"
+    fi
+fi
+export LOG_FILE
+
 if [[ -z "${LOG_FORMAT}" ]]; then
     if [[ -t 1 ]]; then LOG_FORMAT=text; else LOG_FORMAT=json; fi
 fi
