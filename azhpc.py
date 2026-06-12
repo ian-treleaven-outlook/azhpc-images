@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,10 +156,11 @@ def main(argv=None) -> int:
     repo_root = Path(__file__).resolve().parent
     install = repo_root / distro_dir / "install.sh"
 
-    log_info("build-image", f"Invoking {distro_dir}/install.sh {gpu_arg} {args.gpu}")
-    completed = subprocess.run([str(install), gpu_arg, args.gpu],
-                               cwd=str(repo_root / distro_dir))
-    if completed.returncode != 0:
+    from utils.process import exec_program
+
+    rc = exec_program([str(install), gpu_arg, args.gpu], "build-image",
+                      cwd=str(repo_root / distro_dir))
+    if rc != 0:
         return die(f"build failed in {distro_dir}/install.sh", 3)
 
     log_info("build-image", "Image built successfully")
