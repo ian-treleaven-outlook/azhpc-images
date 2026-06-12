@@ -97,7 +97,7 @@ def _log(level: str, op: str, message: str) -> None:
         with open(LOG_FILE, "a", encoding="utf-8") as fh:
             fh.write(line_raw + "\n")
 
-    def log_info(op: str, message: str) -> None:
+def log_info(op: str, message: str) -> None:
     """INFO: a high-level operation."""
     _log("info", op, message)
 
