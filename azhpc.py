@@ -62,8 +62,9 @@ def configure_logging(args) -> None:
     )
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="azhpc", add_help=True,
+    p = argparse.ArgumentParser(prog="azhpc", add_help=False,
                                 description="Build HPC/AI Linux images for Azure")
+    p.add_argument("-h", "--help", action="store_true")
     p.add_argument("--spec")
     p.add_argument("--vendor")
     p.add_argument("--gpu")
@@ -77,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.help:
+        print_help(); return 0
     if args.version:
         print_version(); return 0
 
