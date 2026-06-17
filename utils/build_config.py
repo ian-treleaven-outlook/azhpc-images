@@ -1,7 +1,26 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
+import json
+from utils.logger import log_info, log_warn, log_error
+from utils.process import exec_program
 
+VALID_GPUS = {
+    "NVidia": {"GB200", "GB300", "NCv6", "V100", "A100", "H100", "H200", "VR200"},
+    "AMD": {"MI300", "MI400", "MI500"},
+}
+DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
+DISTRO_DIRS = {
+    "Ubuntu24": "distros/ubuntu24.04",
+    "Ubuntu22": "distros/ubuntu22.04",
+    "Alma9": "distros/almalinux9.7",
+    "Alma8": "distros/almalinux8.10",
+    "Rocky9": "distros/rocky9.7",
+    "Rocky8": "distros/rocky8.10",
+    "Azure3": "distros/azurelinux3.0",
+}
+GPU_ARGS = {"NVidia": "NVIDIA", "AMD": "AMD"}
 
 @dataclass(frozen=True)
 class BuildConfig:
@@ -34,7 +53,7 @@ def resolve_config(args) -> BuildConfig:
         raise ConfigError("--vendor is required", 1)
     if not args.gpu:
         raise ConfigError("--gpu is required", 1)
-    if not args.os_name:
+    if not args.os:
         raise ConfigError("--os is required", 1)
 
     # vendor / gpu / os validation 
@@ -42,9 +61,9 @@ def resolve_config(args) -> BuildConfig:
         raise ConfigError(f"unsupported vendor '{args.vendor}' (NVidia|AMD)", 1)
     if args.gpu not in VALID_GPUS[args.vendor]:
         raise ConfigError(f"GPU '{args.gpu}' not valid for vendor {args.vendor}", 1)
-    if args.os_name not in DISTRO_DIRS:
+    if args.os not in DISTRO_DIRS:
         raise ConfigError(
-            f"unsupported os '{args.os_name}' "
+            f"unsupported os '{args.os}' "
             "(Ubuntu24|Ubuntu22|Azure3|Alma9|Alma8|Rocky9|Rocky8)", 1)
 
     # spec file validation
@@ -62,7 +81,7 @@ def resolve_config(args) -> BuildConfig:
     return BuildConfig(
         vendor=args.vendor,
         gpu=args.gpu,
-        os=args.os_name,
+        os=args.os,
         fips=bool(args.fips),
         spec_path=spec_path,
     )
@@ -82,7 +101,7 @@ class ImageBuilder:
         build_dir = self.repo_root / cfg.distro_dir
         install = build_dir / "install.sh"
 
-        log_info("build-image", f"Building {cfg.os_name} for {cfg.gpu}")
+        log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
         rc = exec_program([str(install), cfg.gpu_arg, cfg.gpu],
                           "build-image", cwd=str(build_dir))
         if rc != 0:

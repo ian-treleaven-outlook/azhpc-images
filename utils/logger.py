@@ -52,6 +52,17 @@ _COLORS = {
     "error": "\033[31m",    # red
 }
 
+def configure(*, log_format=None, log_level=None, version="", commit="",
+              vendor="", gpu="", os="", fips=False) -> None:
+    """Set logger configuration explicitly (call once at startup)."""
+    global LOG_FORMAT, LOG_LEVEL, VERSION, BUILD_COMMIT, VENDOR, GPU, OS, FIPS
+    if log_format:
+        LOG_FORMAT = log_format
+    if log_level:
+        LOG_LEVEL = log_level
+    VERSION, BUILD_COMMIT = version, commit
+    VENDOR, GPU, OS, FIPS = vendor, gpu, os, ("true" if fips else "false")
+
 # redaction (port of the two sed expressions in _redact)
 _BEARER = re.compile(r"(bearer\s+)[A-Za-z0-9._\-]+", re.IGNORECASE)
 _TOKENS = re.compile(r"((?:sig|sas|token|key)=)[A-Za-z0-9._%\-]+", re.IGNORECASE)
