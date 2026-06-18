@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 import json
 from utils.logger import log_info, log_warn, log_error
@@ -86,6 +87,37 @@ def resolve_config(args) -> BuildConfig:
         spec_path=spec_path,
     )
 
+@dataclass(frozen=True)
+class Step:
+    op: str                       # log label, e.g. "install-rocm"
+    script: str                   # filename in components/
+    args: tuple[str, ...] = ()
+    when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
+
+def build_plan(cfg: BuildConfig) -> list[Step]:
+    """The ordered list of component steps, mirroring distros/<os>/install.sh."""
+    return [
+        Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
+        Step("install-lustre",  "install_lustre_client.sh"),
+        Step("install-doca",    "install_doca.sh"),         # TODO: gate on sku_has_infiniband (runtime)
+        Step("install-pmix",    "install_pmix.sh"),
+        Step("install-mpis",    "install_mpis.sh"),
+        Step("install-mpifileutils", "install_mpifileutils.sh"),
+
+        # NVIDIA branch
+        Step("install-nv-driver", "install_nvidiagpudriver.sh",
+             when=lambda c: c.vendor == "NVidia" and c.gpu not in {"GB200", "NCv6"}),
+        Step("install-nv-grid",   "install_nvidiagriddriver.sh",
+             when=lambda c: c.vendor == "NVidia" and c.gpu == "NCv6"),
+        Step("install-nccl",      "install_nccl.sh",   when=lambda c: c.vendor == "NVidia"),
+        Step("install-docker",    "install_docker.sh", when=lambda c: c.vendor == "NVidia"),
+        Step("install-dcgm",      "install_dcgm.sh",   when=lambda c: c.vendor == "NVidia"),
+
+        # AMD branch
+        Step("install-rocm", "install_rocm.sh", when=lambda c: c.vendor == "AMD"),
+        Step("install-rccl", "install_rccl.sh", when=lambda c: c.vendor == "AMD"),
+    ]
+
 class ImageBuilder:
     def __init__(self, repo_root: Path, config: BuildConfig):
         self.repo_root = repo_root
@@ -95,17 +127,25 @@ class ImageBuilder:
         cfg = self.config
         if not cfg.has_dedicated_path:
             log_warn("resolve-config",
-                     f"GPU '{cfg.gpu}' has no dedicated build path; "
-                     f"using generic {cfg.vendor} build")
-        
+                    f"GPU '{cfg.gpu}' has no dedicated build path; "
+                    f"using generic {cfg.vendor} build")
+
         build_dir = self.repo_root / cfg.distro_dir
-        install = build_dir / "install.sh"
+        components = self.repo_root / "components"
 
         log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
-        rc = exec_program([str(install), cfg.gpu_arg, cfg.gpu],
-                          "build-image", cwd=str(build_dir))
-        if rc != 0:
-            log_error("build-image", f"build failed in {cfg.distro_dir}/install.sh")
-            return 3
+        for step in build_plan(cfg):
+            if not step.when(cfg):
+                log_info(step.op, "skipped")
+                continue
+            log_info(step.op, "starting")
+            rc = exec_program([str(components / step.script), *step.args],
+                            step.op, cwd=str(build_dir))
+            if rc != 0:
+                log_error(step.op, f"failed with exit code {rc}")
+                return 3
+            log_info(step.op, "done")
+
         log_info("build-image", "Image built successfully")
         return 0
+        
