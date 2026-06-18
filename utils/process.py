@@ -11,20 +11,21 @@ import subprocess
 
 from utils.logger import log_info, log_debug, log_error
 
-def exec_program(command: list[str], op: str, *, cwd: str | None = None) -> int:
+def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None) -> int:
     """Run an external program and log its output.
 
     Captures stdout and stderr (logged at debug/verbose level) and the return
     code. Returns the program's exit code, or 127 if it could not be executed.
     """
     log_info(op, f"Running command: {' '.join(command)}")
-
+    
     try:
         result = subprocess.run(
             command,
             cwd=cwd,
             capture_output=True,   # capture both streams so we can log them
             text=True,             # decode bytes -> str
+            env=env,               # pass the environment variables
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
         # The program could not be started at all (no return code exists).

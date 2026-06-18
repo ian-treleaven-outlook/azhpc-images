@@ -6,6 +6,14 @@ from pathlib import Path
 import json
 from utils.logger import log_info, log_warn, log_error
 from utils.process import exec_program
+import os
+import platform
+import subprocess
+
+MODULE_DIRS = {
+    "ubuntu": "/usr/share/modules/modulefiles",
+}
+DEFAULT_MODULE_DIR = "/usr/share/Modules/modulefiles"  # alma/rocky/azure/rhel
 
 VALID_GPUS = {
     "NVidia": {"GB200", "GB300", "NCv6", "V100", "A100", "H100", "H200", "VR200"},
@@ -22,6 +30,58 @@ DISTRO_DIRS = {
     "Azure3": "distros/azurelinux3.0",
 }
 GPU_ARGS = {"NVidia": "NVIDIA", "AMD": "AMD"}
+
+def _detect_distribution() -> str:
+    """Mirror: . /etc/os-release; echo $ID$VERSION_ID  -> e.g. 'ubuntu24.04'."""
+    data: dict[str, str] = {}
+    with open("/etc/os-release", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                key, _, val = line.partition("=")
+                data[key] = val.strip().strip('"')
+    return f"{data.get('ID', '')}{data.get('VERSION_ID', '')}"
+
+def _detect_arch_distro(distribution: str) -> str:
+    """Mirror: dpkg --print-architecture (deb) or rpm --eval %{_arch} (rpm)."""
+    if "ubuntu" in distribution:
+        cmd = ["dpkg", "--print-architecture"]
+    else:
+        cmd = ["rpm", "--eval", "%{_arch}"]
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
+    """The env vars set_properties.sh exported that the component scripts read.
+
+    Pure environment setup only — no apt/yum side effects (those stay in the
+    bootstrap step for now).
+    """
+    distribution = _detect_distribution()
+
+    env = os.environ.copy()
+    env["TOP_DIR"]       = str(repo_root)
+    env["COMPONENT_DIR"] = str(repo_root / "components")
+    env["UTILS_DIR"]     = str(repo_root / "utils")
+    env["TEST_DIR"]      = str(repo_root / "tests")
+
+    env["DISTRIBUTION"]        = distribution
+    env["ARCHITECTURE"]        = platform.machine()              # uname -m
+    env["ARCHITECTURE_DISTRO"] = _detect_arch_distro(distribution)
+
+    env["GPU"]        = cfg.gpu_arg                              # NVIDIA / AMD
+    env["SKU"]        = cfg.gpu                                  # H100, MI300, ...
+    env["SKU_FAMILY"] = "gb-family" if cfg.gpu in {"GB200", "GB300"} else cfg.gpu
+    env["NODE_TYPE"]  = os.environ.get("NODE_TYPE", "azure-vm")
+
+    env["MODULE_FILES_DIRECTORY"] = (
+        MODULE_DIRS["ubuntu"] if "ubuntu" in distribution else DEFAULT_MODULE_DIR
+    )
+
+    versions = repo_root / "versions.json"
+    if versions.is_file():
+        env["COMPONENT_VERSIONS"] = versions.read_text(encoding="utf-8")
+
+    return env
 
 @dataclass(frozen=True)
 class BuildConfig:
@@ -132,6 +192,7 @@ class ImageBuilder:
 
         build_dir = self.repo_root / cfg.distro_dir
         components = self.repo_root / "components"
+        env = component_env(self.repo_root, cfg)          # <-- compute once
 
         log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
         for step in build_plan(cfg):
@@ -140,7 +201,7 @@ class ImageBuilder:
                 continue
             log_info(step.op, "starting")
             rc = exec_program([str(components / step.script), *step.args],
-                            step.op, cwd=str(build_dir))
+                            step.op, cwd=str(build_dir), env=env)   # <-- pass env
             if rc != 0:
                 log_error(step.op, f"failed with exit code {rc}")
                 return 3
