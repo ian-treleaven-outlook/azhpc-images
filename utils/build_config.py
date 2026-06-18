@@ -157,6 +157,7 @@ class Step:
 def build_plan(cfg: BuildConfig) -> list[Step]:
     """The ordered list of component steps, mirroring distros/<os>/install.sh."""
     return [
+        Step("bootstrap", "../distros/<...>/install_utils.sh"),
         Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
         Step("install-doca",    "install_doca.sh"),         # TODO: gate on sku_has_infiniband (runtime)
@@ -182,26 +183,43 @@ class ImageBuilder:
     def __init__(self, repo_root: Path, config: BuildConfig):
         self.repo_root = repo_root
         self.config = config
-    
+
+    def _bootstrap(self, build_dir: Path, env: dict[str, str]) -> int:
+        """Run system prep that must happen before any component.
+
+        Mirrors install_utils.sh (Microsoft repo, base packages, IB modules).
+        Still bash for now — it's heavily distro-specific, side-effecting work.
+        """
+        install_utils = build_dir / "install_utils.sh"
+        log_info("bootstrap", "Preparing system (install_utils.sh)")
+        return exec_program([str(install_utils)], "bootstrap",
+                            cwd=str(build_dir), env=env)
+
     def build(self) -> int:
         cfg = self.config
         if not cfg.has_dedicated_path:
             log_warn("resolve-config",
-                    f"GPU '{cfg.gpu}' has no dedicated build path; "
-                    f"using generic {cfg.vendor} build")
+                     f"GPU '{cfg.gpu}' has no dedicated build path; "
+                     f"using generic {cfg.vendor} build")
 
         build_dir = self.repo_root / cfg.distro_dir
         components = self.repo_root / "components"
-        env = component_env(self.repo_root, cfg)          # <-- compute once
+        env = component_env(self.repo_root, cfg)
 
         log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
+
+        rc = self._bootstrap(build_dir, env)
+        if rc != 0:
+            log_error("bootstrap", f"system prep failed with exit code {rc}")
+            return 3
+
         for step in build_plan(cfg):
             if not step.when(cfg):
                 log_info(step.op, "skipped")
                 continue
             log_info(step.op, "starting")
             rc = exec_program([str(components / step.script), *step.args],
-                            step.op, cwd=str(build_dir), env=env)   # <-- pass env
+                              step.op, cwd=str(build_dir), env=env)
             if rc != 0:
                 log_error(step.op, f"failed with exit code {rc}")
                 return 3
