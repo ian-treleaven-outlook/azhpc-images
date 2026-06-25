@@ -25,19 +25,21 @@ print_help() {
 azhpc - Build HPC/AI Linux images for Azure
 
 USAGE:
-    azhpc [OPTIONS]
+    azhpc --vendor <VENDOR> --gpu <SKU> --os <OS> [OPTIONS]
     azhpc --help
 
-OPTIONS:
-    --spec <PATH>           Path to versions.json (optional)
-    --vendor <VENDOR>       Hardware vendor: NVidia | AMD 
-    --gpu <SKU>             Target GPU. Values with dedicated build paths
-                            are marked (*); others use the generic path.
+REQUIRED:
+    --vendor <VENDOR>       Hardware vendor: NVidia | AMD
+    --gpu <SKU>             Target GPU. Values with dedicated build
+                            paths are marked (*); others use the generic path.
                                 NVidia : GB200* | GB300* | NCv6* | V100*
-                                         A100 | H100 | H200 | VR200
+                                        A100 | H100 | H200 | VR200
                                 AMD    : MI300 | MI400 | MI500
     --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
-                                       Alma9 | Alma8 | Rocky9 | Rocky8 
+                                    Alma9 | Alma8 | Rocky9 | Rocky8
+
+OPTIONS:
+    --spec <PATH>           Path to versions.json
     --fips                  Build a FIPS-compliant image (default: non-FIPS)
     --dry-run               Validate args and print build plan; do not build
     -v, --verbose           Verbose (debug-level) logging
