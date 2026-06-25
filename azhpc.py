@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,19 +77,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.help:
-        print_help(); return 0
+        print_help()
+        return 0
     if args.version:
-        print_version(); return 0
+        print_version()
+        return 0
 
     configure_logging(args)         
     try:
         config = resolve_config(args)
     except ConfigError as e:
-        logger.log_error("cli", str(e)); return e.code
+        logger.log_error("cli", str(e))
+        return e.code
 
     logger.log_info("resolve-config", f"Effective build: {config}")
     if args.dry_run:
-        logger.log_info("dry-run", "Dry-run requested; not building"); return 0
+        logger.log_info("dry-run", "Dry-run requested; not building")
+        return 0
 
     repo_root = Path(__file__).resolve().parent
     return ImageBuilder(repo_root, config).build()
