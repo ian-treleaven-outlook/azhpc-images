@@ -24,7 +24,12 @@ def print_help():
 
 USAGE:
     azhpc --vendor <VENDOR> --gpu <SKU> --os <OS> [OPTIONS]
+    azhpc install <PACKAGE>... [-v]
     azhpc --help
+
+COMMANDS:
+    install <PACKAGE>...    Install one or more packages using the detected
+                            system package manager (apt-get, dnf, tdnf, ...)
 
 REQUIRED:
     --vendor <VENDOR>       Hardware vendor: NVidia | AMD
@@ -76,7 +81,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="store_true")
     return p
 
+def cmd_install(args_list) -> int:
+    """`azhpc install <pkg>... [-v]` — install packages via the detected manager."""
+    verbose = False
+    packages = []
+    for a in args_list:
+        if a in ("-v", "--verbose"):
+            verbose = True
+        else:
+            packages.append(a)
+
+    logger.configure(log_level="debug" if verbose else None,
+                     version=VERSION, commit=BUILD_COMMIT)
+
+    if not packages:
+        logger.log_error("install", "no packages specified")
+        return 1
+
+    from utils.package_installer import PackageInstaller
+    ok = PackageInstaller().install_package(packages)
+    return 0 if ok else 3
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "install":
+        return cmd_install(argv[1:])
+
     args = build_parser().parse_args(argv)
     if args.help:
         print_help()

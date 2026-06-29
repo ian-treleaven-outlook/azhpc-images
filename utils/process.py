@@ -1,8 +1,9 @@
 """process.py — the single gateway for running external programs.
 
-Every external command goes through exec_program so its stdout, stderr, and
-return code are captured and logged consistently. Detailed output is logged at
-debug level, so it only appears when --verbose is set.
+Every external command goes through exec_program so its output and return code
+are captured and logged consistently. Output is streamed line-by-line as it
+arrives (via subprocess.Popen) and logged at debug level, so it appears live
+when --verbose is set without waiting for the command to finish.
 """
 
 from __future__ import annotations
@@ -12,35 +13,38 @@ import subprocess
 from utils.logger import log_info, log_debug, log_error
 
 def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None) -> int:
-    """Run an external program and log its output.
+    """Run an external program, streaming and logging its output.
 
-    Captures stdout and stderr (logged at debug/verbose level) and the return
-    code. Returns the program's exit code, or 127 if it could not be executed.
+    stdout and stderr are merged and read line-by-line so each line is logged
+    (at debug/verbose level) as it is produced. Returns the program's exit code,
+    or 127 if it could not be executed.
     """
     log_info(op, f"Running command: {' '.join(command)}")
-    
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             command,
             cwd=cwd,
-            capture_output=True,   # capture both streams so we can log them
-            text=True,             # decode bytes -> str
-            env=env,               # pass the environment variables
+            env=env,                      # pass the environment variables
+            stdout=subprocess.PIPE,       # capture stdout...
+            stderr=subprocess.STDOUT,     # ...and fold stderr into it
+            text=True,                    # decode bytes -> str
+            bufsize=1,                    # line-buffered for live streaming
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
         # The program could not be started at all (no return code exists).
         log_error(op, f"Failed to execute {' '.join(command)}: {exc}")
         return 127
 
-    # Only when --verbose is set 
-    if result.stdout:
-        log_debug(op, f"stdout:\n{result.stdout.rstrip()}")
-    if result.stderr:
-        log_debug(op, f"stderr:\n{result.stderr.rstrip()}")
-    
-    log_debug(op, f"Command exited with code {result.returncode}")
+    # Stream output live: each line is logged as soon as it arrives.
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log_debug(op, line.rstrip())
 
-    if result.returncode != 0:
-        log_error(op, f"Command failed with exit code {result.returncode}")
+    returncode = proc.wait()
+    log_debug(op, f"Command exited with code {returncode}")
 
-    return result.returncode
+    if returncode != 0:
+        log_error(op, f"Command failed with exit code {returncode}")
+
+    return returncode
