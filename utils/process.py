@@ -39,7 +39,12 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
     # Stream output live: each line is logged as soon as it arrives.
     assert proc.stdout is not None
     for line in proc.stdout:
-        log_debug(op, line.rstrip())
+        # Tools like apt redraw progress with carriage returns instead of
+        # newlines, so a single line can carry many '\r'-separated updates.
+        # Keep only the final segment (the last redraw) and drop blank ones.
+        text = line.split("\r")[-1].rstrip()
+        if text:
+            log_debug(op, text)
 
     returncode = proc.wait()
     log_debug(op, f"Command exited with code {returncode}")

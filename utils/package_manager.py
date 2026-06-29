@@ -19,8 +19,10 @@ _MANAGER_ORDER = ["apt-get", "apt", "dnf", "tdnf", "yum", "zypper", "pacman", "a
 
 # How each manager installs a package non-interactively.
 _INSTALL_TEMPLATES: dict[str, list[str]] = {
-    "apt-get": ["apt-get", "install", "-y"],
-    "apt":     ["apt", "install", "-y"],
+    # Dpkg::Use-Pty=0 stops dpkg from allocating a PTY, which otherwise
+    # redraws progress with carriage returns and garbles captured output.
+    "apt-get": ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"],
+    "apt":     ["apt", "install", "-y", "-o", "Dpkg::Use-Pty=0"],
     "dnf":     ["dnf", "install", "-y"],
     "tdnf":    ["tdnf", "install", "-y"],
     "yum":     ["yum", "install", "-y"],
