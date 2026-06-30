@@ -22,15 +22,10 @@ fi
 
 echo "=== Installing mpifileutils ${MPIFILEUTILS_VERSION} ==="
 
-# Install build dependencies
-if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
-    apt-get install -y libbz2-dev libattr1-dev libarchive-dev libssl-dev libcap-dev
-elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
-    dnf install -y bzip2-devel libattr-devel libarchive-devel
-else
-    # RHEL-family: AlmaLinux, Rocky Linux, RHEL, etc.
-    dnf install -y bzip2-devel libattr-devel libarchive-devel
-fi
+# Build dependencies (libbz2-dev, libattr1-dev, libarchive-dev, libssl-dev,
+# libcap-dev) are installed by the azhpc orchestrator via PackageInstaller
+# (see install_mpifileutils_deps in utils/build_config.py) before this script
+# runs, so the package-manager branching that used to live here is gone.
 
 # Create directories
 mkdir -p "${INSTALL_PREFIX}"
