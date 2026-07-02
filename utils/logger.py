@@ -1,9 +1,9 @@
 """logger.py — shared logging helpers for azhpc-images (Python port of logger.sh).
 
 Configuration (override via environment variables before import):
-  LOG_FORMAT   text | json   (default: text if stdout is a TTY, else json)
-  LOG_LEVEL    info | debug  (default: info)
-  LOG_FILE     path          (default: a timestamped file under LOG_DIR)
+  LOG_FORMAT   text | json                 (default: text if stdout is a TTY, else json)
+  LOG_LEVEL    debug | info | warn | error  (default: info)
+  LOG_FILE     path                         (default: a timestamped file under LOG_DIR)
   RUN_ID       string         (default: ADO BUILD_BUILDID, else a UUID)
 """
 
@@ -52,6 +52,19 @@ _COLORS = {
     "error": "\033[31m",    # red
 }
 
+# Severity ranking. A message is emitted only when its own level is at or above
+# the configured LOG_LEVEL threshold, e.g. LOG_LEVEL=warn shows warn + error.
+_LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+
+def _enabled(level: str) -> bool:
+    """True when `level` is at or above the configured LOG_LEVEL threshold.
+
+    Unknown values (for either the message level or LOG_LEVEL) fall back to
+    'info' so a typo never silences the logs entirely.
+    """
+    threshold = _LEVELS.get(LOG_LEVEL.lower(), _LEVELS["info"])
+    return _LEVELS.get(level, _LEVELS["info"]) >= threshold
+
 def configure(*, log_format=None, log_level=None, version="", commit="",
               vendor="", gpu="", os="", fips=False) -> None:
     """Set logger configuration explicitly (call once at startup)."""
@@ -74,11 +87,11 @@ def _redact(s: str) -> str:
 
 def _log(level: str, op: str, message: str) -> None:
     """Emit a single log record."""
-    message = _redact(message)
-
-    # debug messages only when LOG_LEVEL=debug
-    if level == "debug" and LOG_LEVEL != "debug":
+    # Skip anything below the configured LOG_LEVEL threshold.
+    if not _enabled(level):
         return
+
+    message = _redact(message)
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
