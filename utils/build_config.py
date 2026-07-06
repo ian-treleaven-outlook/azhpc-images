@@ -186,7 +186,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("bootstrap", "../distros/<...>/install_utils.sh"),
         Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
-        Step("install-doca",    "install_doca.sh"),         # TODO: gate on sku_has_infiniband (runtime)
+        Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),         # TODO: gate on sku_has_infiniband (runtime)
         Step("install-pmix",    "install_pmix.sh"),
         Step("install-mpis",    "install_mpis.sh"),
         Step("install-mpifileutils-deps", action=install_mpifileutils_deps),
