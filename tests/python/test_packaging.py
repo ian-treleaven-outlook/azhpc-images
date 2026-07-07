@@ -12,7 +12,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components import install_mpifileutils, install_nccl
+from components.python import install_mpifileutils, install_nccl, install_doca
 
 
 def _which(*available: str):
@@ -175,6 +175,23 @@ class NcclDepsTests(unittest.TestCase):
         with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
             rc = install_nccl.install_deps(env={})
         self.assertEqual(rc, 3)
+
+
+class DocaVersionParseTests(unittest.TestCase):
+    def test_parses_openmpi_version(self):
+        sample = "Package: openmpi\nVersion: 4.1.5-1\nArchitecture: amd64\n"
+        self.assertEqual(install_doca.parse_openmpi_version(sample), "4.1.5-1")
+
+    def test_takes_first_version(self):
+        # Mirrors awk '{...; exit}' — only the first Version line is used.
+        sample = "Version: 4.1.5-1\nVersion: 5.0.0-2\n"
+        self.assertEqual(install_doca.parse_openmpi_version(sample), "4.1.5-1")
+
+    def test_missing_version_returns_none(self):
+        self.assertIsNone(install_doca.parse_openmpi_version("Package: openmpi\n"))
+
+    def test_blank_version_returns_none(self):
+        self.assertIsNone(install_doca.parse_openmpi_version("Version: \n"))
 
 
 if __name__ == "__main__":

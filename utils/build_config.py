@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components import install_mpifileutils, install_nccl
+from components.python import install_mpifileutils, install_nccl
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
