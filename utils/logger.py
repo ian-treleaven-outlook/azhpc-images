@@ -117,9 +117,14 @@ def _log(level: str, op: str, message: str) -> None:
 
     print(line)
     if LOG_FILE:
-        # File gets the uncolored, full-timestamp version.
-        with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(line_raw + "\n")
+        # File gets the uncolored, full-timestamp version. If the log file isn't
+        # writable (e.g. /var/log/azhpc without root), degrade gracefully —
+        # keep printing to the screen instead of crashing the caller.
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(line_raw + "\n")
+        except OSError:
+            pass
 
 def log_info(op: str, message: str) -> None:
     """INFO: a high-level operation."""
