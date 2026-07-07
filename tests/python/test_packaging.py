@@ -12,7 +12,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from utils import build_config
+from components import install_mpifileutils, install_nccl
 
 
 def _which(*available: str):
@@ -103,44 +103,77 @@ class PackageInstallerTests(unittest.TestCase):
 
 
 class MpifileutilsDepsTests(unittest.TestCase):
-    def test_selects_apt_dep_list(self):
-        pm = PackageManager(name="apt-get", path="/usr/bin/apt-get")
+    def _fake_installer(self, manager_name, succeeds=True):
         fake = mock.Mock()
-        fake.manager = pm
-        fake.install_package.return_value = True
-        with mock.patch.object(build_config, "PackageInstaller", return_value=fake):
-            rc = build_config.install_mpifileutils_deps(env={})
+        fake.manager = (None if manager_name is None
+                        else PackageManager(name=manager_name,
+                                            path=f"/usr/bin/{manager_name}"))
+        fake.install_package.return_value = succeeds
+        return fake
+
+    def test_selects_apt_dep_list(self):
+        fake = self._fake_installer("apt-get")
+        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
+            rc = install_mpifileutils.install_deps(env={})
         self.assertEqual(rc, 0)
         fake.install_package.assert_called_once_with(
             ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"]
         )
 
     def test_selects_rpm_dep_list(self):
-        pm = PackageManager(name="tdnf", path="/usr/bin/tdnf")
-        fake = mock.Mock()
-        fake.manager = pm
-        fake.install_package.return_value = True
-        with mock.patch.object(build_config, "PackageInstaller", return_value=fake):
-            rc = build_config.install_mpifileutils_deps(env={})
+        fake = self._fake_installer("tdnf")
+        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
+            rc = install_mpifileutils.install_deps(env={})
         self.assertEqual(rc, 0)
         fake.install_package.assert_called_once_with(
             ["bzip2-devel", "libattr-devel", "libarchive-devel"]
         )
 
     def test_returns_3_when_install_fails(self):
-        pm = PackageManager(name="apt-get", path="/usr/bin/apt-get")
-        fake = mock.Mock()
-        fake.manager = pm
-        fake.install_package.return_value = False
-        with mock.patch.object(build_config, "PackageInstaller", return_value=fake):
-            rc = build_config.install_mpifileutils_deps(env={})
+        fake = self._fake_installer("apt-get", succeeds=False)
+        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
+            rc = install_mpifileutils.install_deps(env={})
         self.assertEqual(rc, 3)
 
     def test_returns_3_when_no_manager(self):
+        fake = self._fake_installer(None)
+        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
+            rc = install_mpifileutils.install_deps(env={})
+        self.assertEqual(rc, 3)
+
+
+class NcclDepsTests(unittest.TestCase):
+    def _fake_installer(self, manager_name, succeeds=True):
         fake = mock.Mock()
-        fake.manager = None
-        with mock.patch.object(build_config, "PackageInstaller", return_value=fake):
-            rc = build_config.install_mpifileutils_deps(env={})
+        fake.manager = (None if manager_name is None
+                        else PackageManager(name=manager_name,
+                                            path=f"/usr/bin/{manager_name}"))
+        fake.install_package.return_value = succeeds
+        return fake
+
+    def test_selects_apt_dep_list(self):
+        fake = self._fake_installer("apt-get")
+        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
+            rc = install_nccl.install_deps(env={})
+        self.assertEqual(rc, 0)
+        fake.install_package.assert_called_once_with(
+            ["build-essential", "devscripts", "debhelper", "fakeroot",
+             "zlib1g-dev", "libibverbs-dev"]
+        )
+
+    def test_selects_rpm_dep_list(self):
+        fake = self._fake_installer("tdnf")
+        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
+            rc = install_nccl.install_deps(env={})
+        self.assertEqual(rc, 0)
+        fake.install_package.assert_called_once_with(
+            ["rpm-build", "rpmdevtools", "autoconf", "automake", "git", "libtool"]
+        )
+
+    def test_returns_3_when_no_manager(self):
+        fake = self._fake_installer(None)
+        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
+            rc = install_nccl.install_deps(env={})
         self.assertEqual(rc, 3)
 
 

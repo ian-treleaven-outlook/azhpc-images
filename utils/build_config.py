@@ -6,10 +6,11 @@ from pathlib import Path
 import json
 from utils.logger import log_info, log_warn, log_error
 from utils.process import exec_program
-from utils.package_installer import PackageInstaller
 import os
 import platform
 import subprocess
+
+from components import install_mpifileutils, install_nccl
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -156,40 +157,16 @@ class Step:
     args: tuple[str, ...] = ()
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
 
-# install_mpifileutils build dependencies, keyed by package manager.
-# This replaces the if/elif/else distro branching that used to live in
-# components/install_mpifileutils.sh — detection is handled by
-# detect_package_manager(), so the only per-distro knowledge left is the
-# package names themselves.
-_MPIFILEUTILS_DEPS = {
-    "apt-get": ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"],
-    "apt":     ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"],
-    "tdnf":    ["bzip2-devel", "libattr-devel", "libarchive-devel"],
-    "yum":     ["bzip2-devel", "libattr-devel", "libarchive-devel"],
-    "dnf":     ["bzip2-devel", "libattr-devel", "libarchive-devel"],
-}
-
-def install_mpifileutils_deps(env: dict[str, str]) -> int:
-    """Install mpifileutils build dependencies via PackageInstaller.
-
-    Replaces the package-install slice of install_mpifileutils.sh.
-    """
-    installer = PackageInstaller()
-    if installer.manager is None:
-        return 3
-    deps = _MPIFILEUTILS_DEPS.get(installer.manager.name, [])
-    return 0 if installer.install_package(deps) else 3
-
 def build_plan(cfg: BuildConfig) -> list[Step]:
     """The ordered list of component steps, mirroring distros/<os>/install.sh."""
     return [
         Step("bootstrap", "../distros/<...>/install_utils.sh"),
         Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
-        Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),         # TODO: gate on sku_has_infiniband (runtime)
+        Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
         Step("install-pmix",    "install_pmix.sh"),
         Step("install-mpis",    "install_mpis.sh"),
-        Step("install-mpifileutils-deps", action=install_mpifileutils_deps),
+        Step("install-mpifileutils-deps", action=install_mpifileutils.install_deps),
         Step("install-mpifileutils", "install_mpifileutils.sh"),
 
         # NVIDIA branch
@@ -197,6 +174,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              when=lambda c: c.vendor == "NVidia" and c.gpu not in {"GB200", "NCv6"}),
         Step("install-nv-grid",   "install_nvidiagriddriver.sh",
              when=lambda c: c.vendor == "NVidia" and c.gpu == "NCv6"),
+        Step("install-nccl-deps", action=install_nccl.install_deps,
+             when=lambda c: c.vendor == "NVidia"),
         Step("install-nccl",      "install_nccl.sh",   when=lambda c: c.vendor == "NVidia"),
         Step("install-docker",    "install_docker.sh", when=lambda c: c.vendor == "NVidia"),
         Step("install-dcgm",      "install_dcgm.sh",   when=lambda c: c.vendor == "NVidia"),
