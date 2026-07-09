@@ -6,6 +6,7 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 
@@ -192,6 +193,30 @@ class DocaVersionParseTests(unittest.TestCase):
 
     def test_blank_version_returns_none(self):
         self.assertIsNone(install_doca.parse_openmpi_version("Version: \n"))
+
+
+class MpifileutilsConfigTests(unittest.TestCase):
+    def _env(self, versions):
+        return {
+            "COMPONENT_VERSIONS": json.dumps(versions),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_common_version(self):
+        env = self._env({
+            "mpifileutils": {"common": {"version": "0.12", "url": "u", "sha256": "s"}}
+        })
+        cfg = install_mpifileutils.get_config(env)
+        self.assertEqual(cfg["version"], "0.12")
+        self.assertEqual(cfg["url"], "u")
+
+    def test_get_config_missing_component_returns_none(self):
+        env = self._env({})
+        self.assertIsNone(install_mpifileutils.get_config(env))
 
 
 if __name__ == "__main__":
