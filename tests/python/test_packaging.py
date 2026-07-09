@@ -219,5 +219,51 @@ class MpifileutilsConfigTests(unittest.TestCase):
         self.assertIsNone(install_mpifileutils.get_config(env))
 
 
+class MpifileutilsInstallTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "mpifileutils": {"common": {
+                    "version": "0.12",
+                    "url": "https://example/mpifileutils-v0.12.tgz",
+                    "sha256": "s",
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_install_orchestrates_all_steps(self):
+        env = self._env()
+        with mock.patch.object(install_mpifileutils, "install_deps", return_value=0) as deps, \
+             mock.patch.object(install_mpifileutils, "download_and_verify",
+                               return_value="/tmp/mpifileutils-src/mpifileutils-v0.12.tgz") as dl, \
+             mock.patch.object(install_mpifileutils, "exec_program", return_value=0) as build, \
+             mock.patch("tarfile.open"), \
+             mock.patch("os.makedirs"), \
+             mock.patch("shutil.rmtree"):
+            rc = install_mpifileutils.install(env)
+        self.assertEqual(rc, 0)
+        deps.assert_called_once()
+        dl.assert_called_once()
+        build.assert_called_once()
+
+    def test_install_fails_when_no_version(self):
+        env = {"COMPONENT_VERSIONS": json.dumps({})}
+        self.assertEqual(install_mpifileutils.install(env), 3)
+
+    def test_install_fails_when_deps_fail(self):
+        env = self._env()
+        with mock.patch.object(install_mpifileutils, "install_deps", return_value=3), \
+             mock.patch.object(install_mpifileutils, "download_and_verify") as dl, \
+             mock.patch("os.makedirs"):
+            rc = install_mpifileutils.install(env)
+        self.assertEqual(rc, 3)
+        dl.assert_not_called()  # stopped before downloading
+
+
 if __name__ == "__main__":
     unittest.main()
