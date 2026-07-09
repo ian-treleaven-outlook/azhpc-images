@@ -14,7 +14,7 @@ import shutil
 import tarfile
 
 from utils.package_installer import PackageInstaller
-from utils.component_config import get_component_config
+from utils.component_config import get_component_config, write_component_version
 from utils.download import download_and_verify
 from utils.process import exec_program
 from utils.logger import log_info, log_error
@@ -118,6 +118,9 @@ def install(env: dict[str, str]) -> int:
     # 6. cleanup
     shutil.rmtree(_BUILD_DIR, ignore_errors=True)
     shutil.rmtree(_SRC_DIR, ignore_errors=True)
+
+    # 7. record the installed version
+    write_component_version("MPIFILEUTILS", version)
 
     log_info("install-mpifileutils",
              f"mpifileutils {version} installed to {_INSTALL_PREFIX}")

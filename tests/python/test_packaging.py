@@ -242,6 +242,7 @@ class MpifileutilsInstallTests(unittest.TestCase):
              mock.patch.object(install_mpifileutils, "download_and_verify",
                                return_value="/tmp/mpifileutils-src/mpifileutils-v0.12.tgz") as dl, \
              mock.patch.object(install_mpifileutils, "exec_program", return_value=0) as build, \
+             mock.patch.object(install_mpifileutils, "write_component_version"), \
              mock.patch("tarfile.open"), \
              mock.patch("os.makedirs"), \
              mock.patch("shutil.rmtree"):

@@ -15,11 +15,18 @@ jq), this returns the resolved config as a dict — or None when nothing matches
 
 from __future__ import annotations
 
+import json
+import os
 import re
+from pathlib import Path
 
 # Markers that indicate a <gpu_sku> node is a *nested* config (keyed by node
 # type) rather than a direct config. Mirrors the Bash has_nested_config check.
 _NESTED_MARKERS = ("default", "baremetal", "azure_vm")
+
+# Where installed component versions are recorded (mirrors the Bash
+# write_component_version in utils/utilities.sh).
+_VERSIONS_FILE = "/opt/azurehpc/component_versions.txt"
 
 
 def normalize_key(value: str) -> str:
@@ -71,3 +78,29 @@ def get_component_config(component, versions, *, distribution, architecture,
         config = comp.get("common")
 
     return config
+
+
+def write_component_version(component, version, path=_VERSIONS_FILE):
+    """Record an installed component's version.
+
+    Python port of write_component_version in utils/utilities.sh: maintains a
+    JSON file mapping component -> version (default
+    /opt/azurehpc/component_versions.txt), creating it or updating it in place.
+    Returns the path written.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    data[component] = version
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+    return path

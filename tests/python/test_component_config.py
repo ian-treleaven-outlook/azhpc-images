@@ -18,10 +18,11 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
-from utils.component_config import get_component_config
+from utils.component_config import get_component_config, write_component_version
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VERSIONS_JSON = REPO_ROOT / "versions.json"
@@ -99,6 +100,30 @@ class NormalizeKeyTests(unittest.TestCase):
         self.assertEqual(normalize_key("NVIDIA_A100"), "nvidia_a100")
         self.assertEqual(normalize_key("azure-vm"), "azure_vm")
         self.assertEqual(normalize_key("GB200--x"), "gb200_x")
+
+
+class WriteComponentVersionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "component_versions.txt"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_creates_file_with_component(self):
+        write_component_version("MPIFILEUTILS", "0.12", path=self.path)
+        self.assertEqual(json.loads(self.path.read_text()), {"MPIFILEUTILS": "0.12"})
+
+    def test_appends_and_updates(self):
+        write_component_version("A", "1", path=self.path)
+        write_component_version("B", "2", path=self.path)
+        write_component_version("A", "1.1", path=self.path)  # update existing key
+        self.assertEqual(json.loads(self.path.read_text()), {"A": "1.1", "B": "2"})
+
+    def test_recovers_from_corrupt_file(self):
+        self.path.write_text("not json at all")
+        write_component_version("A", "1", path=self.path)
+        self.assertEqual(json.loads(self.path.read_text()), {"A": "1"})
 
 
 if __name__ == "__main__":
