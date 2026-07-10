@@ -13,7 +13,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag
 
 
 def _which(*available: str):
@@ -405,6 +405,44 @@ class IntelLibsInstallTests(unittest.TestCase):
     def test_install_fails_when_no_version(self):
         self.assertEqual(
             install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class HpcdiagTests(unittest.TestCase):
+    def test_latest_tarball_url_parses(self):
+        api = json.dumps({"name": "r1",
+                          "tarball_url": "https://api.github.com/x/tarball/hpcdiag-1"})
+        self.assertEqual(install_hpcdiag.latest_tarball_url(api),
+                         "https://api.github.com/x/tarball/hpcdiag-1")
+
+    def test_latest_tarball_url_missing_returns_none(self):
+        self.assertIsNone(install_hpcdiag.latest_tarball_url(json.dumps({"name": "r1"})))
+
+    def test_install_orchestrates(self):
+        api_json = json.dumps({"tarball_url": "https://x/tarball/hpcdiag-1"}).encode()
+        resp_cm = mock.MagicMock()
+        resp_cm.__enter__.return_value.read.return_value = api_json
+        with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
+             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch("tarfile.open") as taropen, \
+             mock.patch("shutil.copy") as cp, \
+             mock.patch("shutil.rmtree"), \
+             mock.patch("pathlib.Path.mkdir"), \
+             mock.patch("pathlib.Path.unlink"):
+            taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
+            rc = install_hpcdiag.install(env={})
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        cp.assert_called_once()
+
+    def test_install_fails_when_no_tarball_url(self):
+        api_json = json.dumps({"name": "r1"}).encode()
+        resp_cm = mock.MagicMock()
+        resp_cm.__enter__.return_value.read.return_value = api_json
+        with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
+             mock.patch.object(install_hpcdiag, "download") as dl:
+            rc = install_hpcdiag.install(env={})
+        self.assertEqual(rc, 3)
+        dl.assert_not_called()
 
 
 if __name__ == "__main__":

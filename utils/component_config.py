@@ -80,6 +80,24 @@ def get_component_config(component, versions, *, distribution, architecture,
     return config
 
 
+def config_for(component, env):
+    """Resolve `component`'s config using the COMPONENT_VERSIONS + machine env
+    vars that component_env() populates.
+
+    A convenience wrapper around get_component_config for component modules,
+    which all resolve their config from `env` the same way.
+    """
+    versions = json.loads(env.get("COMPONENT_VERSIONS", "{}"))
+    return get_component_config(
+        component, versions,
+        distribution=env.get("DISTRIBUTION", ""),
+        architecture=env.get("ARCHITECTURE", ""),
+        gpu=env.get("GPU"),
+        sku=env.get("SKU"),
+        node_type=env.get("NODE_TYPE", "azure-vm"),
+    )
+
+
 def write_component_version(component, version, path=_VERSIONS_FILE):
     """Record an installed component's version.
 

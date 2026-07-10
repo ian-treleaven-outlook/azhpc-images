@@ -8,13 +8,12 @@ no bash subprocess required.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import tarfile
 from pathlib import Path
 
-from utils.component_config import get_component_config, write_component_version
+from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.process import exec_program
 from utils.logger import log_info, log_error
@@ -25,15 +24,7 @@ _INSTALL_PREFIX = "/opt/libfabric"
 
 def get_config(env):
     """Resolve libfabric's version/url/sha256 from versions.json."""
-    versions = json.loads(env.get("COMPONENT_VERSIONS", "{}"))
-    return get_component_config(
-        "libfabric", versions,
-        distribution=env.get("DISTRIBUTION", ""),
-        architecture=env.get("ARCHITECTURE", ""),
-        gpu=env.get("GPU"),
-        sku=env.get("SKU"),
-        node_type=env.get("NODE_TYPE", "azure-vm"),
-    )
+    return config_for("libfabric", env)
 
 
 def install(env: dict[str, str]) -> int:

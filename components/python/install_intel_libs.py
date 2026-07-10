@@ -6,10 +6,9 @@ run it non-interactively, record the version, and clean up.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from utils.component_config import get_component_config, write_component_version
+from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.process import exec_program
 from utils.logger import log_info, log_error
@@ -19,15 +18,7 @@ _WORK_DIR = "/tmp"
 
 def get_config(env):
     """Resolve Intel oneAPI MKL's version/url/sha256 from versions.json."""
-    versions = json.loads(env.get("COMPONENT_VERSIONS", "{}"))
-    return get_component_config(
-        "intel_one_mkl", versions,
-        distribution=env.get("DISTRIBUTION", ""),
-        architecture=env.get("ARCHITECTURE", ""),
-        gpu=env.get("GPU"),
-        sku=env.get("SKU"),
-        node_type=env.get("NODE_TYPE", "azure-vm"),
-    )
+    return config_for("intel_one_mkl", env)
 
 
 def install(env: dict[str, str]) -> int:
