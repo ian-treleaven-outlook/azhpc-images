@@ -159,9 +159,12 @@ class Step:
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
 
 def build_plan(cfg: BuildConfig) -> list[Step]:
-    """The ordered list of component steps, mirroring distros/<os>/install.sh."""
+    """The ordered list of component steps, mirroring distros/<os>/install.sh.
+
+    (System prep / install_utils.sh runs separately via ImageBuilder._bootstrap
+    before this plan executes.)
+    """
     return [
-        Step("bootstrap", "../distros/<...>/install_utils.sh"),
         Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
         Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
