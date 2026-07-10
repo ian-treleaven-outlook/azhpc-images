@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools
+from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -184,6 +184,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-nccl-deps", action=install_nccl.install_deps,
              when=lambda c: c.vendor == "NVidia"),
         Step("install-nccl",      "install_nccl.sh",   when=lambda c: c.vendor == "NVidia"),
+        Step("install-cuda-samples", action=install_cuda_samples.install,
+             when=lambda c: c.vendor == "NVidia"),
+        Step("install-nvbandwidth", action=install_nvbandwidth_tool.install,
+             when=lambda c: c.vendor == "NVidia"),
         Step("install-docker",    "install_docker.sh", when=lambda c: c.vendor == "NVidia"),
         Step("install-dcgm",      "install_dcgm.sh",   when=lambda c: c.vendor == "NVidia"),
 

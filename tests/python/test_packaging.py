@@ -15,7 +15,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool
 
 
 def _which(*available: str):
@@ -532,6 +532,115 @@ class MonitoringToolsTests(unittest.TestCase):
     def test_install_fails_when_no_version(self):
         self.assertEqual(
             install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class CudaSamplesTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "cuda": {"common": {
+                    "driver": {"version": "12.4"},
+                    "samples": {"version": "12.4.1", "sha256": "s"},
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_samples_version(self):
+        self.assertEqual(
+            install_cuda_samples.get_config(self._env())["samples"]["version"], "12.4.1")
+
+    def test_install_runs_all_build_steps(self):
+        env = self._env()
+        with mock.patch.object(install_cuda_samples, "download_and_verify",
+                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz") as dl, \
+             mock.patch.object(install_cuda_samples, "exec_program", return_value=0) as ex, \
+             mock.patch("tarfile.open"), \
+             mock.patch("os.makedirs"), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch("shutil.move") as mv, \
+             mock.patch("shutil.rmtree"):
+            rc = install_cuda_samples.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        self.assertEqual(ex.call_count, 2)  # cmake, make
+        mv.assert_called_once()
+
+    def test_install_stops_on_build_failure(self):
+        env = self._env()
+        with mock.patch.object(install_cuda_samples, "download_and_verify",
+                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz"), \
+             mock.patch.object(install_cuda_samples, "exec_program",
+                               side_effect=[0, 1]) as ex, \
+             mock.patch("tarfile.open"), \
+             mock.patch("os.makedirs"), \
+             mock.patch("shutil.move") as mv, \
+             mock.patch("shutil.rmtree"):
+            rc = install_cuda_samples.install(env)
+        self.assertEqual(rc, 3)
+        self.assertEqual(ex.call_count, 2)  # stopped after make failed
+        mv.assert_not_called()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_cuda_samples.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class NvbandwidthTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "nvbandwidth": {"common": {
+                    "version": "0.9",
+                    "url": "https://github.com/NVIDIA/nvbandwidth.git",
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "GB200",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_version(self):
+        self.assertEqual(
+            install_nvbandwidth_tool.get_config(self._env())["version"], "0.9")
+
+    def test_install_runs_clone_and_build(self):
+        env = self._env()
+        with mock.patch.object(install_nvbandwidth_tool, "install_deps", return_value=0), \
+             mock.patch.object(install_nvbandwidth_tool, "exec_program", return_value=0) as ex, \
+             mock.patch.object(install_nvbandwidth_tool, "write_component_version") as wcv, \
+             mock.patch("os.makedirs"), \
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch("shutil.move") as mv, \
+             mock.patch("shutil.rmtree"):
+            rc = install_nvbandwidth_tool.install(env)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ex.call_count, 3)  # git clone, cmake, make
+        mv.assert_called_once()
+        wcv.assert_called_once()
+
+    def test_install_stops_on_clone_failure(self):
+        env = self._env()
+        with mock.patch.object(install_nvbandwidth_tool, "install_deps", return_value=0), \
+             mock.patch.object(install_nvbandwidth_tool, "exec_program",
+                               side_effect=[1]) as ex, \
+             mock.patch.object(install_nvbandwidth_tool, "write_component_version") as wcv, \
+             mock.patch("os.makedirs"), \
+             mock.patch("shutil.rmtree"):
+            rc = install_nvbandwidth_tool.install(env)
+        self.assertEqual(rc, 3)
+        self.assertEqual(ex.call_count, 1)  # stopped after clone failed
+        wcv.assert_not_called()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_nvbandwidth_tool.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
 
 
 if __name__ == "__main__":
