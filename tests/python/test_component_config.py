@@ -28,13 +28,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 VERSIONS_JSON = REPO_ROOT / "versions.json"
 UTILITIES_SH = REPO_ROOT / "utils" / "utilities.sh"
 
-# The lookup scenario under test: Ubuntu 24.04 + A100 + x64 (the design slice).
-SCENARIO = {
-    "DISTRIBUTION": "ubuntu24.04",
-    "ARCHITECTURE": "x86_64",
-    "GPU": "nvidia_a100",
-    "SKU": "A100",
-    "NODE_TYPE": "azure-vm",
+# Lookup scenarios under test. The differential check runs for every scenario,
+# so the harder paths (baremetal, aarch64, RPM distros) get exercised too — not
+# just the A100/x64 case, which mostly falls straight through to `common`.
+SCENARIOS = {
+    "ubuntu24 / A100 / x64 / vm": {
+        "DISTRIBUTION": "ubuntu24.04", "ARCHITECTURE": "x86_64",
+        "GPU": "NVIDIA", "SKU": "A100", "NODE_TYPE": "azure-vm",
+    },
+    "ubuntu24 / GB200 / aarch64 / baremetal": {
+        "DISTRIBUTION": "ubuntu24.04", "ARCHITECTURE": "aarch64",
+        "GPU": "NVIDIA", "SKU": "GB200", "NODE_TYPE": "baremetal",
+    },
+    "ubuntu24 / GB200 / aarch64 / vm": {
+        "DISTRIBUTION": "ubuntu24.04", "ARCHITECTURE": "aarch64",
+        "GPU": "NVIDIA", "SKU": "GB200", "NODE_TYPE": "azure-vm",
+    },
+    "azurelinux3 / MI300 / x64 / vm": {
+        "DISTRIBUTION": "azurelinux3.0", "ARCHITECTURE": "x86_64",
+        "GPU": "AMD", "SKU": "MI300", "NODE_TYPE": "azure-vm",
+    },
 }
 
 
@@ -42,10 +55,10 @@ def _tools_available() -> bool:
     return bool(shutil.which("bash") and shutil.which("jq"))
 
 
-def _bash_get_component_config(component: str, versions_text: str):
-    """Invoke the real Bash get_component_config for one component."""
+def _bash_get_component_config(component: str, versions_text: str, scenario: dict):
+    """Invoke the real Bash get_component_config for one component + scenario."""
     env = os.environ.copy()
-    env.update(SCENARIO)
+    env.update(scenario)
     env["COMPONENT_VERSIONS"] = versions_text
     script = f'source "{UTILITIES_SH}"; get_component_config "{component}"'
     proc = subprocess.run(["bash", "-c", script], env=env,
@@ -63,33 +76,45 @@ class ComponentConfigParityTests(unittest.TestCase):
         cls.versions_text = VERSIONS_JSON.read_text(encoding="utf-8")
         cls.versions = json.loads(cls.versions_text)
 
-    def _python_config(self, component):
+    def _python_config(self, component, scenario):
         return get_component_config(
             component, self.versions,
-            distribution=SCENARIO["DISTRIBUTION"],
-            architecture=SCENARIO["ARCHITECTURE"],
-            gpu=SCENARIO["GPU"], sku=SCENARIO["SKU"],
-            node_type=SCENARIO["NODE_TYPE"],
+            distribution=scenario["DISTRIBUTION"],
+            architecture=scenario["ARCHITECTURE"],
+            gpu=scenario["GPU"], sku=scenario["SKU"],
+            node_type=scenario["NODE_TYPE"],
         )
 
-    def test_python_matches_bash_for_every_component(self):
+    def test_python_matches_bash_across_scenarios(self):
         mismatches = []
-        for component in self.versions:
-            expected = _bash_get_component_config(component, self.versions_text)
-            actual = self._python_config(component)
-            if expected != actual:
-                mismatches.append((component, expected, actual))
+        for name, scenario in SCENARIOS.items():
+            for component in self.versions:
+                expected = _bash_get_component_config(component, self.versions_text, scenario)
+                actual = self._python_config(component, scenario)
+                if expected != actual:
+                    mismatches.append((name, component, expected, actual))
 
         if mismatches:
             report = "\n".join(
-                f"  {c}:\n    bash   = {e}\n    python = {a}"
-                for c, e, a in mismatches
+                f"  [{s}] {c}:\n    bash   = {e}\n    python = {a}"
+                for s, c, e, a in mismatches
             )
-            self.fail(f"Python and Bash disagree for {len(mismatches)} component(s):\n{report}")
+            self.fail(f"Python and Bash disagree in {len(mismatches)} case(s):\n{report}")
+
+    def test_baremetal_scenario_exercises_a_distinct_path(self):
+        # Confirm the baremetal scenario actually reaches a baremetal-specific
+        # config (a different result than the A100/common case), so the parity
+        # check above is meaningfully covering the baremetal / nested logic.
+        baremetal = self._python_config(
+            "cmake", SCENARIOS["ubuntu24 / GB200 / aarch64 / baremetal"])
+        common = self._python_config(
+            "cmake", SCENARIOS["ubuntu24 / A100 / x64 / vm"])
+        self.assertIsInstance(baremetal, dict)
+        self.assertNotEqual(baremetal, common)
 
     def test_at_least_one_component_resolved(self):
-        # Sanity check: the scenario should resolve real config for common cases.
-        cfg = self._python_config("mpifileutils")
+        cfg = self._python_config(
+            "mpifileutils", SCENARIOS["ubuntu24 / A100 / x64 / vm"])
         self.assertIsInstance(cfg, dict)
         self.assertIn("version", cfg)
 
