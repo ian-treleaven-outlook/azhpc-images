@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag
+from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -174,6 +174,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-mpifileutils", action=install_mpifileutils.install),
         Step("install-intel-libs", action=install_intel_libs.install),
         Step("install-hpcdiag", action=install_hpcdiag.install),
+        Step("install-monitoring-tools", action=install_monitoring_tools.install),
 
         # NVIDIA branch
         Step("install-nv-driver", "install_nvidiagpudriver.sh",

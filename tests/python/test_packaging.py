@@ -7,13 +7,15 @@ Run from the repo root:
 from __future__ import annotations
 
 import json
+import os
+import tarfile
 import unittest
 from unittest import mock
 
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools
 
 
 def _which(*available: str):
@@ -443,6 +445,93 @@ class HpcdiagTests(unittest.TestCase):
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 3)
         dl.assert_not_called()
+
+
+class MonitoringToolsTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "moneo": {"common": {"version": "1.2.3", "sha256": "s"}}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_version(self):
+        self.assertEqual(
+            install_monitoring_tools.get_config(self._env())["version"], "1.2.3")
+
+    def test_extract_stripped_drops_top_level_dir(self):
+        import io
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tar_path = os.path.join(tmp, "moneo.tar.gz")
+            with tarfile.open(tar_path, "w:gz") as tar:
+                data = b"hi"
+                info = tarfile.TarInfo("Moneo-1.2.3/moneo.py")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            dest = os.path.join(tmp, "Moneo")
+            os.makedirs(dest)
+            install_monitoring_tools.extract_stripped(tar_path, dest)
+            self.assertTrue(os.path.exists(os.path.join(dest, "moneo.py")))
+            self.assertFalse(os.path.exists(os.path.join(dest, "Moneo-1.2.3")))
+
+    def test_ensure_line_appends_when_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bashrc")
+            self.assertTrue(install_monitoring_tools.ensure_line(path, "alias x='y'"))
+            with open(path) as handle:
+                self.assertEqual(handle.read(), "alias x='y'\n")
+
+    def test_ensure_line_skips_when_present(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bashrc")
+            with open(path, "w") as handle:
+                handle.write("alias x='y'\n")
+            self.assertFalse(install_monitoring_tools.ensure_line(path, "alias x='y'"))
+
+    def test_install_orchestrates(self):
+        env = self._env()
+        with mock.patch.object(install_monitoring_tools, "install_deps", return_value=0), \
+             mock.patch.object(install_monitoring_tools, "download_and_verify",
+                               return_value="/opt/azurehpc/tools/v1.2.3.tar.gz") as dl, \
+             mock.patch.object(install_monitoring_tools, "extract_stripped") as ex, \
+             mock.patch.object(install_monitoring_tools, "exec_program", return_value=0), \
+             mock.patch.object(install_monitoring_tools, "ensure_line") as el, \
+             mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
+             mock.patch("os.makedirs"), \
+             mock.patch("os.chmod"), \
+             mock.patch("os.remove"):
+            rc = install_monitoring_tools.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        ex.assert_called_once()
+        el.assert_called_once()
+        wcv.assert_called_once()
+
+    def test_install_fails_when_configure_fails(self):
+        env = self._env()
+        with mock.patch.object(install_monitoring_tools, "install_deps", return_value=0), \
+             mock.patch.object(install_monitoring_tools, "download_and_verify",
+                               return_value="/opt/azurehpc/tools/v1.2.3.tar.gz"), \
+             mock.patch.object(install_monitoring_tools, "extract_stripped"), \
+             mock.patch.object(install_monitoring_tools, "exec_program", return_value=1), \
+             mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
+             mock.patch("os.makedirs"), \
+             mock.patch("os.chmod"):
+            rc = install_monitoring_tools.install(env)
+        self.assertEqual(rc, 3)
+        wcv.assert_not_called()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
 
 
 if __name__ == "__main__":
