@@ -13,7 +13,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric
 
 
 def _which(*available: str):
@@ -304,6 +304,59 @@ class CmakeInstallTests(unittest.TestCase):
     def test_install_fails_when_no_version(self):
         self.assertEqual(
             install_cmake.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class LibfabricInstallTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "libfabric": {"common": {
+                    "version": "2.5.0",
+                    "url": "https://example/libfabric-2.5.0.tar.bz2",
+                    "sha256": "s",
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "NCv6",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_version(self):
+        self.assertEqual(install_libfabric.get_config(self._env())["version"], "2.5.0")
+
+    def test_install_runs_all_build_steps(self):
+        env = self._env()
+        with mock.patch.object(install_libfabric, "download_and_verify",
+                               return_value="/tmp/libfabric-2.5.0.tar.bz2") as dl, \
+             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
+             mock.patch.object(install_libfabric, "exec_program", return_value=0) as ex, \
+             mock.patch("tarfile.open"), \
+             mock.patch("shutil.rmtree"):
+            rc = install_libfabric.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        self.assertEqual(ex.call_count, 3)  # configure, make, make install
+        wcv.assert_called_once()
+
+    def test_install_stops_on_build_failure(self):
+        env = self._env()
+        with mock.patch.object(install_libfabric, "download_and_verify",
+                               return_value="/tmp/libfabric-2.5.0.tar.bz2"), \
+             mock.patch.object(install_libfabric, "exec_program",
+                               side_effect=[0, 1]) as ex, \
+             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
+             mock.patch("tarfile.open"), \
+             mock.patch("shutil.rmtree"):
+            rc = install_libfabric.install(env)
+        self.assertEqual(rc, 3)
+        self.assertEqual(ex.call_count, 2)  # stopped after make failed
+        wcv.assert_not_called()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
 
 
 if __name__ == "__main__":

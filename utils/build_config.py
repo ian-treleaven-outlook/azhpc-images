@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl, install_cmake
+from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -168,6 +168,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-cmake",   action=install_cmake.install, when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
         Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
+        Step("install-libfabric", action=install_libfabric.install, when=lambda c: c.gpu == "NCv6"),
         Step("install-pmix",    "install_pmix.sh"),
         Step("install-mpis",    "install_mpis.sh"),
         Step("install-mpifileutils", action=install_mpifileutils.install),
