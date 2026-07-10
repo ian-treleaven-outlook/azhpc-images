@@ -13,7 +13,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake
 
 
 def _which(*available: str):
@@ -264,6 +264,46 @@ class MpifileutilsInstallTests(unittest.TestCase):
             rc = install_mpifileutils.install(env)
         self.assertEqual(rc, 3)
         dl.assert_not_called()  # stopped before downloading
+
+
+class CmakeInstallTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "cmake": {"common": {
+                    "version": "4.3.1",
+                    "url": "https://example/cmake-4.3.1-linux-x86_64.tar.gz",
+                    "sha256": "s",
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_version(self):
+        self.assertEqual(install_cmake.get_config(self._env())["version"], "4.3.1")
+
+    def test_install_orchestrates_all_steps(self):
+        env = self._env()
+        with mock.patch.object(install_cmake, "download_and_verify",
+                               return_value="/tmp/cmake-4.3.1-linux-x86_64.tar.gz") as dl, \
+             mock.patch.object(install_cmake, "write_component_version") as wcv, \
+             mock.patch("tarfile.open"), \
+             mock.patch("shutil.copy") as cp, \
+             mock.patch("glob.glob", return_value=[]), \
+             mock.patch("shutil.rmtree"):
+            rc = install_cmake.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        self.assertEqual(cp.call_count, 4)  # ccmake, cmake, cpack, ctest
+        wcv.assert_called_once()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_cmake.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
 
 
 if __name__ == "__main__":

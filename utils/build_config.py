@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl
+from components.python import install_mpifileutils, install_nccl, install_cmake
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -165,7 +165,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     before this plan executes.)
     """
     return [
-        Step("install-cmake",   "install_cmake.sh",         when=lambda c: c.gpu != "GB200"),
+        Step("install-cmake",   action=install_cmake.install, when=lambda c: c.gpu != "GB200"),
         Step("install-lustre",  "install_lustre_client.sh"),
         Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
         Step("install-pmix",    "install_pmix.sh"),
