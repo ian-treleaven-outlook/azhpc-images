@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric
+from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -172,6 +172,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-pmix",    "install_pmix.sh"),
         Step("install-mpis",    "install_mpis.sh"),
         Step("install-mpifileutils", action=install_mpifileutils.install),
+        Step("install-intel-libs", action=install_intel_libs.install),
 
         # NVIDIA branch
         Step("install-nv-driver", "install_nvidiagpudriver.sh",

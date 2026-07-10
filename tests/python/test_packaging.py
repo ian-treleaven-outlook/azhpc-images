@@ -13,7 +13,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs
 
 
 def _which(*available: str):
@@ -357,6 +357,54 @@ class LibfabricInstallTests(unittest.TestCase):
     def test_install_fails_when_no_version(self):
         self.assertEqual(
             install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class IntelLibsInstallTests(unittest.TestCase):
+    def _env(self):
+        return {
+            "COMPONENT_VERSIONS": json.dumps({
+                "intel_one_mkl": {"common": {
+                    "version": "2025.3.1.11",
+                    "url": "https://example/intel-onemkl-2025.3.1.11_offline.sh",
+                    "sha256": "s",
+                }}
+            }),
+            "DISTRIBUTION": "ubuntu24.04",
+            "ARCHITECTURE": "x86_64",
+            "GPU": "NVIDIA",
+            "SKU": "A100",
+            "NODE_TYPE": "azure-vm",
+        }
+
+    def test_get_config_resolves_version(self):
+        self.assertEqual(
+            install_intel_libs.get_config(self._env())["version"], "2025.3.1.11")
+
+    def test_install_runs_installer(self):
+        env = self._env()
+        with mock.patch.object(install_intel_libs, "download_and_verify",
+                               return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
+             mock.patch.object(install_intel_libs, "exec_program", return_value=0) as ex, \
+             mock.patch.object(install_intel_libs, "write_component_version") as wcv:
+            rc = install_intel_libs.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        ex.assert_called_once()
+        wcv.assert_called_once()
+
+    def test_install_fails_when_installer_fails(self):
+        env = self._env()
+        with mock.patch.object(install_intel_libs, "download_and_verify",
+                               return_value="/tmp/x.sh"), \
+             mock.patch.object(install_intel_libs, "exec_program", return_value=1), \
+             mock.patch.object(install_intel_libs, "write_component_version") as wcv:
+            rc = install_intel_libs.install(env)
+        self.assertEqual(rc, 3)
+        wcv.assert_not_called()
+
+    def test_install_fails_when_no_version(self):
+        self.assertEqual(
+            install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
 
 
 if __name__ == "__main__":
