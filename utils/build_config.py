@@ -50,7 +50,8 @@ def _detect_arch_distro(distribution: str) -> str:
         cmd = ["dpkg", "--print-architecture"]
     else:
         cmd = ["rpm", "--eval", "%{_arch}"]
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(cmd, capture_output
+                          =True, text=True).stdout.strip()
 
 def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     """The env vars set_properties.sh exported that the component scripts read.
@@ -166,8 +167,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
         Step("install-pmix",    "install_pmix.sh"),
         Step("install-mpis",    "install_mpis.sh"),
-        Step("install-mpifileutils-deps", action=install_mpifileutils.install_deps),
-        Step("install-mpifileutils", "install_mpifileutils.sh"),
+        Step("install-mpifileutils", action=install_mpifileutils.install),
 
         # NVIDIA branch
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
