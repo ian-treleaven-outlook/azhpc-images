@@ -34,6 +34,9 @@ COMMANDS:
     versions                Print the resolved component versions that would be
                             installed for a target (--os/--vendor/--gpu). Does
                             not build anything.
+    validate                Check versions.json for internal consistency for a
+                            target (e.g. CUDA-major agreement). Exit 0 if clean,
+                            1 if issues are found.
 
 REQUIRED:
     --vendor <VENDOR>       Hardware vendor: NVidia | AMD
@@ -142,12 +145,55 @@ def cmd_versions(args_list) -> int:
     print(format_report(report))
     return 0
 
+def cmd_validate(args_list) -> int:
+    """`azhpc validate --os <OS> --vendor <V> --gpu <SKU>` — check versions.json
+    for internal consistency for a target. Exit 0 if clean, 1 if issues."""
+    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.version_validate import check_cuda_consistency
+
+    p = argparse.ArgumentParser(prog="azhpc validate")
+    p.add_argument("--os", required=True, choices=sorted(DISTRO_DIRS))
+    p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
+    p.add_argument("--gpu", required=True)
+    p.add_argument("--arch", default="x86_64")
+    p.add_argument("--node-type", dest="node_type", default="azure-vm")
+    p.add_argument("--spec", default="versions.json")
+    ns = p.parse_args(args_list)
+
+    if ns.gpu not in VALID_GPUS[ns.vendor]:
+        print(f"error: GPU '{ns.gpu}' not valid for vendor {ns.vendor}",
+              file=sys.stderr)
+        return 1
+
+    spec = Path(ns.spec)
+    if not spec.is_file():
+        print(f"error: spec file not found: {ns.spec}", file=sys.stderr)
+        return 2
+    versions = json.loads(spec.read_text(encoding="utf-8"))
+
+    distribution = DISTRO_DIRS[ns.os].split("/")[-1]
+    issues = check_cuda_consistency(
+        versions, distribution=distribution, architecture=ns.arch,
+        gpu=GPU_ARGS[ns.vendor], sku=ns.gpu, node_type=ns.node_type,
+    )
+    target = f"{ns.vendor}/{ns.gpu} on {ns.os} ({ns.arch}, {ns.node_type})"
+    if not issues:
+        print(f"OK: no version-consistency issues for {target}")
+        return 0
+    print(f"FAIL: {len(issues)} version-consistency issue(s) for {target}:",
+          file=sys.stderr)
+    for issue in issues:
+        print(f"  - {issue}", file=sys.stderr)
+    return 1
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "install":
         return cmd_install(argv[1:])
     if argv and argv[0] == "versions":
         return cmd_versions(argv[1:])
+    if argv and argv[0] == "validate":
+        return cmd_validate(argv[1:])
 
     args = build_parser().parse_args(argv)
     if args.help:
