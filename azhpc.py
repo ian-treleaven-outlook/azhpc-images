@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from utils.build_config import resolve_config, ConfigError, ImageBuilder
@@ -30,6 +31,9 @@ USAGE:
 COMMANDS:
     install <PACKAGE>...    Install one or more packages using the detected
                             system package manager (apt-get, dnf, tdnf, ...)
+    versions                Print the resolved component versions that would be
+                            installed for a target (--os/--vendor/--gpu). Does
+                            not build anything.
 
 REQUIRED:
     --vendor <VENDOR>       Hardware vendor: NVidia | AMD
@@ -102,10 +106,48 @@ def cmd_install(args_list) -> int:
     ok = PackageInstaller().install_package(packages)
     return 0 if ok else 3
 
+def cmd_versions(args_list) -> int:
+    """`azhpc versions --os <OS> --vendor <V> --gpu <SKU>` — print the resolved
+    component versions for a target without building anything."""
+    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.version_report import resolve_report, format_report
+
+    p = argparse.ArgumentParser(prog="azhpc versions")
+    p.add_argument("--os", required=True, choices=sorted(DISTRO_DIRS))
+    p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
+    p.add_argument("--gpu", required=True)
+    p.add_argument("--arch", default="x86_64")
+    p.add_argument("--node-type", dest="node_type", default="azure-vm")
+    p.add_argument("--spec", default="versions.json")
+    ns = p.parse_args(args_list)
+
+    if ns.gpu not in VALID_GPUS[ns.vendor]:
+        print(f"error: GPU '{ns.gpu}' not valid for vendor {ns.vendor}",
+              file=sys.stderr)
+        return 1
+
+    spec = Path(ns.spec)
+    if not spec.is_file():
+        print(f"error: spec file not found: {ns.spec}", file=sys.stderr)
+        return 2
+    versions = json.loads(spec.read_text(encoding="utf-8"))
+
+    distribution = DISTRO_DIRS[ns.os].split("/")[-1]
+    report = resolve_report(
+        versions, distribution=distribution, architecture=ns.arch,
+        gpu=GPU_ARGS[ns.vendor], sku=ns.gpu, node_type=ns.node_type,
+    )
+    print(f"# Resolved component versions for {ns.vendor}/{ns.gpu} "
+          f"on {ns.os} ({ns.arch}, {ns.node_type})")
+    print(format_report(report))
+    return 0
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "install":
         return cmd_install(argv[1:])
+    if argv and argv[0] == "versions":
+        return cmd_versions(argv[1:])
 
     args = build_parser().parse_args(argv)
     if args.help:
