@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool
+from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs
 from utils.sku import sku_has_infiniband
 
 MODULE_DIRS = {
@@ -165,6 +165,25 @@ class Step:
     base: str = "component"       # "component" (components/) or "distro" (build_dir)
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
 
+def _cleanup_downloads(env: dict[str, str]) -> int:
+    """Free space by removing downloaded tarballs/installers and extracted dirs.
+
+    Mirrors the inline cleanup in install.sh between install_dynolog_drl and
+    hpc-tuning. Runs the exact bash rm in the distro build dir. Destructive by
+    design; only ever runs during a real build() on the build VM.
+    """
+    build_dir = Path(env.get("TOP_DIR", ".")) / "distros" / env.get("DISTRIBUTION", "")
+    cleanup = (
+        "rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh; "
+        "rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*; "
+        "rm -rf /var/intel/; "
+        "rm -rf /var/cache/* || true; "
+        "rm -Rf -- */"
+    )
+    return exec_program(["bash", "-c", cleanup], "cleanup-downloads",
+                        cwd=str(build_dir), env=env)
+
+
 def build_plan(cfg: BuildConfig) -> list[Step]:
     """The ordered list of component steps, mirroring distros/<os>/install.sh.
 
@@ -238,13 +257,17 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # dynolog + dyno-relay-logger
         Step("install-dynolog-drl", "install_dynolog_drl.sh"),
 
+        # free space: remove downloaded tarballs/installers (inline rm in install.sh)
+        Step("cleanup-downloads", action=_cleanup_downloads),
+
         # optimizations + persistent RDMA naming
         Step("hpc-tuning", "hpc-tuning.sh"),
         Step("install-persistent-rdma-naming",
              "install_azure_persistent_rdma_naming.sh"),
 
         # not-GB200 group
-        Step("install-aznfs", "install_aznfs.sh", when=lambda c: c.gpu != "GB200"),
+        Step("install-aznfs", "install_aznfs.sh", action=install_aznfs.install,
+             when=lambda c: c.gpu != "GB200"),
         Step("install-hpcdiag", "install_hpcdiag.sh",
              action=install_hpcdiag.install, when=lambda c: c.gpu != "GB200"),
         Step("install-monitoring-tools", "install_monitoring_tools.sh",

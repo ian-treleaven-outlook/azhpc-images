@@ -15,7 +15,7 @@ from unittest import mock
 from utils import package_manager
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool
+from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool, install_aznfs
 
 
 def _which(*available: str):
@@ -641,6 +641,40 @@ class NvbandwidthTests(unittest.TestCase):
     def test_install_fails_when_no_version(self):
         self.assertEqual(
             install_nvbandwidth_tool.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+
+
+class AznfsTests(unittest.TestCase):
+    def test_install_ubuntu_uses_package_manager(self):
+        with mock.patch.object(install_aznfs, "PackageInstaller") as PI:
+            PI.return_value.manager = object()
+            PI.return_value.install_package.return_value = True
+            rc = install_aznfs.install({"DISTRIBUTION": "ubuntu24.04"})
+        self.assertEqual(rc, 0)
+        PI.return_value.install_package.assert_called_once_with(["aznfs"])
+
+    def test_install_fails_without_package_manager(self):
+        with mock.patch.object(install_aznfs, "PackageInstaller") as PI:
+            PI.return_value.manager = None
+            rc = install_aznfs.install({"DISTRIBUTION": "ubuntu24.04"})
+        self.assertEqual(rc, 3)
+
+    def test_install_azurelinux_runs_patched_installer(self):
+        env = {"DISTRIBUTION": "azurelinux3.0",
+               "COMPONENT_VERSIONS": json.dumps(
+                   {"aznfs": {"common": {"version": "2.0", "sha256": "s"}}})}
+        with mock.patch.object(install_aznfs, "download_and_verify",
+                               return_value="/tmp/aznfs_install.sh") as dl, \
+             mock.patch("pathlib.Path.read_text", return_value="yum install x"), \
+             mock.patch("pathlib.Path.write_text") as wt, \
+             mock.patch.object(install_aznfs, "exec_program", return_value=0) as ex:
+            rc = install_aznfs.install(env)
+        self.assertEqual(rc, 0)
+        dl.assert_called_once()
+        ex.assert_called_once()
+        self.assertIn("tdnf", wt.call_args[0][0])  # yum -> tdnf patch applied
+
+    def test_install_unsupported_distro(self):
+        self.assertEqual(install_aznfs.install({"DISTRIBUTION": "gentoo"}), 3)
 
 
 if __name__ == "__main__":

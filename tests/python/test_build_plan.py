@@ -43,7 +43,7 @@ def _is_subsequence(sub, full):
 
 
 def _plan_scripts(cfg):
-    return [s.script for s in build_plan(cfg) if s.when(cfg)]
+    return [s.script for s in build_plan(cfg) if s.when(cfg) and s.script]
 
 
 def _cfg(vendor, gpu, os="Ubuntu24"):
