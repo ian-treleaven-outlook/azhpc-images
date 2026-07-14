@@ -10,7 +10,8 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_nccl, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool
+from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool
+from utils.sku import sku_has_infiniband
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -106,6 +107,11 @@ class BuildConfig:
     def has_dedicated_path(self) -> bool:
         return self.gpu in DEDICATED_PATH_GPUS
 
+    @property
+    def architecture(self) -> str:
+        """Target CPU architecture, derived from the SKU (Grace SKUs are ARM)."""
+        return "aarch64" if self.gpu in {"GB200", "GB300"} else "x86_64"
+
 class ConfigError(Exception):
     def __init__(self, message: str, code: int):
         super().__init__(message)
@@ -153,47 +159,110 @@ def resolve_config(args) -> BuildConfig:
 @dataclass(frozen=True)
 class Step:
     op: str                       # log label, e.g. "install-rocm"
-    script: str = ""                                    # bash script in components/
-    action: Callable[[dict[str, str]], int] | None = None  # OR a python action
+    script: str = ""              # canonical bash script name (parity + bash exec)
+    action: Callable[[dict[str, str]], int] | None = None  # optional python action
     args: tuple[str, ...] = ()
+    base: str = "component"       # "component" (components/) or "distro" (build_dir)
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
 
 def build_plan(cfg: BuildConfig) -> list[Step]:
     """The ordered list of component steps, mirroring distros/<os>/install.sh.
 
+    Every step carries its canonical bash script name (for parity), plus an
+    optional python `action` used to run it natively. Order and `when` gates
+    follow distros/ubuntu24.04/install.sh exactly.
+
     (System prep / install_utils.sh runs separately via ImageBuilder._bootstrap
-    before this plan executes.)
+    before this plan executes. Inline shell in install.sh that isn't a component
+    script — the non-IB rdma-core install + mana_ib blacklist, the AMD moby
+    docker setup, and the tarball cleanup — is not represented here yet.)
     """
+    def nvidia(c):
+        return c.vendor == "NVidia"
+
+    def amd(c):
+        return c.vendor == "AMD"
+
     return [
-        Step("install-cmake",   action=install_cmake.install, when=lambda c: c.gpu != "GB200"),
-        Step("install-lustre",  "install_lustre_client.sh"),
-        Step("install-doca",    "install_doca.sh", when=lambda c: c.gpu != "NCv6"),  
-        Step("install-libfabric", action=install_libfabric.install, when=lambda c: c.gpu == "NCv6"),
-        Step("install-pmix",    "install_pmix.sh"),
-        Step("install-mpis",    "install_mpis.sh"),
-        Step("install-mpifileutils", action=install_mpifileutils.install),
-        Step("install-intel-libs", action=install_intel_libs.install),
-        Step("install-hpcdiag", action=install_hpcdiag.install),
-        Step("install-monitoring-tools", action=install_monitoring_tools.install),
+        # update cmake (skip GB200)
+        Step("install-cmake", "install_cmake.sh", action=install_cmake.install,
+             when=lambda c: c.gpu != "GB200"),
 
-        # NVIDIA branch
+        # Lustre client
+        Step("install-lustre", "install_lustre_client.sh"),
+
+        # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
+        Step("install-doca", "install_doca.sh",
+             when=lambda c: sku_has_infiniband(c.gpu)),
+        Step("install-libfabric", "install_libfabric.sh",
+             action=install_libfabric.install,
+             when=lambda c: not sku_has_infiniband(c.gpu)),
+
+        # PMIX + MPI libraries + mpifileutils
+        Step("install-pmix", "install_pmix.sh"),
+        Step("install-mpis", "install_mpis.sh"),
+        Step("install-mpifileutils", "install_mpifileutils.sh",
+             action=install_mpifileutils.install),
+
+        # --- NVIDIA driver branch (mutually exclusive by SKU) ---
+        Step("install-nv-driver-gb200", "install_nvidiagpudriver_gb200.sh",
+             base="distro", when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        Step("install-nvshmem", "install_nvshmem.sh",
+             when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        Step("install-nvloom", "install_nvloom.sh",
+             when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        Step("install-nvbandwidth", "install_nvbandwidth_tool.sh",
+             action=install_nvbandwidth_tool.install,
+             when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        Step("install-nv-grid", "install_nvidiagriddriver.sh",
+             when=lambda c: nvidia(c) and c.gpu == "NCv6"),
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
-             when=lambda c: c.vendor == "NVidia" and c.gpu not in {"GB200", "NCv6"}),
-        Step("install-nv-grid",   "install_nvidiagriddriver.sh",
-             when=lambda c: c.vendor == "NVidia" and c.gpu == "NCv6"),
-        Step("install-nccl-deps", action=install_nccl.install_deps,
-             when=lambda c: c.vendor == "NVidia"),
-        Step("install-nccl",      "install_nccl.sh",   when=lambda c: c.vendor == "NVidia"),
-        Step("install-cuda-samples", action=install_cuda_samples.install,
-             when=lambda c: c.vendor == "NVidia"),
-        Step("install-nvbandwidth", action=install_nvbandwidth_tool.install,
-             when=lambda c: c.vendor == "NVidia"),
-        Step("install-docker",    "install_docker.sh", when=lambda c: c.vendor == "NVidia"),
-        Step("install-dcgm",      "install_dcgm.sh",   when=lambda c: c.vendor == "NVidia"),
+             when=lambda c: nvidia(c) and c.gpu not in {"GB200", "NCv6"}),
 
-        # AMD branch
-        Step("install-rocm", "install_rocm.sh", when=lambda c: c.vendor == "AMD"),
-        Step("install-rccl", "install_rccl.sh", when=lambda c: c.vendor == "AMD"),
+        # NCCL, docker, DCGM (NVIDIA)
+        Step("install-nccl", "install_nccl.sh", when=nvidia),
+        Step("install-docker", "install_docker.sh", when=nvidia),
+        Step("install-dcgm", "install_dcgm.sh", when=nvidia),
+
+        # --- AMD branch ---
+        Step("install-rocm", "install_rocm.sh", when=amd),
+        Step("install-rccl", "install_rccl.sh", when=amd),
+
+        # --- x86_64 libraries ---
+        Step("install-amd-libs", "install_amd_libs.sh",
+             when=lambda c: c.architecture == "x86_64"),
+        Step("install-intel-libs", "install_intel_libs.sh",
+             action=install_intel_libs.install,
+             when=lambda c: c.architecture == "x86_64"),
+
+        # dynolog + dyno-relay-logger
+        Step("install-dynolog-drl", "install_dynolog_drl.sh"),
+
+        # optimizations + persistent RDMA naming
+        Step("hpc-tuning", "hpc-tuning.sh"),
+        Step("install-persistent-rdma-naming",
+             "install_azure_persistent_rdma_naming.sh"),
+
+        # not-GB200 group
+        Step("install-aznfs", "install_aznfs.sh", when=lambda c: c.gpu != "GB200"),
+        Step("install-hpcdiag", "install_hpcdiag.sh",
+             action=install_hpcdiag.install, when=lambda c: c.gpu != "GB200"),
+        Step("install-monitoring-tools", "install_monitoring_tools.sh",
+             action=install_monitoring_tools.install,
+             when=lambda c: c.gpu != "GB200"),
+        Step("install-health-checks", "install_health_checks.sh",
+             args=(cfg.gpu_arg,),
+             when=lambda c: c.gpu not in {"GB200", "NCv6"}),
+
+        # final configuration steps
+        Step("add-udev-rules", "add-udev-rules.sh"),
+        Step("copy-test-file", "copy_test_file.sh"),
+        Step("disable-cloudinit", "disable_cloudinit.sh"),
+        Step("setup-sku-customizations", "setup_sku_customizations.sh"),
+        Step("trivy-scan", "trivy_scan.sh"),
+        Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro"),
+        Step("disable-predictive-interface-renaming",
+             "disable_predictive_interface_renaming.sh", base="distro"),
     ]
 
 class ImageBuilder:
@@ -238,7 +307,8 @@ class ImageBuilder:
             if step.action is not None:
                 rc = step.action(env)
             else:
-                rc = exec_program([str(components / step.script), *step.args],
+                base_dir = build_dir if step.base == "distro" else components
+                rc = exec_program([str(base_dir / step.script), *step.args],
                                   step.op, cwd=str(build_dir), env=env)
             if rc != 0:
                 log_error(step.op, f"failed with exit code {rc}")

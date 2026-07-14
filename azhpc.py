@@ -7,7 +7,7 @@ import sys
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from utils.build_config import resolve_config, ConfigError, ImageBuilder
+from utils.build_config import resolve_config, ConfigError, ImageBuilder, build_plan
 from utils import logger
 
 VERSION = "0.1.0"
@@ -213,6 +213,12 @@ def main(argv=None) -> int:
     logger.log_info("resolve-config", f"Effective build: {config}")
     if args.dry_run:
         logger.log_info("dry-run", "Dry-run requested; not building")
+        plan = [s for s in build_plan(config) if s.when(config)]
+        print(f"# Build plan for {config.vendor}/{config.gpu} on {config.os} "
+              f"({config.architecture}) — {len(plan)} steps:")
+        for i, step in enumerate(plan, 1):
+            how = "python" if step.action is not None else "bash"
+            print(f"  {i:2d}. {step.op:<34} {step.script:<40} ({how})")
         return 0
 
     repo_root = Path(__file__).resolve().parent
