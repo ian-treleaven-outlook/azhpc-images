@@ -186,6 +186,19 @@ def cmd_validate(args_list) -> int:
         print(f"  - {issue}", file=sys.stderr)
     return 1
 
+def print_build_plan(config) -> None:
+    """Print the ordered steps a build would run, for --dry-run."""
+    # Keep only the steps that apply to this target (drop the gated-out ones).
+    steps = [step for step in build_plan(config) if step.when(config)]
+
+    print(f"# Build plan for {config.vendor}/{config.gpu} on {config.os} "
+          f"({config.architecture}) — {len(steps)} steps:")
+
+    # Columns: number, step name, bash script, and whether it runs as python/bash.
+    for number, step in enumerate(steps, start=1):
+        runner = "python" if step.action is not None else "bash"
+        print(f"  {number:2d}. {step.op:<34} {step.script:<40} ({runner})")
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "install":
@@ -213,12 +226,7 @@ def main(argv=None) -> int:
     logger.log_info("resolve-config", f"Effective build: {config}")
     if args.dry_run:
         logger.log_info("dry-run", "Dry-run requested; not building")
-        plan = [s for s in build_plan(config) if s.when(config)]
-        print(f"# Build plan for {config.vendor}/{config.gpu} on {config.os} "
-              f"({config.architecture}) — {len(plan)} steps:")
-        for i, step in enumerate(plan, 1):
-            how = "python" if step.action is not None else "bash"
-            print(f"  {i:2d}. {step.op:<34} {step.script:<40} ({how})")
+        print_build_plan(config)
         return 0
 
     repo_root = Path(__file__).resolve().parent

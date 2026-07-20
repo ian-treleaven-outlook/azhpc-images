@@ -207,7 +207,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-cmake", "install_cmake.sh", action=install_cmake.install,
              when=lambda c: c.gpu != "GB200"),
 
-        # Lustre client
+        # Lustre clients
         Step("install-lustre", "install_lustre_client.sh"),
 
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
@@ -306,38 +306,57 @@ class ImageBuilder:
 
     def build(self) -> int:
         cfg = self.config
+
+        # Warn (but continue) if this GPU uses the generic path rather than a
+        # dedicated one (GB200/NCv6/... have special handling; A100 does not).
         if not cfg.has_dedicated_path:
             log_warn("resolve-config",
                      f"GPU '{cfg.gpu}' has no dedicated build path; "
                      f"using generic {cfg.vendor} build")
 
+        # --- Phase 1: setup ---
+        # build_dir  = the distro folder the bash scripts run from
+        # components = where the component scripts live
+        # env        = vars handed to every step (this loads versions.json)
         build_dir = self.repo_root / cfg.distro_dir
         components = self.repo_root / "components"
         env = component_env(self.repo_root, cfg)
 
         log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
 
+        # --- Phase 2: bootstrap (system prep) ---
+        # Runs install_utils.sh first; abort the build if it fails.
         rc = self._bootstrap(build_dir, env)
         if rc != 0:
             log_error("bootstrap", f"system prep failed with exit code {rc}")
             return 3
 
+        # --- Phase 3: run each step of the plan, in order ---
         for step in build_plan(cfg):
+            # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA)
             if not step.when(cfg):
                 log_info(step.op, "skipped")
                 continue
+
             log_info(step.op, "starting")
+
+            # (b) run it: a python action, or the bash script via exec_program
             if step.action is not None:
                 rc = step.action(env)
             else:
+                # "distro" scripts live in build_dir; the rest in components/
                 base_dir = build_dir if step.base == "distro" else components
                 rc = exec_program([str(base_dir / step.script), *step.args],
                                   step.op, cwd=str(build_dir), env=env)
+
+            # (c) stop the whole build on the first failure
             if rc != 0:
                 log_error(step.op, f"failed with exit code {rc}")
                 return 3
             log_info(step.op, "done")
 
+        # --- Phase 4: every step passed ---
         log_info("build-image", "Image built successfully")
         return 0
+
         
