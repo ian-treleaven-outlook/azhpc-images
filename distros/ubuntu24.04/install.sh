@@ -170,3 +170,6 @@ $COMPONENT_DIR/trivy_scan.sh
 # clear history
 # Uncomment the line below if you are running this on a VM
 # $UTILS_DIR/clear_history.sh
+
+
+
