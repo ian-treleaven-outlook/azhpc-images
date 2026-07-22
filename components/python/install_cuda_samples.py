@@ -20,14 +20,9 @@ from utils.logger import log_info, log_error
 _WORK_DIR = "/tmp/cuda-samples-build"
 
 
-def get_config(env):
-    """Resolve the cuda component config (driver + samples) from versions.json."""
-    return config_for("cuda", env)
-
-
 def install(env):
     """Download -> extract -> cmake/make -> install Samples. Returns 0 or 3."""
-    cfg = get_config(env) or {}
+    cfg = config_for("cuda", env) or {}
     samples = cfg.get("samples") or {}
     driver = cfg.get("driver") or {}
     version = samples.get("version")

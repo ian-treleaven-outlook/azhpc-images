@@ -16,17 +16,12 @@ from utils.logger import log_info, log_error
 _WORK_DIR = "/tmp"
 
 
-def get_config(env):
-    """Resolve Intel oneAPI MKL's version/url/sha256 from versions.json."""
-    return config_for("intel_one_mkl", env)
-
-
 def install(env: dict[str, str]) -> int:
     """Download and run the Intel oneAPI MKL offline installer.
 
     Returns 0 on success, 3 on failure.
     """
-    cfg = get_config(env)
+    cfg = config_for("intel_one_mkl", env)
     if not cfg or not cfg.get("version"):
         log_error("install-intel-libs",
                   "could not resolve intel_one_mkl version from versions.json")

@@ -28,11 +28,6 @@ _DEPS = {
 }
 
 
-def get_config(env):
-    """Resolve nvbandwidth's version/url from versions.json."""
-    return config_for("nvbandwidth", env)
-
-
 def install_deps(env):
     """Install boost (and cmake on azurelinux/aarch64). Returns 0 or 3."""
     installer = PackageInstaller()
@@ -46,7 +41,7 @@ def install_deps(env):
 
 def install(env):
     """Deps -> clone -> cmake/make -> install binary -> record version. 0 or 3."""
-    cfg = get_config(env)
+    cfg = config_for("nvbandwidth", env)
     if not cfg or not cfg.get("version"):
         log_error("install-nvbandwidth",
                   "could not resolve nvbandwidth version from versions.json")

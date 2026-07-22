@@ -23,10 +23,6 @@ _INSTALL_PREFIX = "/opt/mpifileutils"
 _BUILD_DIR = "/tmp/mpifileutils-build"
 _SRC_DIR = "/tmp/mpifileutils-src"
 
-def get_config(env):
-    """Resolve this component's version/url/sha256 from versions.json."""
-    return config_for("mpifileutils", env)
-
 # Build dependencies, keyed by package manager.
 _DEPS = {
     "apt-get": ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"],
@@ -41,7 +37,7 @@ def install_deps(env: dict[str, str]) -> int:
 
     Returns 0 on success, 3 if no package manager is found or an install fails.
     """
-    cfg = get_config(env)
+    cfg = config_for("mpifileutils", env)
     if cfg and cfg.get("version"):
         log_info("install-mpifileutils", f"Preparing mpifileutils {cfg['version']}")
     installer = PackageInstaller()
@@ -56,7 +52,7 @@ def install(env: dict[str, str]) -> int:
 
     Returns 0 on success, 3 on any failure.
     """
-    cfg = get_config(env)
+    cfg = config_for("mpifileutils", env)
     if not cfg or not cfg.get("version"):
         log_error("install-mpifileutils",
                   "could not resolve mpifileutils version from versions.json")
@@ -100,8 +96,10 @@ def install(env: dict[str, str]) -> int:
         "make install\n"
         "module unload mpi/hpcx\n"
     )
+
     rc = exec_program(["bash", "-c", build_script], "install-mpifileutils",
                       cwd=_BUILD_DIR, env=env)
+    
     if rc != 0:
         log_error("install-mpifileutils", f"build failed with exit code {rc}")
         return 3

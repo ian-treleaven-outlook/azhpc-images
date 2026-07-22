@@ -22,17 +22,12 @@ _WORK_DIR = "/tmp"
 _INSTALL_PREFIX = "/opt/libfabric"
 
 
-def get_config(env):
-    """Resolve libfabric's version/url/sha256 from versions.json."""
-    return config_for("libfabric", env)
-
-
 def install(env: dict[str, str]) -> int:
     """Download, build, and install libfabric into /opt/libfabric.
 
     Returns 0 on success, 3 on failure.
     """
-    cfg = get_config(env)
+    cfg = config_for("libfabric", env)
     if not cfg or not cfg.get("version"):
         log_error("install-libfabric",
                   "could not resolve libfabric version from versions.json")

@@ -23,20 +23,16 @@ _SHARE_DIR = "/usr/local/share"
 _TOOLS = ("ccmake", "cmake", "cpack", "ctest")
 
 
-def get_config(env):
-    """Resolve cmake's version/url/sha256 from versions.json."""
-    return config_for("cmake", env)
-
-
 def install(env: dict[str, str]) -> int:
     """Download and install CMake into /usr/local.
 
     Returns 0 on success, 3 on failure.
     """
-    cfg = get_config(env)
-    if not cfg or not cfg.get("version"):
+    cfg = config_for("cmake", env)                                                       # parse versions.json ONCE
+    if not cfg or not cfg.get("version"):                                       # real error handling 
         log_error("install-cmake", "could not resolve cmake version from versions.json")
         return 3
+    
     version = cfg["version"]
     url = cfg.get("url", "")
     sha256 = cfg.get("sha256", "")
@@ -45,14 +41,14 @@ def install(env: dict[str, str]) -> int:
 
     # 1. download + verify
     try:
-        tarball = download_and_verify(url, sha256, dest_dir=_WORK_DIR)
+        tarball = download_and_verify(url, sha256, dest_dir=_WORK_DIR)          # urllib + hashlib
     except Exception as exc:
         log_error("install-cmake", f"download/verify failed: {exc}")
         return 3
 
     # 2. extract (the tarball unpacks to a dir named like the tarball stem)
     with tarfile.open(tarball) as archive:
-        archive.extractall(_WORK_DIR, filter="data")
+        archive.extractall(_WORK_DIR, filter="data")                            # safe extraction
     extracted = Path(_WORK_DIR) / Path(tarball).name.removesuffix(".tar.gz")
 
     # 3. copy the CMake binaries into /usr/local/bin

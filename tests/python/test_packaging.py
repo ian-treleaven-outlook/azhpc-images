@@ -212,13 +212,13 @@ class MpifileutilsConfigTests(unittest.TestCase):
         env = self._env({
             "mpifileutils": {"common": {"version": "0.12", "url": "u", "sha256": "s"}}
         })
-        cfg = install_mpifileutils.get_config(env)
+        cfg = install_mpifileutils.config_for("mpifileutils", env)
         self.assertEqual(cfg["version"], "0.12")
         self.assertEqual(cfg["url"], "u")
 
     def test_get_config_missing_component_returns_none(self):
         env = self._env({})
-        self.assertIsNone(install_mpifileutils.get_config(env))
+        self.assertIsNone(install_mpifileutils.config_for("mpifileutils", env))
 
 
 class MpifileutilsInstallTests(unittest.TestCase):
@@ -286,7 +286,7 @@ class CmakeInstallTests(unittest.TestCase):
         }
 
     def test_get_config_resolves_version(self):
-        self.assertEqual(install_cmake.get_config(self._env())["version"], "4.3.1")
+        self.assertEqual(install_cmake.config_for("cmake", self._env())["version"], "4.3.1")
 
     def test_install_orchestrates_all_steps(self):
         env = self._env()
@@ -326,7 +326,7 @@ class LibfabricInstallTests(unittest.TestCase):
         }
 
     def test_get_config_resolves_version(self):
-        self.assertEqual(install_libfabric.get_config(self._env())["version"], "2.5.0")
+        self.assertEqual(install_libfabric.config_for("libfabric", self._env())["version"], "2.5.0")
 
     def test_install_runs_all_build_steps(self):
         env = self._env()
@@ -380,7 +380,7 @@ class IntelLibsInstallTests(unittest.TestCase):
 
     def test_get_config_resolves_version(self):
         self.assertEqual(
-            install_intel_libs.get_config(self._env())["version"], "2025.3.1.11")
+            install_intel_libs.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
 
     def test_install_runs_installer(self):
         env = self._env()
@@ -462,7 +462,7 @@ class MonitoringToolsTests(unittest.TestCase):
 
     def test_get_config_resolves_version(self):
         self.assertEqual(
-            install_monitoring_tools.get_config(self._env())["version"], "1.2.3")
+            install_monitoring_tools.config_for("moneo", self._env())["version"], "1.2.3")
 
     def test_extract_stripped_drops_top_level_dir(self):
         import io
@@ -552,7 +552,7 @@ class CudaSamplesTests(unittest.TestCase):
 
     def test_get_config_resolves_samples_version(self):
         self.assertEqual(
-            install_cuda_samples.get_config(self._env())["samples"]["version"], "12.4.1")
+            install_cuda_samples.config_for("cuda", self._env())["samples"]["version"], "12.4.1")
 
     def test_install_runs_all_build_steps(self):
         env = self._env()
@@ -608,7 +608,7 @@ class NvbandwidthTests(unittest.TestCase):
 
     def test_get_config_resolves_version(self):
         self.assertEqual(
-            install_nvbandwidth_tool.get_config(self._env())["version"], "0.9")
+            install_nvbandwidth_tool.config_for("nvbandwidth", self._env())["version"], "0.9")
 
     def test_install_runs_clone_and_build(self):
         env = self._env()

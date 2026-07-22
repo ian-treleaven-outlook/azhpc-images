@@ -27,11 +27,6 @@ _BASHRC = "/etc/bash.bashrc"
 _ALIAS = "alias moneo='python3 /opt/azurehpc/tools/Moneo/moneo.py'"
 
 
-def get_config(env):
-    """Resolve Moneo's version/sha256 from versions.json."""
-    return config_for("moneo", env)
-
-
 def extract_stripped(tarball, dest_dir):
     """Extract `tarball` into `dest_dir`, dropping the leading path component.
 
@@ -90,7 +85,7 @@ def install(env):
 
     Returns 0 on success, 3 on any failure.
     """
-    cfg = get_config(env)
+    cfg = config_for("moneo", env)
     if not cfg or not cfg.get("version"):
         log_error("install-monitoring-tools",
                   "could not resolve moneo version from versions.json")

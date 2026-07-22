@@ -20,11 +20,6 @@ from utils.logger import log_info, log_error
 _PACKAGE_DISTROS = ("ubuntu", "almalinux", "rocky", "rhel")
 
 
-def get_config(env):
-    """Resolve aznfs's version/sha256 from versions.json (Azure Linux only)."""
-    return config_for("aznfs", env)
-
-
 def _install_from_package_feed():
     """Ubuntu / RHEL-family: install aznfs straight from the distro package feed."""
     installer = PackageInstaller()
@@ -35,7 +30,7 @@ def _install_from_package_feed():
 
 def _install_from_azurelinux_installer(env):
     """Azure Linux: download the vendor installer, patch yum->tdnf, and run it."""
-    cfg = get_config(env)
+    cfg = config_for("aznfs", env)
     if not cfg or not cfg.get("version"):
         log_error("install-aznfs",
                   "could not resolve aznfs version from versions.json")
