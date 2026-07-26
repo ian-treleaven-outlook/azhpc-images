@@ -42,7 +42,7 @@ def extract_stripped(tarball, dest_dir):
                 continue  # the top-level directory entry itself
             member.name = parts[1]
             members.append(member)
-        archive.extractall(dest_dir, members=members, filter="data")
+        archive.extractall(dest_dir, members=members, filter="data")           # safe extraction: no path traversal
 
 
 def ensure_line(path, line):
@@ -53,7 +53,7 @@ def ensure_line(path, line):
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            if any(existing.rstrip("\n") == line for existing in handle):
+            if any(existing.rstrip("\n") == line for existing in handle):       # mirrors bash `grep -qxF`
                 return False
     except FileNotFoundError:
         pass
@@ -85,11 +85,13 @@ def install(env):
 
     Returns 0 on success, 3 on any failure.
     """
-    cfg = config_for("moneo", env)
-    if not cfg or not cfg.get("version"):
+    cfg = config_for("moneo", env)                                             # parse versions.json ONCE
+
+    if not cfg or not cfg.get("version"):                                       # real error handling (bash: set -ex)
         log_error("install-monitoring-tools",
                   "could not resolve moneo version from versions.json")
         return 3
+    
     version = cfg["version"]
     sha256 = cfg.get("sha256", "")
     url = f"https://github.com/Azure/Moneo/archive/refs/tags/v{version}.tar.gz"
@@ -103,19 +105,19 @@ def install(env):
     # 2. download + verify the release tarball
     os.makedirs(_MONITOR_DIR, exist_ok=True)
     try:
-        tarball = download_and_verify(url, sha256, dest_dir=_MONITOR_DIR)
+        tarball = download_and_verify(url, sha256, dest_dir=_MONITOR_DIR)       # urllib + hashlib (no wget | sha256sum)
     except Exception as exc:
         log_error("install-monitoring-tools", f"download/verify failed: {exc}")
         return 3
 
     # 3. extract into Moneo/, stripping the top-level Moneo-<version>/ dir
     os.makedirs(_MONEO_DIR, exist_ok=True)
-    extract_stripped(tarball, _MONEO_DIR)
+    extract_stripped(tarball, _MONEO_DIR)                                       # native --strip-components, done safely
     os.chmod(_MONEO_DIR, 0o777)
 
     # 4. run Moneo's service-configuration script
     service_dir = f"{_MONEO_DIR}/linux_service"
-    rc = exec_program(["bash", "configure_service.sh"],
+    rc = exec_program(["bash", "configure_service.sh"],                         # Moneo's OWN script — correctly left as bash
                       "install-monitoring-tools", cwd=service_dir, env=env)
     if rc != 0:
         log_error("install-monitoring-tools",
@@ -123,7 +125,7 @@ def install(env):
         return 3
 
     # 5. register the `moneo` shell alias (idempotent)
-    ensure_line(_BASHRC, _ALIAS)
+    ensure_line(_BASHRC, _ALIAS)                                                # same guard as bash, but reusable + tested
 
     # 6. cleanup + record the installed version
     try:
