@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs
+from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca
 from utils.sku import sku_has_infiniband
 
 MODULE_DIRS = {
@@ -211,7 +211,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-lustre", "install_lustre_client.sh"),
 
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
-        Step("install-doca", "install_doca.sh",
+        Step("install-doca", "install_doca.sh", action=install_doca.install,
              when=lambda c: sku_has_infiniband(c.gpu)),
         Step("install-libfabric", "install_libfabric.sh",
              action=install_libfabric.install,
@@ -344,7 +344,7 @@ class ImageBuilder:
             if step.action is not None:
                 rc = step.action(env)
             else:
-                # "distro" scripts live in build_dir; the rest in components/
+                # "distro" specific scripts live in build_dir; the rest in components/
                 base_dir = build_dir if step.base == "distro" else components
                 rc = exec_program([str(base_dir / step.script), *step.args],
                                   step.op, cwd=str(build_dir), env=env)
