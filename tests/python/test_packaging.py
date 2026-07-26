@@ -1,5 +1,15 @@
 """Unit tests for the Python packaging layer.
 
+Everything that hits the real world here is mocked — downloads, exec_program
+(apt/dnf/make/git), file writes — so the whole file runs in a couple seconds with
+no network and no GPU. Most tests follow the same shape: fake the external calls,
+run the component, then check the return code AND that it made the right calls
+(for the fail-fast tests, that it stopped at the right point).
+
+The negative tests patch the module's log_error/log_warn. That does two things:
+it keeps the intentional error/warning out of the test output, and it lets us
+assert the failure path actually ran (the error really got reported).
+
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
 """
@@ -13,17 +23,22 @@ import unittest
 from unittest import mock
 
 from utils import package_manager
+from utils import package_installer
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
 from components.python import install_mpifileutils, install_nccl, install_doca, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool, install_aznfs
 
 
+# detect_package_manager() finds a manager by calling shutil.which on each candidate.
+# Faking which lets us pretend a box only has, say, tdnf — without touching the real PATH.
 def _which(*available: str):
     """Build a shutil.which side-effect that only finds `available` names."""
     avail = set(available)
     return lambda name: f"/usr/bin/{name}" if name in avail else None
 
 
+# Detection walks a fixed preference order (apt-get before apt, etc.) and returns the
+# first one that's actually on PATH. Faking `which` is how we control what's "installed".
 class DetectPackageManagerTests(unittest.TestCase):
     def test_prefers_apt_get_over_apt(self):
         with mock.patch.object(package_manager.shutil, "which",
@@ -46,9 +61,11 @@ class DetectPackageManagerTests(unittest.TestCase):
 
     def test_returns_none_when_nothing_found(self):
         with mock.patch.object(package_manager.shutil, "which",
-                               side_effect=_which()):
+                               side_effect=_which()), \
+             mock.patch.object(package_manager, "log_error") as logged:
             pm = detect_package_manager()
         self.assertIsNone(pm)
+        logged.assert_called_once()   # "no package manager found" is reported as an error
 
 
 class InstallCommandTests(unittest.TestCase):
@@ -65,8 +82,12 @@ class InstallCommandTests(unittest.TestCase):
                          ["tdnf", "install", "-y", "foo"])
 
 
+# install_package loops over a list of packages, running each install via exec_program.
+# We mock exec_program (return codes only), so nothing really installs and we can just
+# check how the loop reacts: all ok, partial failure, single string, no manager.
 class PackageInstallerTests(unittest.TestCase):
     def _installer_with(self, manager_name="apt-get"):
+        # hand it a manager up front so it doesn't go detecting one off the real PATH
         pm = PackageManager(name=manager_name, path=f"/usr/bin/{manager_name}")
         return PackageInstaller(manager=pm)
 
@@ -82,10 +103,12 @@ class PackageInstallerTests(unittest.TestCase):
         installer = self._installer_with()
         # First package fails (rc=100), second succeeds (rc=0).
         with mock.patch("utils.package_installer.exec_program",
-                        side_effect=[100, 0]) as exec_mock:
+                        side_effect=[100, 0]) as exec_mock, \
+             mock.patch.object(package_installer, "log_warn") as warned:
             ok = installer.install_package(["bad-pkg", "tree"])
         self.assertFalse(ok)
         self.assertEqual(exec_mock.call_count, 2)  # did not stop early
+        warned.assert_called_once()   # the failed package is reported as a warning
 
     def test_single_string_is_accepted(self):
         installer = self._installer_with()
@@ -98,15 +121,22 @@ class PackageInstallerTests(unittest.TestCase):
     def test_no_manager_returns_false(self):
         installer = PackageInstaller(manager=None)
         with mock.patch("utils.package_installer.detect_package_manager",
-                        return_value=None):
+                        return_value=None), \
+             mock.patch.object(package_installer, "log_error") as logged:
             with mock.patch("utils.package_installer.exec_program") as exec_mock:
                 ok = installer.install_package(["tree"])
         self.assertFalse(ok)
         exec_mock.assert_not_called()
+        logged.assert_called_once()   # "no package manager detected" is reported as an error
 
 
+# install_deps picks a different dependency list depending on the package manager
+# (apt names vs rpm names). We give it a fake installer so we can assert *which* list
+# it chose without doing any real installs.
 class MpifileutilsDepsTests(unittest.TestCase):
     def _fake_installer(self, manager_name, succeeds=True):
+        # stand-in PackageInstaller: .manager selects the branch, .install_package just
+        # reports success/failure so we can inspect the chosen deps.
         fake = mock.Mock()
         fake.manager = (None if manager_name is None
                         else PackageManager(name=manager_name,
@@ -180,6 +210,8 @@ class NcclDepsTests(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
+# Pure string parsing, no mocks needed — parse_openmpi_version digs the version out of
+# `apt-cache show openmpi` output (mirrors the old awk one-liner).
 class DocaVersionParseTests(unittest.TestCase):
     def test_parses_openmpi_version(self):
         sample = "Package: openmpi\nVersion: 4.1.5-1\nArchitecture: amd64\n"
@@ -198,6 +230,9 @@ class DocaVersionParseTests(unittest.TestCase):
 
 
 class MpifileutilsConfigTests(unittest.TestCase):
+    # The env dict is exactly what a component sees at runtime: COMPONENT_VERSIONS is the
+    # parsed versions.json, and the rest (distro/arch/gpu/sku/node_type) is what
+    # get_component_config uses to pick the right entry out of it.
     def _env(self, versions):
         return {
             "COMPONENT_VERSIONS": json.dumps(versions),
@@ -239,6 +274,9 @@ class MpifileutilsInstallTests(unittest.TestCase):
         }
 
     def test_install_orchestrates_all_steps(self):
+        # Happy path. Stub out every real step — deps, download, the build subprocess,
+        # the version write, and the tar/mkdir/cleanup calls — so nothing actually runs,
+        # then confirm install() drove the key steps once each and returned 0.
         env = self._env()
         with mock.patch.object(install_mpifileutils, "install_deps", return_value=0) as deps, \
              mock.patch.object(install_mpifileutils, "download_and_verify",
@@ -256,7 +294,9 @@ class MpifileutilsInstallTests(unittest.TestCase):
 
     def test_install_fails_when_no_version(self):
         env = {"COMPONENT_VERSIONS": json.dumps({})}
-        self.assertEqual(install_mpifileutils.install(env), 3)
+        with mock.patch.object(install_mpifileutils, "log_error") as logged:
+            self.assertEqual(install_mpifileutils.install(env), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
     def test_install_fails_when_deps_fail(self):
         env = self._env()
@@ -304,8 +344,10 @@ class CmakeInstallTests(unittest.TestCase):
         wcv.assert_called_once()
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_cmake.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_cmake, "log_error") as logged:
+            self.assertEqual(
+                install_cmake.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class LibfabricInstallTests(unittest.TestCase):
@@ -349,16 +391,20 @@ class LibfabricInstallTests(unittest.TestCase):
              mock.patch.object(install_libfabric, "exec_program",
                                side_effect=[0, 1]) as ex, \
              mock.patch.object(install_libfabric, "write_component_version") as wcv, \
+             mock.patch.object(install_libfabric, "log_error") as logged, \
              mock.patch("tarfile.open"), \
              mock.patch("shutil.rmtree"):
             rc = install_libfabric.install(env)
         self.assertEqual(rc, 3)
         self.assertEqual(ex.call_count, 2)  # stopped after make failed
         wcv.assert_not_called()
+        logged.assert_called()   # build failure is reported as an error
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_libfabric, "log_error") as logged:
+            self.assertEqual(
+                install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class IntelLibsInstallTests(unittest.TestCase):
@@ -399,14 +445,18 @@ class IntelLibsInstallTests(unittest.TestCase):
         with mock.patch.object(install_intel_libs, "download_and_verify",
                                return_value="/tmp/x.sh"), \
              mock.patch.object(install_intel_libs, "exec_program", return_value=1), \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv:
+             mock.patch.object(install_intel_libs, "write_component_version") as wcv, \
+             mock.patch.object(install_intel_libs, "log_error") as logged:
             rc = install_intel_libs.install(env)
         self.assertEqual(rc, 3)
         wcv.assert_not_called()
+        logged.assert_called()   # installer failure is reported as an error
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_intel_libs, "log_error") as logged:
+            self.assertEqual(
+                install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class HpcdiagTests(unittest.TestCase):
@@ -441,10 +491,12 @@ class HpcdiagTests(unittest.TestCase):
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download") as dl:
+             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch.object(install_hpcdiag, "log_error") as logged:
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 3)
         dl.assert_not_called()
+        logged.assert_called()   # missing tarball_url is reported as an error
 
 
 class MonitoringToolsTests(unittest.TestCase):
@@ -523,15 +575,19 @@ class MonitoringToolsTests(unittest.TestCase):
              mock.patch.object(install_monitoring_tools, "extract_stripped"), \
              mock.patch.object(install_monitoring_tools, "exec_program", return_value=1), \
              mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
+             mock.patch.object(install_monitoring_tools, "log_error") as logged, \
              mock.patch("os.makedirs"), \
              mock.patch("os.chmod"):
             rc = install_monitoring_tools.install(env)
         self.assertEqual(rc, 3)
         wcv.assert_not_called()
+        logged.assert_called()   # configure failure is reported as an error
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_monitoring_tools, "log_error") as logged:
+            self.assertEqual(
+                install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class CudaSamplesTests(unittest.TestCase):
@@ -576,6 +632,7 @@ class CudaSamplesTests(unittest.TestCase):
                                return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz"), \
              mock.patch.object(install_cuda_samples, "exec_program",
                                side_effect=[0, 1]) as ex, \
+             mock.patch.object(install_cuda_samples, "log_error") as logged, \
              mock.patch("tarfile.open"), \
              mock.patch("os.makedirs"), \
              mock.patch("shutil.move") as mv, \
@@ -584,10 +641,13 @@ class CudaSamplesTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertEqual(ex.call_count, 2)  # stopped after make failed
         mv.assert_not_called()
+        logged.assert_called()   # build failure is reported as an error
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_cuda_samples.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_cuda_samples, "log_error") as logged:
+            self.assertEqual(
+                install_cuda_samples.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class NvbandwidthTests(unittest.TestCase):
@@ -631,16 +691,20 @@ class NvbandwidthTests(unittest.TestCase):
              mock.patch.object(install_nvbandwidth_tool, "exec_program",
                                side_effect=[1]) as ex, \
              mock.patch.object(install_nvbandwidth_tool, "write_component_version") as wcv, \
+             mock.patch.object(install_nvbandwidth_tool, "log_error") as logged, \
              mock.patch("os.makedirs"), \
              mock.patch("shutil.rmtree"):
             rc = install_nvbandwidth_tool.install(env)
         self.assertEqual(rc, 3)
         self.assertEqual(ex.call_count, 1)  # stopped after clone failed
         wcv.assert_not_called()
+        logged.assert_called()   # clone failure is reported as an error
 
     def test_install_fails_when_no_version(self):
-        self.assertEqual(
-            install_nvbandwidth_tool.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        with mock.patch.object(install_nvbandwidth_tool, "log_error") as logged:
+            self.assertEqual(
+                install_nvbandwidth_tool.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
+        logged.assert_called_once()   # missing version is reported as an error
 
 
 class AznfsTests(unittest.TestCase):
@@ -674,7 +738,9 @@ class AznfsTests(unittest.TestCase):
         self.assertIn("tdnf", wt.call_args[0][0])  # yum -> tdnf patch applied
 
     def test_install_unsupported_distro(self):
-        self.assertEqual(install_aznfs.install({"DISTRIBUTION": "gentoo"}), 3)
+        with mock.patch.object(install_aznfs, "log_error") as logged:
+            self.assertEqual(install_aznfs.install({"DISTRIBUTION": "gentoo"}), 3)
+        logged.assert_called_once()   # unsupported distro is reported as an error
 
 
 if __name__ == "__main__":

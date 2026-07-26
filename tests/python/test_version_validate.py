@@ -16,6 +16,9 @@ from utils.version_validate import (
 )
 
 
+# The small pieces the rule is built from: pull the CUDA major out of the driver config,
+# scrape it out of a URL (the "cudaNN" tag), and work out which HPC-X variant a given
+# target actually installs.
 class HelperTests(unittest.TestCase):
     def test_cuda_major_from_config(self):
         self.assertEqual(cuda_major_from_config({"driver": {"version": "13.0"}}), 13)
@@ -38,6 +41,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(active_hpcx_component("NVIDIA", "A100"), "hpcx")
 
 
+# The actual rule: the HPC-X build we install is tagged with a CUDA major in its URL
+# (e.g. ...-cuda13-...), and that must match the CUDA driver's major. The catch is only
+# ONE hpcx variant is installed per target (hpcx / hpcx_inbox / hpcx_amd), so we only
+# check that one — a mismatched sibling that never gets installed isn't a problem.
 class CudaConsistencyTests(unittest.TestCase):
     def _versions(self, hpcx_cuda="cuda13", driver="13.0"):
         return {

@@ -56,7 +56,12 @@ def _tools_available() -> bool:
 
 
 def _bash_get_component_config(component: str, versions_text: str, scenario: dict):
-    """Invoke the real Bash get_component_config for one component + scenario."""
+    """Invoke the real Bash get_component_config for one component + scenario.
+
+    This is the heart of the differential test: instead of hardcoding what we THINK
+    bash returns, we actually source utilities.sh and run the real function, then diff
+    Python against it. If either side ever drifts, the diff catches it.
+    """
     env = os.environ.copy()
     env.update(scenario)
     env["COMPONENT_VERSIONS"] = versions_text

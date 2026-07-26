@@ -43,6 +43,8 @@ def _is_subsequence(sub, full):
 
 
 def _plan_scripts(cfg):
+    # the bash script names the Python plan would run for this target (gates applied),
+    # in order — this is what we line up against install.sh
     return [s.script for s in build_plan(cfg) if s.when(cfg) and s.script]
 
 
@@ -50,6 +52,9 @@ def _cfg(vendor, gpu, os="Ubuntu24"):
     return BuildConfig(vendor=vendor, gpu=gpu, os=os, fips=False, spec_path=None)
 
 
+# Core idea: don't hardcode the expected flow — read install.sh itself and check the
+# Python plan lines up with it (same scripts, same order). If someone reorders
+# install.sh, these fail until build_plan is updated to match.
 class InstallShParityTests(unittest.TestCase):
     def test_install_sh_is_parseable(self):
         scripts = _install_sh_scripts()
@@ -98,6 +103,9 @@ class InstallShParityTests(unittest.TestCase):
         self.assertEqual(_plan_scripts(_cfg("NVidia", "A100")), expected)
 
 
+# Same plan, different targets: check the SKU/vendor/arch gates pull in the right
+# components and leave out the ones meant for other paths (IB vs non-IB, NVIDIA vs AMD,
+# GB200's aarch64 branch, etc.).
 class GatingTests(unittest.TestCase):
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))

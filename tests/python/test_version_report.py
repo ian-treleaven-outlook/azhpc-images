@@ -11,6 +11,9 @@ import unittest
 from utils.version_report import resolve_report, format_report, _extract_versions
 
 
+# _extract_versions pulls the version(s) out of one resolved config block. Two shapes:
+# a flat block ({"version": ...}), or a nested one like cuda ({"driver": {...},
+# "samples": {...}}) that expands into multiple sub-versions.
 class ExtractVersionsTests(unittest.TestCase):
     def test_flat_version(self):
         self.assertEqual(_extract_versions({"version": "1.2", "url": "u"}), [("", "1.2")])
@@ -30,6 +33,10 @@ class ExtractVersionsTests(unittest.TestCase):
         self.assertEqual(_extract_versions({"url": "u"}), [])
 
 
+# resolve_report walks every component in versions.json and works out what version
+# WOULD install for a target. This fixture mixes the cases on purpose: a flat component
+# (cmake), a nested one (cuda -> driver/samples), a metadata entry to skip (note), and
+# one with no ubuntu24 entry so it stays unresolved (aznfs).
 class ResolveReportTests(unittest.TestCase):
     def _versions(self):
         return {
@@ -63,6 +70,9 @@ class ResolveReportTests(unittest.TestCase):
         self.assertIsNone(aznfs["version"])
 
 
+# format_report is just the pretty-printer. Two states worth telling apart: "(no match)"
+# means nothing resolved for this target, vs "(no version)" means it resolved but the
+# block has no version field.
 class FormatReportTests(unittest.TestCase):
     def test_aligns_and_labels_states(self):
         report = [

@@ -13,7 +13,9 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from utils import download
 from utils.download import (
     ChecksumError,
     download_and_verify,
@@ -22,6 +24,8 @@ from utils.download import (
 )
 
 
+# Write a known file and compute its real sha up front, then check verify_checksum
+# agrees (and rejects a wrong one). No network here — just hashing a local file.
 class ChecksumTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -41,12 +45,17 @@ class ChecksumTests(unittest.TestCase):
         self.assertTrue(verify_checksum(self.file, self.sha))
 
     def test_verify_checksum_mismatch(self):
-        self.assertFalse(verify_checksum(self.file, "0" * 64))
+        # Negative: a mismatched checksum returns False and is logged as an error.
+        with mock.patch.object(download, "log_error") as logged:
+            self.assertFalse(verify_checksum(self.file, "0" * 64))
+        logged.assert_called_once()
 
     def test_verify_checksum_is_case_insensitive(self):
         self.assertTrue(verify_checksum(self.file, self.sha.upper()))
 
 
+# The download path, kept fully offline: we point it at a local file via a file:// URL
+# so urllib "downloads" it for real without ever hitting the network.
 class DownloadAndVerifyTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -69,8 +78,11 @@ class DownloadAndVerifyTests(unittest.TestCase):
         self.assertEqual(sha256_of(path), self.sha)
 
     def test_raises_on_bad_checksum(self):
-        with self.assertRaises(ChecksumError):
-            download_and_verify(self.url, "0" * 64, dest_dir=self.dest_dir)
+        # Negative: a mismatched checksum is logged as an error, then raises.
+        with mock.patch.object(download, "log_error") as logged:
+            with self.assertRaises(ChecksumError):
+                download_and_verify(self.url, "0" * 64, dest_dir=self.dest_dir)
+        logged.assert_called()
 
 
 if __name__ == "__main__":
