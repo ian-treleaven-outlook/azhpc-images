@@ -1,7 +1,13 @@
 """install_nccl.py — NCCL build dependencies.
 
-The Python counterpart to the package-install slice of
-components/install_nccl.sh. The old if/elif/else distro branching is now a table
+STAGED, NOT WIRED. This is only the package-install slice of
+components/install_nccl.sh (its opening if/elif/else). The tarball build,
+make pkg.debian.build / pkg.redhat.build, the dpkg/rpm installs, apt-mark hold,
+the /etc/dnf/dnf.conf edit and the nccl-rdma-sharp-plugins clone are all still
+bash-only, so install-nccl runs as a bash Step. Wiring this in as-is would just
+install the deps twice. Kept and tested so it doesn't rot before the rest lands.
+
+The part that is ported: the old if/elif/else distro branching is now a table
 keyed by package manager; detection is handled by detect_package_manager(), so
 the only per-distro knowledge left here is the package names themselves.
 """

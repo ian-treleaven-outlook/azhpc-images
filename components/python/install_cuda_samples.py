@@ -4,6 +4,11 @@ Downloads the NVIDIA cuda-samples source matching the pinned version, builds it
 with cmake/nvcc, and installs the built Samples tree into the CUDA toolkit's
 samples directory. (The bash script records no component version, so neither
 does this port.)
+
+STAGED, NOT WIRED. The port itself is complete, but the bash it replaces isn't a
+top-level step -- install_nvidiagpudriver.sh and install_nvidiagriddriver.sh call
+it themselves, after nvcc is on PATH. build_plan only models install.sh, so there
+is no Step to attach this to until the driver scripts are ported too.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ _WORK_DIR = "/tmp/cuda-samples-build"
 def install(env):
     """Download -> extract -> cmake/make -> install Samples. Returns 0 or 3."""
     cfg = config_for("cuda", env) or {}
+
     samples = cfg.get("samples") or {}
     driver = cfg.get("driver") or {}
     version = samples.get("version")
