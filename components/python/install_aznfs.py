@@ -29,8 +29,9 @@ def _install_from_package_feed():
 
 
 def _install_from_azurelinux_installer(env):
-    """Azure Linux: download the vendor installer, patch yum->tdnf, and run it."""
+    """Azure Linux: download the vendor installer, patch yum->tdnf, and run it.""" 
     cfg = config_for("aznfs", env)
+
     if not cfg or not cfg.get("version"):
         log_error("install-aznfs",
                   "could not resolve aznfs version from versions.json")
@@ -53,7 +54,11 @@ def _install_from_azurelinux_installer(env):
     path.write_text(patched, encoding="utf-8")
 
     run_env = {**env, "AZNFS_NONINTERACTIVE_INSTALL": "1"}
-    return exec_program(["bash", str(path)], "install-aznfs", env=run_env)
+    # exec_program hands back the script's own exit code (or 127 if bash is
+    # missing); collapse anything non-zero to 3 so every path out of this
+    # module is 0-or-3, like the docstring says.
+    rc = exec_program(["bash", str(path)], "install-aznfs", env=run_env)
+    return 0 if rc == 0 else 3
 
 
 def install(env):

@@ -737,6 +737,20 @@ class AznfsTests(unittest.TestCase):
         ex.assert_called_once()
         self.assertIn("tdnf", wt.call_args[0][0])  # yum -> tdnf patch applied
 
+    def test_install_azurelinux_normalizes_installer_exit_code(self):
+        # exec_program passes through whatever the vendor script exited with
+        # (127 here = bash not found). We only ever hand back 0 or 3.
+        env = {"DISTRIBUTION": "azurelinux3.0",
+               "COMPONENT_VERSIONS": json.dumps(
+                   {"aznfs": {"common": {"version": "2.0", "sha256": "s"}}})}
+        with mock.patch.object(install_aznfs, "download_and_verify",
+                               return_value="/tmp/aznfs_install.sh"), \
+             mock.patch("pathlib.Path.read_text", return_value="yum install x"), \
+             mock.patch("pathlib.Path.write_text"), \
+             mock.patch.object(install_aznfs, "exec_program", return_value=127):
+            rc = install_aznfs.install(env)
+        self.assertEqual(rc, 3)
+
     def test_install_unsupported_distro(self):
         with mock.patch.object(install_aznfs, "log_error") as logged:
             self.assertEqual(install_aznfs.install({"DISTRIBUTION": "gentoo"}), 3)
