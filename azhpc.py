@@ -230,7 +230,13 @@ def main(argv=None) -> int:
         return 0
 
     repo_root = Path(__file__).resolve().parent
-    return ImageBuilder(repo_root, config).build()
+    # Last-resort guard: anything the build raises becomes exit 3 ("build
+    # failure") instead of a traceback, so the documented exit codes always hold.
+    try:
+        return ImageBuilder(repo_root, config).build()
+    except Exception as e:
+        logger.log_error("build-image", f"unhandled error: {e.__class__.__name__}: {e}")
+        return 3
     
 if __name__ == "__main__":
     sys.exit(main())

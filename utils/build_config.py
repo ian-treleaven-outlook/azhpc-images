@@ -340,14 +340,21 @@ class ImageBuilder:
 
             log_info(step.op, "starting")
 
-            # (b) run it: a python action, or the bash script via exec_program
-            if step.action is not None:
-                rc = step.action(env)
-            else:
-                # "distro" specific scripts live in build_dir; the rest in components/
-                base_dir = build_dir if step.base == "distro" else components
-                rc = exec_program([str(base_dir / step.script), *step.args],
-                                  step.op, cwd=str(build_dir), env=env)
+            # (b) run it: a python action, or the bash script via exec_program.
+            # A python action that raises (bad tarball, missing file, ...) is
+            # turned into a normal rc=3 failure here, so an unexpected exception
+            # can't escape as a traceback and break the documented exit codes.
+            try:
+                if step.action is not None:
+                    rc = step.action(env)
+                else:
+                    # "distro" specific scripts live in build_dir; the rest in components/
+                    base_dir = build_dir if step.base == "distro" else components
+                    rc = exec_program([str(base_dir / step.script), *step.args],
+                                      step.op, cwd=str(build_dir), env=env)
+            except Exception as exc:
+                log_error(step.op, f"unhandled error: {exc.__class__.__name__}: {exc}")
+                return 3
 
             # (c) stop the whole build on the first failure
             if rc != 0:

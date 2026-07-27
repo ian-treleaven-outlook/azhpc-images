@@ -15,8 +15,10 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from utils.build_config import BuildConfig, build_plan
+from utils import build_config
+from utils.build_config import BuildConfig, ImageBuilder, Step, build_plan
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _INSTALL_SH = _REPO_ROOT / "distros" / "ubuntu24.04" / "install.sh"
@@ -143,6 +145,46 @@ class GatingTests(unittest.TestCase):
         self.assertNotIn("install_amd_libs.sh", plan)    # aarch64
         self.assertNotIn("install_aznfs.sh", plan)       # not-GB200 group
         self.assertNotIn("install_health_checks.sh", plan)
+
+
+# A component action is just a python function, so it can raise as well as return
+# a bad code (corrupt tarball, missing file, changed upstream layout...). build()
+# has to turn either one into exit code 3 — a traceback would escape as exit 1 and
+# break the exit-status contract azhpc.py --help publishes.
+class BuildFailureHandlingTests(unittest.TestCase):
+    def _run_build_with(self, action):
+        """Run build() against a single-step plan whose only step is `action`.
+
+        Everything around the step is stubbed: bootstrap (would run
+        install_utils.sh) and component_env (would shell out to dpkg/rpm).
+        """
+        cfg = _cfg("NVidia", "A100")
+        builder = ImageBuilder(_REPO_ROOT, cfg)
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value={}), \
+             mock.patch.object(build_config, "build_plan",
+                               return_value=[Step("test-step", action=action)]), \
+             mock.patch.object(build_config, "log_error") as logged:
+            rc = builder.build()
+        return rc, logged
+
+    def test_step_returning_failure_gives_exit_3(self):
+        rc, logged = self._run_build_with(lambda env: 3)
+        self.assertEqual(rc, 3)
+        logged.assert_called_once()
+
+    def test_raising_step_gives_exit_3_not_a_traceback(self):
+        def boom(env):
+            raise FileNotFoundError("/tmp/cmake-4.3.1/bin/ccmake")
+
+        rc, logged = self._run_build_with(boom)   # must not propagate
+        self.assertEqual(rc, 3)
+        # the log names the exception type so the cause isn't lost
+        self.assertIn("FileNotFoundError", logged.call_args[0][1])
+
+    def test_successful_step_still_returns_0(self):
+        rc, _ = self._run_build_with(lambda env: 0)
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":
