@@ -72,6 +72,7 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
             command,
             cwd=cwd,
             env=env,                      # pass the environment variables
+            stdin=subprocess.DEVNULL,     # no terminal: stops dpkg drawing progress
             stdout=subprocess.PIPE,       # capture stdout...
             stderr=subprocess.STDOUT,     # ...and fold stderr into it
             text=True,                    # decode bytes -> str

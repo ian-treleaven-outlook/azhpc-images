@@ -81,6 +81,10 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
         MODULE_DIRS["ubuntu"] if "ubuntu" in distribution else DEFAULT_MODULE_DIR
     )
 
+    # Keep apt/dpkg out of interactive mode. Without this, debconf takes over the
+    # terminal to draw prompts and progress, which corrupts the log's formatting.
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+
     versions = repo_root / "versions.json"
     if versions.is_file():
         env["COMPONENT_VERSIONS"] = versions.read_text(encoding="utf-8")
