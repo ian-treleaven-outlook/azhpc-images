@@ -1,7 +1,8 @@
 # ToDo — before merging this fork upstream
 
-Open items on the Python CLI port (`modern/python`). Both were
-deliberately deferred during the rebase onto `Azure/azhpc-images@f58ab80`.
+Open items on the Python CLI port (`modern/python`). Items 1 and 2 were
+deliberately deferred during the rebase onto `Azure/azhpc-images@f58ab80`;
+item 3 was found while writing the contributor guide.
 
 ---
 
@@ -82,6 +83,33 @@ consequences for upstream submission.
 - [ ] If not, decide the remedy *before* opening the PR: have him sign, or
       re-attribute with `Co-authored-by:` trailers preserving credit
 - [ ] Confirm the PR is opened from `ian-treleaven-outlook`, not an EMU account
+
+---
+
+## 3. `install_cuda_samples` is ported but orphaned
+
+**What's odd**
+
+`components/python/install_cuda_samples.py` exists and exposes a complete
+`install(env)`. Its bash counterpart `components/install_cuda_samples.sh` also
+exists. But:
+
+- **no distro's `install.sh` invokes it**, and
+- there is **no corresponding `Step`** in `build_plan()`.
+
+So it is a finished port of a component that is not part of any current build
+flow. Unlike `components/python/install_nccl.py` — which documents itself as
+`STAGED, NOT WIRED` with a clear reason — this one carries no such note, so the
+intent is unclear.
+
+**Action**
+
+- [ ] Determine whether `install_cuda_samples.sh` is dead code upstream, or is
+      meant to run on some path that currently misses it
+- [ ] If it should run: add a `Step` with the correct `when=` gate and wire
+      `action=install_cuda_samples.install`
+- [ ] If it is genuinely dead: raise removal with upstream rather than deleting
+      it locally — it is upstream's file, not ours
 
 ---
 
