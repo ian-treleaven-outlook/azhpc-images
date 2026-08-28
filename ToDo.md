@@ -1,6 +1,6 @@
 # ToDo — before merging this fork upstream
 
-Open items on the Python CLI port (`modern/python-cli-rebased`). Both were
+Open items on the Python CLI port (`modern/python`). Both were
 deliberately deferred during the rebase onto `Azure/azhpc-images@f58ab80`.
 
 ---
@@ -92,6 +92,10 @@ consequences for upstream submission.
 
 ## Reference
 
-- Pristine pre-rebase branch: `modern/python-cli` (do not force-push over it)
+- Working branch: `modern/python`
+- Gio's pristine pre-rebase work (56 commits, tip `9ec3889`) is **no longer a
+  branch on this fork** — it survives only in the mirror backup below. To read
+  it back:
+  `git --git-dir=D:\Gio\azhpc-images-backup.git log gio/python-cli`
 - Full mirror backup of the original intern fork: `D:\Gio\azhpc-images-backup.git`
 - Run the suite: `python -m unittest discover -s tests/python`
