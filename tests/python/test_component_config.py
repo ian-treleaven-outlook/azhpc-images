@@ -111,9 +111,9 @@ class ComponentConfigParityTests(unittest.TestCase):
         # config (a different result than the A100/common case), so the parity
         # check above is meaningfully covering the baremetal / nested logic.
         baremetal = self._python_config(
-            "cmake", SCENARIOS["ubuntu24 / GB200 / aarch64 / baremetal"])
+            "nccl", SCENARIOS["ubuntu24 / GB200 / aarch64 / baremetal"])
         common = self._python_config(
-            "cmake", SCENARIOS["ubuntu24 / A100 / x64 / vm"])
+            "nccl", SCENARIOS["ubuntu24 / A100 / x64 / vm"])
         self.assertIsInstance(baremetal, dict)
         self.assertNotEqual(baremetal, common)
 

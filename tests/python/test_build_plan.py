@@ -60,7 +60,7 @@ def _cfg(vendor, gpu, os="Ubuntu24"):
 class InstallShParityTests(unittest.TestCase):
     def test_install_sh_is_parseable(self):
         scripts = _install_sh_scripts()
-        self.assertIn("install_cmake.sh", scripts)
+        self.assertIn("install_doca.sh", scripts)
         self.assertIn("install_dcgm.sh", scripts)
 
     def test_a100_plan_is_ordered_subsequence_of_install_sh(self):
@@ -75,25 +75,26 @@ class InstallShParityTests(unittest.TestCase):
     def test_a100_plan_exact_order(self):
         # The full expected A100 flow, in order, per install.sh.
         expected = [
-            "install_cmake.sh",
-            "install_lustre_client.sh",
             "install_doca.sh",
             "install_pmix.sh",
             "install_mpis.sh",
-            "install_mpifileutils.sh",
             "install_nvidiagpudriver.sh",
             "install_nccl.sh",
             "install_docker.sh",
             "install_dcgm.sh",
+            "install_lustre_client.sh",
+            "install_mpifileutils.sh",
             "install_amd_libs.sh",
             "install_intel_libs.sh",
             "install_dynolog_drl.sh",
             "hpc-tuning.sh",
+            "install_waagent.sh",
             "install_azure_persistent_rdma_naming.sh",
             "install_aznfs.sh",
             "install_hpcdiag.sh",
             "install_monitoring_tools.sh",
             "install_health_checks.sh",
+            "write_kernel_os_version.sh",
             "add-udev-rules.sh",
             "copy_test_file.sh",
             "disable_cloudinit.sh",
@@ -140,7 +141,6 @@ class GatingTests(unittest.TestCase):
         self.assertIn("install_nvshmem.sh", plan)
         self.assertIn("install_nvloom.sh", plan)
         self.assertIn("install_nvbandwidth_tool.sh", plan)
-        self.assertNotIn("install_cmake.sh", plan)       # skipped on GB200
         self.assertNotIn("install_intel_libs.sh", plan)  # aarch64
         self.assertNotIn("install_amd_libs.sh", plan)    # aarch64
         self.assertNotIn("install_aznfs.sh", plan)       # not-GB200 group
@@ -175,7 +175,7 @@ class BuildFailureHandlingTests(unittest.TestCase):
 
     def test_raising_step_gives_exit_3_not_a_traceback(self):
         def boom(env):
-            raise FileNotFoundError("/tmp/cmake-4.3.1/bin/ccmake")
+            raise FileNotFoundError("/tmp/mpifileutils-build/bin/dcp")
 
         rc, logged = self._run_build_with(boom)   # must not propagate
         self.assertEqual(rc, 3)

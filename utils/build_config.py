@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_cmake, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca
 from utils.sku import sku_has_infiniband
 
 MODULE_DIRS = {
@@ -207,13 +207,6 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         return c.vendor == "AMD"
 
     return [
-        # update cmake (skip GB200)
-        Step("install-cmake", "install_cmake.sh", action=install_cmake.install,
-             when=lambda c: c.gpu != "GB200"),
-
-        # Lustre clients
-        Step("install-lustre", "install_lustre_client.sh"),
-
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
         Step("install-doca", "install_doca.sh", action=install_doca.install,
              when=lambda c: sku_has_infiniband(c.gpu)),
@@ -221,11 +214,9 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_libfabric.install,
              when=lambda c: not sku_has_infiniband(c.gpu)),
 
-        # PMIX + MPI libraries + mpifileutils
+        # PMIX + MPI libraries
         Step("install-pmix", "install_pmix.sh"),
         Step("install-mpis", "install_mpis.sh"),
-        Step("install-mpifileutils", "install_mpifileutils.sh",
-             action=install_mpifileutils.install),
 
         # --- NVIDIA driver branch (mutually exclusive by SKU) ---
         Step("install-nv-driver-gb200", "install_nvidiagpudriver_gb200.sh",
@@ -251,6 +242,12 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-rocm", "install_rocm.sh", when=amd),
         Step("install-rccl", "install_rccl.sh", when=amd),
 
+        # Lustre client, then mpifileutils which builds against it (upstream #557
+        # moved lustre here so mpifileutils picks up Lustre support).
+        Step("install-lustre", "install_lustre_client.sh"),
+        Step("install-mpifileutils", "install_mpifileutils.sh",
+             action=install_mpifileutils.install),
+
         # --- x86_64 libraries ---
         Step("install-amd-libs", "install_amd_libs.sh",
              when=lambda c: c.architecture == "x86_64"),
@@ -266,6 +263,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # optimizations + persistent RDMA naming
         Step("hpc-tuning", "hpc-tuning.sh"),
+        Step("install-waagent", "install_waagent.sh"),
         Step("install-persistent-rdma-naming",
              "install_azure_persistent_rdma_naming.sh"),
 
@@ -280,6 +278,9 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-health-checks", "install_health_checks.sh",
              args=(cfg.gpu_arg,),
              when=lambda c: c.gpu not in {"GB200", "NCv6"}),
+
+        # record kernel + OS version into the image
+        Step("write-kernel-os-version", "write_kernel_os_version.sh"),
 
         # final configuration steps
         Step("add-udev-rules", "add-udev-rules.sh"),
