@@ -30,6 +30,16 @@ Following are the current supported HPC/AI VM images that are available in Azure
 - [AzureLinux-HPC]() 3-V100 (azure-hpc:azurelinux-hpc:3-v100:latest)
 - [AzureLinux-HPC]() 3-V100-FIPS (azure-hpc:azurelinux-hpc:3-v100-fips:latest)  
 
+# Python port (in progress)
+
+The bash image-build orchestration is being incrementally ported to Python. The
+build is driven by `azhpc.py`, with the step plan in `utils/build_config.py`;
+bash remains the default for any step not yet ported.
+
+If you'd like to contribute, see **[docs/porting-guide.md](docs/porting-guide.md)**
+— it covers the design rationale, the action contract, the shared helpers, and
+the list of remaining scripts.
+
 # How to Use
 
 This repo uses [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/?view=azure-cli-latest) and [Packer](https://developer.hashicorp.com/packer/integrations/hashicorp/azure/latest/components/builder/arm) to build images. (Note: only WSL/Linux is supported at the moment)
