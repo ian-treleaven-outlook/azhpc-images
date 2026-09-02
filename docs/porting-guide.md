@@ -3,9 +3,11 @@
 A contributor guide for the incremental port of the bash image-build
 orchestration to Python.
 
-**Status:** `build_plan()` has 36 steps; **9 run natively in Python, 27 still
-shell out to bash.** Each remaining script is an independent, self-contained
-task — claim the ADO task, port it, open a PR.
+**Status:** [`build_plan()`](../utils/build_config.py#L191) in
+[`build_config.py`](../utils/build_config.py#L191), called from
+[`azhpc.py`](../azhpc.py#L192), has 36 steps; **9 run natively in Python, 27
+still shell out to bash.** Each remaining script is an independent,
+self-contained task — claim the ADO task, port it, open a PR.
 
 > Much of the design rationale here comes from Gio Martinez's project
 > presentation, *Azure HPC Images Python Refactor* (Aug 2026). He designed and
