@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -55,8 +55,8 @@ DISTRO_DIRS = {
 }
 GPU_ARGS = {"NVidia": "NVIDIA", "AMD": "AMD"}
 
-# The --os values whose install.sh runs the Ubuntu-only distro scripts
-# (disable_auto_upgrade.sh, disable_predictive_interface_renaming.sh).
+# The --os values whose install.sh runs the Ubuntu-only distro script
+# disable_predictive_interface_renaming.sh.
 UBUNTU_OSES = {"Ubuntu24", "Ubuntu22"}
 
 def _detect_distribution() -> str:
@@ -215,11 +215,27 @@ class Step:
     # WARNING rather than the usual INFO line — e.g. a distro's install.sh never
     # runs this script, which may be an upstream gap someone should look at.
     skip_warning: str = ""
+    # Set when the Python port is behind its bash script, e.g. upstream changed
+    # the script after it was ported. The value names the ticket that will
+    # update the port, e.g. "ADO 987". While it is set, build() runs the bash
+    # script instead of `action` and logs a WARNING, so a build never runs a
+    # stale port. Remove it once the port matches the bash again.
+    resync: str = ""
+
+    @property
+    def runner(self) -> str:
+        """How build() runs this step: "python" (its action) or "bash".
+
+        A step runs as bash when it has no Python action, or when its port is
+        marked resync (behind its bash script). build() and `azhpc.py
+        --dry-run` both use this, so the dry run shows what a build would do.
+        """
+        return "python" if self.action is not None and not self.resync else "bash"
 
 def _cleanup_downloads(env: dict[str, str]) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
 
-    Mirrors the inline cleanup in install.sh between install_dynolog_drl and
+    Mirrors the inline cleanup in install.sh between install_intel_libs and
     hpc-tuning. Runs the exact bash rm in the distro build dir. Destructive by
     design; only ever runs during a real build() on the build VM.
     """
@@ -246,6 +262,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     before this plan executes. Inline shell in install.sh that isn't a component
     script — the non-IB rdma-core install + mana_ib blacklist and the tarball
     cleanup — is handled here only for the cleanup.)
+
+    Steps marked resync="ADO <id>" have a Python port that is behind its bash
+    script since the upstream sync (ADO 983); they run bash until that ticket
+    updates the port. See Step.resync.
     """
     def nvidia(c):
         return c.vendor == "NVidia"
@@ -256,7 +276,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     return [
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
         Step("install-doca", "install_doca.sh", action=install_doca.install,
-             when=lambda c: sku_has_infiniband(c.gpu)),
+             when=lambda c: sku_has_infiniband(c.gpu), resync="ADO 987"),
         Step("install-libfabric", "install_libfabric.sh",
              action=install_libfabric.install,
              when=lambda c: not sku_has_infiniband(c.gpu)),
@@ -264,52 +284,56 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
         # install_mpis.sh can rebuild HPC-X's UCX with ROCm support.
         Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
-             when=amd),
+             when=amd, resync="ADO 986"),
 
-        # PMIX + MPI libraries
-        Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
-        Step("install-mpis", "install_mpis.sh", action=install_mpis.install),
-
-        # --- NVIDIA driver branch ---
-        # One shared driver script for every NVIDIA SKU except NCv6 (GRID), as
-        # in install.sh. GB200/GB300/VR200 differences (IMEX, CDMM, no fabric
-        # manager) are inside install_nvidiagpudriver.sh, switched on by the
-        # NVLINK_RACKSCALE env var that packer sets. (The old dedicated
-        # install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
-        # On GB200 the driver must come before NVSHMEM/NVLOOM/nvbandwidth.
+        # --- NVIDIA driver, before PMIx/MPI ---
+        # As in install.sh: "Install CUDA before MPI so HPC-X can rebuild Open
+        # MPI with CUDA support." One shared driver script for every NVIDIA SKU
+        # except NCv6, which gets the GRID driver. GB200/GB300/VR200 differences
+        # (IMEX, CDMM, no fabric manager) are inside install_nvidiagpudriver.sh,
+        # switched on by the NVLINK_RACKSCALE env var that packer sets. (The old
+        # dedicated install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
              action=install_nvidiagpudriver.install,
-             when=lambda c: nvidia(c) and c.gpu != "NCv6"),
+             when=lambda c: nvidia(c) and c.gpu != "NCv6", resync="ADO 985"),
+        Step("install-nv-grid", "install_nvidiagriddriver.sh",
+             action=install_nvidiagriddriver.install,
+             when=lambda c: nvidia(c) and c.gpu == "NCv6", resync="ADO 985"),
+
+        # PMIX + MPI libraries
+        Step("install-pmix", "install_pmix.sh", action=install_pmix.install,
+             resync="ADO 984"),
+        Step("install-mpis", "install_mpis.sh", action=install_mpis.install,
+             resync="ADO 984"),
+
+        # --- GB200 NVLink tools (need the driver and HPC-X) ---
         Step("install-nvshmem", "install_nvshmem.sh",
              action=install_nvshmem.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nvloom", "install_nvloom.sh",
              action=install_nvloom.install,
-             when=lambda c: nvidia(c) and c.gpu == "GB200"),
+             when=lambda c: nvidia(c) and c.gpu == "GB200", resync="ADO 985"),
         Step("install-nvbandwidth", "install_nvbandwidth_tool.sh",
              action=install_nvbandwidth_tool.install,
-             when=lambda c: nvidia(c) and c.gpu == "GB200"),
-        Step("install-nv-grid", "install_nvidiagriddriver.sh",
-             action=install_nvidiagriddriver.install,
-             when=lambda c: nvidia(c) and c.gpu == "NCv6"),
+             when=lambda c: nvidia(c) and c.gpu == "GB200", resync="ADO 985"),
 
         # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", action=install_nccl.install,
-             when=nvidia),
+             when=nvidia, resync="ADO 987"),
         Step("install-docker", "install_docker.sh", action=install_docker.install),
         Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
-             when=nvidia),
+             when=nvidia, resync="ADO 987"),
 
         # --- AMD branch (ROCm itself runs earlier, before PMIx/MPI) ---
         Step("install-rccl", "install_rccl.sh", action=install_rccl.install,
-             when=amd),
+             when=amd, resync="ADO 986"),
 
         # Lustre client, then mpifileutils which builds against it (upstream #557
         # moved lustre here so mpifileutils picks up Lustre support).
         Step("install-lustre", "install_lustre_client.sh",
-             action=install_lustre_client.install),
+             action=install_lustre_client.install, resync="ADO 988"),
         Step("install-mpifileutils", "install_mpifileutils.sh",
-             action=install_mpifileutils.install),
+             action=install_mpifileutils.install, resync="ADO 984"),
 
         # --- x86_64 libraries ---
         Step("install-amd-libs", "install_amd_libs.sh",
@@ -319,23 +343,22 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_intel_libs.install,
              when=lambda c: c.architecture == "x86_64"),
 
-        # dynolog + dyno-relay-logger
-        Step("install-dynolog-drl", "install_dynolog_drl.sh",
-             action=install_dynolog_drl.install),
+        # (install_dynolog_drl.sh was removed upstream in #627; ADO 989.)
 
         # free space: remove downloaded tarballs/installers (inline rm in install.sh)
         Step("cleanup-downloads", action=_cleanup_downloads),
 
         # optimizations + persistent RDMA naming
-        Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install),
+        Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install,
+             resync="ADO 988"),
         Step("install-waagent", "install_waagent.sh", action=install_waagent.install),
         Step("install-persistent-rdma-naming",
              "install_azure_persistent_rdma_naming.sh",
-             action=install_azure_persistent_rdma_naming.install),
+             action=install_azure_persistent_rdma_naming.install, resync="ADO 988"),
 
         # not-GB200 group
         Step("install-aznfs", "install_aznfs.sh", action=install_aznfs.install,
-             when=lambda c: c.gpu != "GB200"),
+             when=lambda c: c.gpu != "GB200", resync="ADO 988"),
         Step("install-hpcdiag", "install_hpcdiag.sh",
              action=install_hpcdiag.install, when=lambda c: c.gpu != "GB200"),
         Step("install-monitoring-tools", "install_monitoring_tools.sh",
@@ -349,6 +372,11 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # record kernel + OS version into the image
         Step("write-kernel-os-version", "write_kernel_os_version.sh",
              action=write_kernel_os_version.install),
+
+        # New upstream (every distro): on 64 KB-page kernels, install nmap
+        # from the distro, since the one shipped with AzSecPack doesn't work
+        # there. Bash only until ADO 990 ports it.
+        Step("install-azsecpack-prereqs", "install_azsecpack_prereqs.sh"),
 
         # final configuration steps
         Step("add-udev-rules", "add-udev-rules.sh",
@@ -365,13 +393,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("setup-sku-customizations", "setup_sku_customizations.sh",
              action=setup_sku_customizations.install),
         Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install),
-        # Ubuntu only: these scripts exist only in distros/ubuntu22.04 and
-        # distros/ubuntu24.04, and only those install.sh scripts run them.
-        Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro",
-             action=disable_auto_upgrade.install,
-             when=lambda c: c.os in UBUNTU_OSES,
-             skip_warning="only the Ubuntu install.sh scripts run "
-                          "disable_auto_upgrade.sh; skipped to match bash"),
+        # (disable_auto_upgrade.sh was removed upstream from Ubuntu 22.04 and
+        # 24.04 in #623; Packer handles it now. Only 26.04 runs it; ADO 989.)
+        # Ubuntu only: this script exists only in the Ubuntu distro folders,
+        # and only their install.sh scripts run it.
         Step("disable-predictive-interface-renaming",
              "disable_predictive_interface_renaming.sh", base="distro",
              action=disable_predictive_interface_renaming.install,
@@ -464,8 +489,14 @@ class ImageBuilder:
                 continue
 
             # Record whether this step ran as Python or bash, so a failure in a
-            # real build can be traced to the right implementation.
-            runner = "python" if step.action is not None else "bash"
+            # real build can be traced to the right implementation. A port
+            # marked `resync` is out of date, so its bash script runs instead.
+            runner = step.runner
+            if step.action is not None and step.resync:
+                log_warn(step.op,
+                         f"Python port is behind {step.script} ({step.resync}); "
+                         "running the bash script instead",
+                         script=step.script, resync=step.resync)
             log_info(step.op, f"starting ({runner})", runner=runner, script=step.script)
             step_started = time.monotonic()
 
@@ -475,7 +506,7 @@ class ImageBuilder:
             # can't escape as a traceback and break the documented exit codes.
             # The traceback is still logged, as the error's detail block.
             try:
-                if step.action is not None:
+                if runner == "python":
                     rc = step.action(env)
                 else:
                     # "distro" specific scripts live in build_dir; the rest in components/

@@ -205,9 +205,10 @@ def print_build_plan(config) -> None:
     print(f"# Build plan for {config.vendor}/{config.gpu} on {config.os} "
           f"({config.architecture}) — {len(steps)} steps:")
 
-    # Columns: number, step name, bash script, and whether it runs as python/bash.
+    # Columns: number, step name, bash script, and whether it runs as python/bash
+    # (plus the resync ticket when a stale Python port falls back to bash).
     for number, step in enumerate(steps, start=1):
-        runner = "python" if step.action is not None else "bash"
+        runner = step.runner + (f", resync {step.resync}" if step.resync else "")
         print(f"  {number:2d}. {step.op:<34} {step.script:<40} ({runner})")
 
 def main(argv=None) -> int:

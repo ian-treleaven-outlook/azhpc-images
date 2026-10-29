@@ -166,18 +166,18 @@ class InstallTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Wiring: the build plan must call this module, keeping the bash fallback.
+# Wiring: upstream removed disable_auto_upgrade.sh from Ubuntu 22.04 and 24.04
+# (#623; Packer handles it now), so the build plan no longer runs this module.
+# Only Ubuntu 26.04 still runs the script; ADO 989 decides the module's future.
 # --------------------------------------------------------------------------- #
 class BuildPlanWiringTests(unittest.TestCase):
-    def test_step_runs_the_python_action_and_keeps_its_bash_script(self):
-        cfg = BuildConfig(vendor="NVidia", gpu="A100", os="Ubuntu24",
-                          fips=False, spec_path=None)
-        steps = [s for s in build_plan(cfg) if s.op == "disable-auto-upgrade"]
-
-        self.assertEqual(len(steps), 1)
-        self.assertIs(steps[0].action, disable_auto_upgrade.install)
-        self.assertEqual(steps[0].script, "disable_auto_upgrade.sh")
-        self.assertEqual(steps[0].base, "distro")
+    def test_step_is_no_longer_in_the_build_plan(self):
+        for os_name in ("Ubuntu24", "Ubuntu22"):
+            with self.subTest(os=os_name):
+                cfg = BuildConfig(vendor="NVidia", gpu="A100", os=os_name,
+                                  fips=False, spec_path=None)
+                ops = [s.op for s in build_plan(cfg)]
+                self.assertNotIn("disable-auto-upgrade", ops)
 
 
 if __name__ == "__main__":

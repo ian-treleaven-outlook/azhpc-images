@@ -30,6 +30,11 @@ if [ "$GPU" = "AMD" ]; then
     $COMPONENT_DIR/install_rocm.sh
 fi
 
+if [ "$GPU" = "NVIDIA" ]; then
+    # Install CUDA before MPI so HPC-X can rebuild Open MPI with CUDA support.
+    $COMPONENT_DIR/install_nvidiagpudriver.sh
+fi
+
 # install PMIX
 $COMPONENT_DIR/install_pmix.sh
 
@@ -40,9 +45,6 @@ $COMPONENT_DIR/install_mpis.sh
 $COMPONENT_DIR/install_mpifileutils.sh
 
 if [ "$GPU" = "NVIDIA" ]; then
-    # install nvidia gpu driver
-    $COMPONENT_DIR/install_nvidiagpudriver.sh
-    
     # Install NCCL
     $COMPONENT_DIR/install_nccl.sh
 
@@ -80,9 +82,6 @@ if [ "$ARCHITECTURE" != "aarch64" ]; then
     $COMPONENT_DIR/install_intel_libs.sh
 fi
 
-# install dynolog and dyno-relay-logger
-$COMPONENT_DIR/install_dynolog_drl.sh
-
 # cleanup downloaded tarballs - clear some space
 rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh
 rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*
@@ -110,6 +109,8 @@ fi
 
 # write kernel and OS version metadata
 $COMPONENT_DIR/write_kernel_os_version.sh
+
+$COMPONENT_DIR/install_azsecpack_prereqs.sh
 
 # install diagnostic script
 $COMPONENT_DIR/install_hpcdiag.sh

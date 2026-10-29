@@ -5,11 +5,13 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 35 steps; **all 35 run natively in Python.**
+[`azhpc.py`](../azhpc.py#L192), has 34 steps. **17 run in Python. 16 have a
+Python port that is behind its bash script since the October 2026 upstream sync
+and run bash until resynced, and 1 new upstream step is bash only** (see §12).
 Each bash script is kept as that step's fallback and parity reference: delete a
-Step's `action=` and it runs the bash script again. The plan mirrors
-`distros/ubuntu24.04/install.sh`; the other distros' `install.sh` scripts still
-differ from it in places (see §12).
+Step's `action=`, or mark it `resync=`, and it runs the bash script again. The
+plan mirrors `distros/ubuntu24.04/install.sh`; the other distros' `install.sh`
+scripts still differ from it in places (see §12).
 
 > Much of the design rationale here comes from Gio Martinez's project
 > presentation, *Azure HPC Images Python Refactor* (Aug 2026). He designed and
@@ -85,17 +87,20 @@ class Step:
     args: tuple[str, ...] = ()
     base: str = "component"       # "component" (components/) or "distro" (build_dir)
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
+    skip_warning: str = ""        # why a skip deserves a WARNING (see §7)
+    resync: str = ""              # ticket, when the port is behind its bash
 ```
 
 Every step keeps its bash script name, so the plan stays traceable and can be
 diffed against `install.sh` automatically. **Bash is the default.** A step only
-runs Python when it has an `action`:
+runs Python when it has an `action` and is not marked `resync`
+(`Step.runner`):
 
 ```python
-if step.action is not None:
+if step.runner == "python":
     rc = step.action(env)          # ported: run Python
 else:
-    rc = exec_program([...])       # not yet ported: run the bash script
+    rc = exec_program([...])       # not yet ported, or stale: run the bash script
 ```
 
 ### Porting is one reversible line
@@ -114,6 +119,24 @@ verified before moving to the next.
 
 You are not rewriting the orchestrator, and you must **not** remove `script=` —
 the parity tests depend on it.
+
+### When upstream changes a ported script: `resync=`
+
+Upstream keeps changing the bash. When a ported script changes, the port is
+stale, and running it would build something different from bash. Mark the step
+with the ticket that will update the port:
+
+```python
+Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
+     when=nvidia, resync="ADO 987"),                                  # stale
+```
+
+The step then runs its bash script, logs a WARNING naming the ticket, and
+`azhpc.py --dry-run` shows `(bash, resync ADO 987)`. The port stays wired, so
+its tests keep running. To re-enable it, bring the port up to date with
+`git diff <old> <new> -- components/<name>.sh` and delete `resync=`.
+`ResyncTests` in `tests/python/test_build_plan.py` pins the list of marked steps,
+so both directions are deliberate changes.
 
 ---
 
@@ -286,7 +309,9 @@ carries vendor/GPU/OS for filtering across concurrent builds.
   `E: Unable to locate package foo`) is visible at the default INFO level.
 - **Every step** (`build()`): `starting (python|bash)`, then `done in Ns` or the
   failure, with `runner`, `exit_code` and `duration_s` fields. An unexpected
-  exception is logged with its traceback as the detail block.
+  exception is logged with its traceback as the detail block. A step marked
+  `resync` first logs a WARNING that its Python port is behind the bash script,
+  with a `resync` field naming the ticket.
 - **The run**: a first line with vendor, GPU, OS, distribution, architecture,
   node type and planned step count; a last line with total duration and how
   many steps ran as Python, as bash, or were skipped.
@@ -393,8 +418,10 @@ remaining scripts.
 
 Do **not** delete `components/<name>.sh`. It remains the fallback for unported
 distro paths, the script `install.sh` invokes, and the reference the parity
-tests compare against. The only script removed so far was `install_cmake.sh` —
-because *upstream* deleted it, not because we ported it.
+tests compare against. Scripts leave only when *upstream* deletes them:
+`install_cmake.sh` earlier, and in the October 2026 sync
+`install_dynolog_drl.sh`, `install_azure_persistent_rdma_naming_monitor.sh` and
+the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 
 ---
 
@@ -403,8 +430,10 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **857 tests, ~standard library only** — `unittest` and
-`unittest.mock`, no pytest.
+The suite is **865 tests, ~standard library only** — `unittest` and
+`unittest.mock`, no pytest. Six are skipped on purpose: they compare the Lustre
+and CUDA samples ports with bash that upstream has since changed, and each
+skip names the resync ticket that will update them.
 
 Add coverage for at minimum:
 
@@ -453,14 +482,39 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Status — every step ported
+## 12. Status — every step ported; 16 waiting for a resync
 
-All 35 steps have a Python `action=`. Nested component scripts that a ported
-step calls (e.g. `install_gdrcopy.sh`, `install_nvidia_fabric_manager.sh`,
-`configure_nvidia_persistence.sh`, `install_nvidia_container_toolkit.sh`,
-`install_azure_persistent_rdma_naming_monitor.sh`) still run as bash, invoked
-by the Python step exactly as the bash step did; `install_cuda_samples` runs as
-its Python port, called by both driver steps.
+Every step that existed before the October 2026 upstream sync has a Python
+`action=`. The sync (ADO 983; upstream `f58ab80` → `0c2b8f9`) changed the plan:
+
+- the NVIDIA driver (GRID on NCv6) now runs **before** PMIx/MPI, so HPC-X can
+  rebuild Open MPI with CUDA support;
+- `install_dynolog_drl.sh` and the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`
+  were removed upstream, so their steps are gone (the modules are retired in
+  ADO 989);
+- `install_azsecpack_prereqs.sh` is new, after `write_kernel_os_version.sh`, and
+  runs as bash until ADO 990 ports it.
+
+Upstream also changed 16 ported scripts. Those steps are marked `resync=` and
+run bash until their ticket updates the port:
+
+| Ticket | Steps |
+|---|---|
+| ADO 984 | `install-pmix`, `install-mpis`, `install-mpifileutils` |
+| ADO 985 | `install-nv-driver`, `install-nv-grid`, `install-nvloom`, `install-nvbandwidth` |
+| ADO 986 | `install-rocm`, `install-rccl` |
+| ADO 987 | `install-doca`, `install-nccl`, `install-dcgm` |
+| ADO 988 | `install-lustre`, `hpc-tuning`, `install-persistent-rdma-naming`, `install-aznfs` |
+
+Ports kept enabled had no upstream change, or a change only for Ubuntu 26.04
+(not yet a CLI target: `install_docker.sh`, `install_monitoring_tools.sh`) or in
+whitespace (`install_health_checks.sh`).
+
+Nested component scripts that a ported step calls (e.g. `install_gdrcopy.sh`,
+`install_nvidia_fabric_manager.sh`, `configure_nvidia_persistence.sh`,
+`install_nvidia_container_toolkit.sh`) still run as bash, invoked by the Python
+step exactly as the bash step did; `install_cuda_samples` runs as its Python
+port, called by both driver steps.
 
 `install-nv-driver` covers GB200/GB300 (and VR200, built as GB200) too, as in
 bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, and
@@ -473,11 +527,12 @@ it for GB*/VR* SKUs).
 `install.sh` scripts differ from it in which component scripts they run — for
 example Azure Linux uses `install_mofed.sh` instead of `install_doca.sh` and
 doesn't run `install_lustre_client.sh`; AlmaLinux and Rocky don't run
-`add-udev-rules.sh` (Rocky also skips `install_dynolog_drl.sh`) and run extra
-scripts such as `network-config.sh`. `DISTRO_DIRS` also names
-`almalinux9.7`/`rocky9.7` directories that don't exist (they are `9.x`).
-Only the Ubuntu-only and Azure Linux cloud-init skips are handled so far; the
-rest needs per-distro plans before RPM builds use the Python path.
+`add-udev-rules.sh` and run extra scripts such as `network-config.sh`.
+`DISTRO_DIRS` also names `almalinux9.7`/`rocky9.7` directories that don't exist
+(they are `9.x`), and upstream added RHEL 8.10/9.x and Ubuntu 26.04, which the
+CLI doesn't offer yet. Only the Ubuntu-only and Azure Linux cloud-init skips
+are handled so far; the rest needs per-distro plans (ADO 991–997) before other
+distros use the Python path.
 
 ---
 

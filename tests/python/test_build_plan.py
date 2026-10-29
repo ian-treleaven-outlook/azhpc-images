@@ -91,13 +91,24 @@ class InstallShParityTests(unittest.TestCase):
         self.assertLess(plan.index("install_rocm.sh"), plan.index("install_pmix.sh"))
         self.assertLess(plan.index("install_rocm.sh"), plan.index("install_mpis.sh"))
 
+    def test_nvidia_installs_the_driver_before_pmix_and_mpis(self):
+        # Upstream install.sh: "Install CUDA before MPI so HPC-X can rebuild
+        # Open MPI with CUDA support." NCv6 gets the GRID driver instead.
+        for gpu, driver in (("A100", "install_nvidiagpudriver.sh"),
+                            ("GB200", "install_nvidiagpudriver.sh"),
+                            ("NCv6", "install_nvidiagriddriver.sh")):
+            with self.subTest(gpu=gpu):
+                plan = _plan_scripts(_cfg("NVidia", gpu))
+                self.assertLess(plan.index(driver), plan.index("install_pmix.sh"))
+                self.assertLess(plan.index(driver), plan.index("install_mpis.sh"))
+
     def test_a100_plan_exact_order(self):
         # The full expected A100 flow, in order, per install.sh.
         expected = [
             "install_doca.sh",
+            "install_nvidiagpudriver.sh",
             "install_pmix.sh",
             "install_mpis.sh",
-            "install_nvidiagpudriver.sh",
             "install_nccl.sh",
             "install_docker.sh",
             "install_dcgm.sh",
@@ -105,7 +116,6 @@ class InstallShParityTests(unittest.TestCase):
             "install_mpifileutils.sh",
             "install_amd_libs.sh",
             "install_intel_libs.sh",
-            "install_dynolog_drl.sh",
             "hpc-tuning.sh",
             "install_waagent.sh",
             "install_azure_persistent_rdma_naming.sh",
@@ -114,15 +124,59 @@ class InstallShParityTests(unittest.TestCase):
             "install_monitoring_tools.sh",
             "install_health_checks.sh",
             "write_kernel_os_version.sh",
+            "install_azsecpack_prereqs.sh",
             "add-udev-rules.sh",
             "copy_test_file.sh",
             "disable_cloudinit.sh",
             "setup_sku_customizations.sh",
             "trivy_scan.sh",
-            "disable_auto_upgrade.sh",
             "disable_predictive_interface_renaming.sh",
         ]
         self.assertEqual(_plan_scripts(_cfg("NVidia", "A100")), expected)
+
+
+# Since the upstream sync (ADO 983), some ports are behind their bash script and
+# run bash until a resync ticket updates them (Step.resync). This list is pinned
+# on purpose: re-enabling a port, or marking another one stale, should be a
+# deliberate change that also updates this test.
+class ResyncTests(unittest.TestCase):
+    EXPECTED = {
+        "install-pmix": "ADO 984",
+        "install-mpis": "ADO 984",
+        "install-mpifileutils": "ADO 984",
+        "install-nv-driver": "ADO 985",
+        "install-nv-grid": "ADO 985",
+        "install-nvloom": "ADO 985",
+        "install-nvbandwidth": "ADO 985",
+        "install-rocm": "ADO 986",
+        "install-rccl": "ADO 986",
+        "install-doca": "ADO 987",
+        "install-nccl": "ADO 987",
+        "install-dcgm": "ADO 987",
+        "install-lustre": "ADO 988",
+        "hpc-tuning": "ADO 988",
+        "install-persistent-rdma-naming": "ADO 988",
+        "install-aznfs": "ADO 988",
+    }
+
+    def _steps(self):
+        return build_plan(_cfg("NVidia", "A100"))
+
+    def test_stale_ports_are_marked_with_their_ticket(self):
+        marked = {s.op: s.resync for s in self._steps() if s.resync}
+        self.assertEqual(marked, self.EXPECTED)
+
+    def test_marked_steps_have_a_bash_script_to_fall_back_to(self):
+        for step in self._steps():
+            if step.resync:
+                with self.subTest(op=step.op):
+                    self.assertTrue(step.script)
+                    self.assertIsNotNone(step.action)
+                    self.assertTrue((_REPO_ROOT / "components" / step.script).is_file())
+
+    def test_new_upstream_step_runs_as_bash(self):
+        steps = {s.op: s for s in self._steps()}
+        self.assertIsNone(steps["install-azsecpack-prereqs"].action)   # ADO 990
 
 
 # Same plan, different targets: check the SKU/vendor/arch gates pull in the right
@@ -179,8 +233,8 @@ class GatingTests(unittest.TestCase):
 
     def test_steps_a_distros_install_sh_never_runs_are_skipped(self):
         # Azure Linux's install.sh has no disable_cloudinit.sh; only the Ubuntu
-        # install.sh scripts run the two distro-local disable scripts.
-        ubuntu_only = {"disable_auto_upgrade.sh", "disable_predictive_interface_renaming.sh"}
+        # install.sh scripts run the distro-local disable script.
+        ubuntu_only = {"disable_predictive_interface_renaming.sh"}
         cases = {
             "Ubuntu24": (True, True),   # (runs disable_cloudinit, runs ubuntu-only)
             "Ubuntu22": (True, True),
@@ -197,8 +251,7 @@ class GatingTests(unittest.TestCase):
 
     def test_those_skips_carry_a_warning_reason(self):
         steps = {s.op: s for s in build_plan(_cfg("NVidia", "A100"))}
-        for op in ("disable-cloudinit", "disable-auto-upgrade",
-                   "disable-predictive-interface-renaming"):
+        for op in ("disable-cloudinit", "disable-predictive-interface-renaming"):
             with self.subTest(op=op):
                 self.assertTrue(steps[op].skip_warning)
         self.assertEqual(steps["install-rocm"].skip_warning, "")   # normal gating
@@ -331,6 +384,69 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertFalse([c for c in warn.call_args_list if c.args[0] == "test-step"])
         self.assertTrue([c for c in info.call_args_list
                          if c.args[0] == "test-step" and "skipped" in c.args[1]])
+
+    def _run_one_step(self, step):
+        """Run build() with a one-step plan; bash is stubbed to succeed.
+
+        Returns (exit code, exec_program mock, log_info mock, log_warn mock).
+        """
+        builder = ImageBuilder(_REPO_ROOT, _cfg("NVidia", "A100"))
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value={}), \
+             mock.patch.object(build_config, "build_plan", return_value=[step]), \
+             mock.patch.object(build_config, "exec_program", return_value=0) as bash, \
+             mock.patch.object(build_config, "log_info") as info, \
+             mock.patch.object(build_config, "log_warn") as warn:
+            rc = builder.build()
+        return rc, bash, info, warn
+
+    def test_step_marked_resync_runs_bash_with_a_warning(self):
+        action = mock.Mock(return_value=0)
+        step = Step("test-step", "x.sh", action=action, resync="ADO 987")
+        rc, bash, info, warn = self._run_one_step(step)
+
+        self.assertEqual(rc, 0)
+        action.assert_not_called()                    # the stale port never runs
+        bash.assert_called_once()
+        self.assertEqual(Path(bash.call_args.args[0][0]).name, "x.sh")
+        warned = [c for c in warn.call_args_list if c.args[0] == "test-step"]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("ADO 987", warned[0].args[1])
+        self.assertEqual(warned[0].kwargs["resync"], "ADO 987")
+        summary = info.call_args_list[-1]
+        self.assertEqual(summary.kwargs["bash_steps"], 1)
+        self.assertEqual(summary.kwargs["python_steps"], 0)
+
+    def test_step_without_resync_runs_python_and_does_not_warn(self):
+        action = mock.Mock(return_value=0)
+        rc, bash, _, warn = self._run_one_step(Step("test-step", "x.sh", action=action))
+        self.assertEqual(rc, 0)
+        action.assert_called_once()
+        bash.assert_not_called()
+        self.assertFalse([c for c in warn.call_args_list if c.args[0] == "test-step"])
+
+    def test_runner_property(self):
+        port = lambda env: 0
+        self.assertEqual(Step("a", "a.sh", action=port).runner, "python")
+        self.assertEqual(Step("a", "a.sh").runner, "bash")
+        self.assertEqual(Step("a", "a.sh", action=port, resync="ADO 1").runner, "bash")
+
+    def test_dry_run_shows_the_runner_a_build_would_use(self):
+        import contextlib
+        import io
+        import azhpc
+
+        plan = [Step("ported", "p.sh", action=lambda env: 0),
+                Step("stale", "s.sh", action=lambda env: 0, resync="ADO 987"),
+                Step("bash-only", "b.sh")]
+        out = io.StringIO()
+        with mock.patch.object(azhpc, "build_plan", return_value=plan), \
+             contextlib.redirect_stdout(out):
+            azhpc.print_build_plan(_cfg("NVidia", "A100"))
+        lines = {line.split()[1]: line for line in out.getvalue().splitlines()[1:]}
+        self.assertTrue(lines["ported"].endswith("(python)"))
+        self.assertTrue(lines["stale"].endswith("(bash, resync ADO 987)"))
+        self.assertTrue(lines["bash-only"].endswith("(bash)"))
 
     def _rackscale_warnings(self, gpu, env):
         """Run build() for `gpu` with an empty plan; return the rackscale warnings."""
