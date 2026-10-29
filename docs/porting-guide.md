@@ -5,7 +5,7 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **10 run natively in Python, 26
+[`azhpc.py`](../azhpc.py#L192), has 36 steps; **20 run natively in Python, 16
 still shell out to bash.** Each remaining script is an independent,
 self-contained task — claim the ADO task, port it, open a PR.
 
@@ -354,7 +354,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **150 tests, ~standard library only** — `unittest` and
+The suite is **355 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -404,48 +404,41 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 26 unported steps
+## 12. Remaining work — the 16 unported steps
 
 Each row is one ADO task, ordered as they appear in `build_plan()`.
 
 | # | Step (`op`) | Script |
 |---|---|---|
-| 1 | `install-pmix` | `install_pmix.sh` |
-| 2 | `install-mpis` | `install_mpis.sh` |
-| 3 | `install-nv-driver-gb200` | `install_nvidiagpudriver_gb200.sh` |
-| 4 | `install-nvshmem` | `install_nvshmem.sh` |
-| 5 | `install-nvloom` | `install_nvloom.sh` |
-| 6 | `install-nv-grid` | `install_nvidiagriddriver.sh` |
-| 7 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
-| 8 | `install-nccl` | `install_nccl.sh` |
-| 9 | `install-docker` | `install_docker.sh` |
-| 10 | `install-dcgm` | `install_dcgm.sh` |
-| 11 | `install-rocm` | `install_rocm.sh` |
-| 12 | `install-rccl` | `install_rccl.sh` |
-| 13 | `install-lustre` | `install_lustre_client.sh` |
-| 14 | `install-amd-libs` | `install_amd_libs.sh` |
-| 15 | `install-dynolog-drl` | `install_dynolog_drl.sh` |
-| 16 | `hpc-tuning` | `hpc-tuning.sh` |
-| 17 | `install-waagent` | `install_waagent.sh` |
-| 18 | `install-persistent-rdma-naming` | `install_azure_persistent_rdma_naming.sh` |
-| 19 | `install-health-checks` | `install_health_checks.sh` |
-| 20 | `add-udev-rules` | `add-udev-rules.sh` |
-| 21 | `copy-test-file` | `copy_test_file.sh` |
-| 22 | `disable-cloudinit` | `disable_cloudinit.sh` |
-| 23 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
-| 24 | `trivy-scan` | `trivy_scan.sh` |
-| 25 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
-| 26 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
+| 1 | `install-mpis` | `install_mpis.sh` |
+| 2 | `install-nv-driver-gb200` | `install_nvidiagpudriver_gb200.sh` |
+| 3 | `install-nv-grid` | `install_nvidiagriddriver.sh` |
+| 4 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
+| 5 | `install-nccl` | `install_nccl.sh` |
+| 6 | `install-docker` | `install_docker.sh` |
+| 7 | `install-dcgm` | `install_dcgm.sh` |
+| 8 | `install-rocm` | `install_rocm.sh` |
+| 9 | `install-rccl` | `install_rccl.sh` |
+| 10 | `install-lustre` | `install_lustre_client.sh` |
+| 11 | `install-dynolog-drl` | `install_dynolog_drl.sh` |
+| 12 | `hpc-tuning` | `hpc-tuning.sh` |
+| 13 | `install-waagent` | `install_waagent.sh` |
+| 14 | `install-persistent-rdma-naming` | `install_azure_persistent_rdma_naming.sh` |
+| 15 | `disable-cloudinit` | `disable_cloudinit.sh` |
+| 16 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
 
 **Already ported (study these):** `install-doca`, `install-libfabric`,
-`install-nvbandwidth`, `install-mpifileutils`, `install-intel-libs`,
+`install-pmix`, `install-nvshmem`, `install-nvloom`, `install-nvbandwidth`,
+`install-mpifileutils`, `install-amd-libs`, `install-intel-libs`,
 `cleanup-downloads`, `install-aznfs`, `install-hpcdiag`,
-`install-monitoring-tools`, `write-kernel-os-version`.
+`install-monitoring-tools`, `install-health-checks`, `write-kernel-os-version`,
+`add-udev-rules`, `copy-test-file`, `trivy-scan`, `disable-auto-upgrade`,
+`disable-predictive-interface-renaming`.
 
 ### Suggested starting points
 
-New to the codebase? Take `add-udev-rules`, `copy-test-file`, or
-`disable-cloudinit` — small and self-contained.
+New to the codebase? Take `disable-cloudinit`, `install-persistent-rdma-naming`
+or `hpc-tuning` — the smallest remaining steps.
 The GPU driver steps (`install-nv-driver`, `install-rocm`) are the most
 involved; save those until you've done one of the others.
 
