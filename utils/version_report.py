@@ -11,7 +11,7 @@ combination is valid (that is Step 2).
 
 from __future__ import annotations
 
-from utils.component_config import get_component_config
+from utils.component_config import DEFAULT_NODE_TYPE, get_component_config
 
 # Top-level keys in versions.json that are metadata, not installable components.
 _NON_COMPONENTS = {"note"}
@@ -40,7 +40,7 @@ def _extract_versions(config):
 
 
 def resolve_report(versions, *, distribution, architecture,
-                   gpu=None, sku=None, node_type="azure-vm"):
+                   gpu=None, sku=None, node_type=DEFAULT_NODE_TYPE):
     """Resolve every component's version for the given target.
 
     Returns a list of dicts, one row per (component[.sub]) entry:

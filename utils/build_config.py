@@ -12,6 +12,7 @@ import subprocess
 
 from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version
 from utils.sku import sku_has_infiniband
+from utils.component_config import DEFAULT_NODE_TYPE
 
 MODULE_DIRS = {
     "ubuntu": "/usr/share/modules/modulefiles",
@@ -75,7 +76,11 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     env["GPU"]        = cfg.gpu_arg                              # NVIDIA / AMD
     env["SKU"]        = cfg.gpu                                  # H100, MI300, ...
     env["SKU_FAMILY"] = "gb-family" if cfg.gpu in {"GB200", "GB300"} else cfg.gpu
-    env["NODE_TYPE"]  = os.environ.get("NODE_TYPE", "azure-vm")
+    # The deployment target, under the same name and default bash uses (see
+    # utils/set_properties.sh). versions.json overrides are keyed on it, and the
+    # bash steps that still run read it directly. An empty value gets the
+    # default, matching bash's ${TARGET_NODE_TYPE:-azure_vm_regular}.
+    env["TARGET_NODE_TYPE"] = os.environ.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
 
     env["MODULE_FILES_DIRECTORY"] = (
         MODULE_DIRS["ubuntu"] if "ubuntu" in distribution else DEFAULT_MODULE_DIR

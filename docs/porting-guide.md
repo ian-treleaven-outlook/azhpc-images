@@ -131,8 +131,8 @@ Four rules, all load-bearing:
 3. **Log through `utils.logger`, never `print()`.** Pass your step's `op` label
    first so output correlates with the step.
 4. **Read configuration from `env`.** It already carries `COMPONENT_VERSIONS`
-   (the contents of `versions.json`), `DISTRIBUTION`, `ARCHITECTURE`, `SKU`,
-   `NODE_TYPE`, and the `*_DIR` paths — see `component_env()`.
+   (the contents of `versions.json`), `DISTRIBUTION`, `ARCHITECTURE`, `GPU`,
+   `SKU`, `TARGET_NODE_TYPE`, and the `*_DIR` paths — see `component_env()`.
 
 ---
 
@@ -155,25 +155,33 @@ Everything you need exists. Use these rather than rolling your own.
 ## 5. Configuration: the five-tier version hierarchy
 
 `config_for()` resolves a component by walking `versions.json` **most-specific
-first**:
+first**, in the same order as bash's `get_component_config`:
 
 ```
-1. component.distribution.architecture.<gpu_sku>.<node_type>
-2. component.distribution.architecture.<gpu_sku>.default
-3. component.distribution.architecture.<gpu_sku>
+1. component.distribution.architecture.<node_type>.<gpu_sku>
+2. component.distribution.architecture.<node_type>.default
+3. component.distribution.architecture.<node_type>   (if it is a config, not a
+                                                      table of per-SKU overrides)
 4. component.distribution.architecture
 5. component.common
 ```
 
-A real example — NCCL, three machines, one file:
+Steps 1–3 only apply when both `GPU` and `SKU` are set. `<node_type>` is the
+deployment target from `TARGET_NODE_TYPE` — `azure_vm_regular` (default),
+`azure_vm_akshost`, `baremetal_1p` or `baremetal_3p`. `<gpu_sku>` is the vendor
+and SKU normalised, e.g. `nvidia_v100`.
 
-| Machine | Tier hit | Version |
+A real example — NCCL on Ubuntu 24.04, three machines, one file:
+
+| Machine | Step hit | Version |
 |---|---|---|
-| GB200 baremetal · ubuntu24.04 · aarch64 | 1 | `2.28.3-1` |
-| GB200 VM · ubuntu24.04 · aarch64 | 4 | `2.29.3-1` |
-| A100 · x86_64 | 5 | `2.29.7-1` |
+| GB200 · aarch64 · `baremetal_3p` | 3 | `2.28.3-1` |
+| GB200 · aarch64 · `azure_vm_regular` | 4 | `2.29.7-1` |
+| A100 · x86_64 · `azure_vm_regular` | 5 | `2.30.4-1` |
 
-Only one of those was written down explicitly; the rest fall through.
+Each machine gets the most specific entry that exists for it. Step 1 is for a
+single SKU on a single target: CUDA on Ubuntu 24.04 x86_64 is `13.0`, but a V100
+on a regular VM gets `12.9` from `cuda…x86_64.azure_vm_regular.nvidia_v100`.
 
 **This is the single most important function in the project** — every component
 depends on it. Which is exactly why it has a differential test (§9).
@@ -346,7 +354,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **137 tests, ~standard library only** — `unittest` and
+The suite is **150 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
