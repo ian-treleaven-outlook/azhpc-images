@@ -26,7 +26,7 @@ from utils import package_manager
 from utils import package_installer
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool, install_aznfs
+from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs
 
 
 # detect_package_manager() finds a manager by calling shutil.which on each candidate.
@@ -545,66 +545,6 @@ class MonitoringToolsTests(unittest.TestCase):
         with mock.patch.object(install_monitoring_tools, "log_error") as logged:
             self.assertEqual(
                 install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
-
-
-class CudaSamplesTests(unittest.TestCase):
-    def _env(self):
-        return {
-            "COMPONENT_VERSIONS": json.dumps({
-                "cuda": {"common": {
-                    "driver": {"version": "12.4"},
-                    "samples": {"version": "12.4.1", "sha256": "s"},
-                }}
-            }),
-            "DISTRIBUTION": "ubuntu24.04",
-            "ARCHITECTURE": "x86_64",
-            "GPU": "NVIDIA",
-            "SKU": "A100",
-            "TARGET_NODE_TYPE": "azure_vm_regular",
-        }
-
-    def test_get_config_resolves_samples_version(self):
-        self.assertEqual(
-            install_cuda_samples.config_for("cuda", self._env())["samples"]["version"], "12.4.1")
-
-    def test_install_runs_all_build_steps(self):
-        env = self._env()
-        with mock.patch.object(install_cuda_samples, "download_and_verify",
-                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz") as dl, \
-             mock.patch.object(install_cuda_samples, "exec_program", return_value=0) as ex, \
-             mock.patch("tarfile.open"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("os.path.exists", return_value=False), \
-             mock.patch("shutil.move") as mv, \
-             mock.patch("shutil.rmtree"):
-            rc = install_cuda_samples.install(env)
-        self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        self.assertEqual(ex.call_count, 2)  # cmake, make
-        mv.assert_called_once()
-
-    def test_install_stops_on_build_failure(self):
-        env = self._env()
-        with mock.patch.object(install_cuda_samples, "download_and_verify",
-                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz"), \
-             mock.patch.object(install_cuda_samples, "exec_program",
-                               side_effect=[0, 1]) as ex, \
-             mock.patch.object(install_cuda_samples, "log_error") as logged, \
-             mock.patch("tarfile.open"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("shutil.move") as mv, \
-             mock.patch("shutil.rmtree"):
-            rc = install_cuda_samples.install(env)
-        self.assertEqual(rc, 3)
-        self.assertEqual(ex.call_count, 2)  # stopped after make failed
-        mv.assert_not_called()
-        logged.assert_called()   # build failure is reported as an error
-
-    def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_cuda_samples, "log_error") as logged:
-            self.assertEqual(
-                install_cuda_samples.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
 

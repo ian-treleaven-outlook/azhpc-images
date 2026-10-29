@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis, install_nvidiagpudriver
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -278,6 +278,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
         # On GB200 the driver must come before NVSHMEM/NVLOOM/nvbandwidth.
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
+             action=install_nvidiagpudriver.install,
              when=lambda c: nvidia(c) and c.gpu != "NCv6"),
         Step("install-nvshmem", "install_nvshmem.sh",
              action=install_nvshmem.install,
