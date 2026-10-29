@@ -225,6 +225,11 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_libfabric.install,
              when=lambda c: not sku_has_infiniband(c.gpu)),
 
+        # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
+        # install_mpis.sh can rebuild HPC-X's UCX with ROCm support.
+        Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
+             when=amd),
+
         # PMIX + MPI libraries
         Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
         Step("install-mpis", "install_mpis.sh"),
@@ -252,9 +257,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
              when=nvidia),
 
-        # --- AMD branch ---
-        Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
-             when=amd),
+        # --- AMD branch (ROCm itself runs earlier, before PMIx/MPI) ---
         Step("install-rccl", "install_rccl.sh", action=install_rccl.install,
              when=amd),
 

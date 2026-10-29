@@ -72,6 +72,25 @@ class InstallShParityTests(unittest.TestCase):
             f"A100 plan is not an ordered subsequence of install.sh\n"
             f"plan={plan}\ninstall.sh={install_sh}")
 
+    def test_other_targets_are_ordered_subsequences_of_install_sh(self):
+        # Same check for the AMD and non-InfiniBand paths, which the A100 test
+        # can't see (this is how the ROCm-after-MPI ordering slipped through).
+        # GB200 is left out: its plan names install_nvidiagpudriver_gb200.sh,
+        # which install.sh doesn't use (see the porting guide).
+        install_sh = _install_sh_scripts()
+        for vendor, gpu in (("AMD", "MI300"), ("NVidia", "NCv6"), ("NVidia", "H100")):
+            with self.subTest(gpu=gpu):
+                plan = _plan_scripts(_cfg(vendor, gpu))
+                self.assertTrue(
+                    _is_subsequence(plan, install_sh),
+                    f"{gpu} plan is not an ordered subsequence of install.sh\n"
+                    f"plan={plan}\ninstall.sh={install_sh}")
+
+    def test_amd_installs_rocm_before_pmix_and_mpis(self):
+        plan = _plan_scripts(_cfg("AMD", "MI300"))
+        self.assertLess(plan.index("install_rocm.sh"), plan.index("install_pmix.sh"))
+        self.assertLess(plan.index("install_rocm.sh"), plan.index("install_mpis.sh"))
+
     def test_a100_plan_exact_order(self):
         # The full expected A100 flow, in order, per install.sh.
         expected = [
