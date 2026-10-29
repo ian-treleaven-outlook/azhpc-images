@@ -399,7 +399,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **602 tests, ~standard library only** — `unittest` and
+The suite is **633 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:

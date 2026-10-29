@@ -91,9 +91,9 @@ install() returns 0 for success or 3 for failure. It logs problems and returns
 3; it does not let exceptions escape to the build loop. Like bash's `set -e`,
 the first failure stops the step.
 
-Known drift (not fixed here): bash's install.sh maps the VR200 SKU to GB200,
-so the bash build applies the GB200 GRUB/irqbalance changes on VR200 too. The
-Python build sets SKU=VR200, so this step skips them there.
+VR200: like bash's install.sh, the Python build treats a VR200 SKU as GB200
+(see SKU_ALIASES in utils/build_config.py), so SKU is GB200 here and the GB200
+GRUB/irqbalance changes apply to VR200 images too.
 
 Rerun behaviour (same as bash): the GB200 replacement text still contains
 "lockdown=integrity", so running the step twice adds the options twice. A
