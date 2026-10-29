@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis, install_nvidiagpudriver
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -290,6 +290,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_nvbandwidth_tool.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nv-grid", "install_nvidiagriddriver.sh",
+             action=install_nvidiagriddriver.install,
              when=lambda c: nvidia(c) and c.gpu == "NCv6"),
 
         # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
