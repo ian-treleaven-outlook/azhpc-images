@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -68,6 +68,10 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     env["COMPONENT_DIR"] = str(repo_root / "components")
     env["UTILS_DIR"]     = str(repo_root / "utils")
     env["TEST_DIR"]      = str(repo_root / "tests")
+    # The same directory under the name set_properties.sh exports and
+    # copy_test_file.sh / copy_test_file.py read. Without it the bash script
+    # would copy from "/" instead of the repo's tests (the Python one fails).
+    env["AZHPC_IMAGES_TEST_DIR"] = str(repo_root / "tests")
 
     env["DISTRIBUTION"]        = distribution
     env["ARCHITECTURE"]        = platform.machine()              # uname -m
@@ -291,7 +295,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # final configuration steps
         Step("add-udev-rules", "add-udev-rules.sh",
              action=add_udev_rules.install),
-        Step("copy-test-file", "copy_test_file.sh"),
+        Step("copy-test-file", "copy_test_file.sh",
+             action=copy_test_file.install),
         Step("disable-cloudinit", "disable_cloudinit.sh"),
         Step("setup-sku-customizations", "setup_sku_customizations.sh"),
         Step("trivy-scan", "trivy_scan.sh"),
