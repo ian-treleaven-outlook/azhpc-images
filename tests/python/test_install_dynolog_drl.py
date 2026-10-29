@@ -369,19 +369,17 @@ class InstallTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Wiring: the build plan must call this module, keeping the bash fallback.
+# Wiring: upstream removed install_dynolog_drl.sh (#627), so the build plan no
+# longer runs this module. The module and its tests stay until ADO 989.
 # --------------------------------------------------------------------------- #
 class BuildPlanWiringTests(unittest.TestCase):
-    def test_step_runs_the_python_action_and_keeps_its_bash_script(self):
-        # The step has no `when`: AMD builds run it too, and it skips itself.
+    def test_step_is_no_longer_in_the_build_plan(self):
         for vendor, gpu in (("NVidia", "H100"), ("AMD", "MI300")):
             with self.subTest(vendor=vendor):
                 cfg = BuildConfig(vendor=vendor, gpu=gpu, os="Ubuntu24",
                                   fips=False, spec_path=None)
-                steps = [s for s in build_plan(cfg) if s.op == "install-dynolog-drl"]
-                self.assertEqual(len(steps), 1)
-                self.assertIs(steps[0].action, install_dynolog_drl.install)
-                self.assertEqual(steps[0].script, "install_dynolog_drl.sh")
+                ops = [s.op for s in build_plan(cfg)]
+                self.assertNotIn("install-dynolog-drl", ops)
 
 
 if __name__ == "__main__":

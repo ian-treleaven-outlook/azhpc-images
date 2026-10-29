@@ -91,13 +91,24 @@ class InstallShParityTests(unittest.TestCase):
         self.assertLess(plan.index("install_rocm.sh"), plan.index("install_pmix.sh"))
         self.assertLess(plan.index("install_rocm.sh"), plan.index("install_mpis.sh"))
 
+    def test_nvidia_installs_the_driver_before_pmix_and_mpis(self):
+        # Upstream install.sh: "Install CUDA before MPI so HPC-X can rebuild
+        # Open MPI with CUDA support." NCv6 gets the GRID driver instead.
+        for gpu, driver in (("A100", "install_nvidiagpudriver.sh"),
+                            ("GB200", "install_nvidiagpudriver.sh"),
+                            ("NCv6", "install_nvidiagriddriver.sh")):
+            with self.subTest(gpu=gpu):
+                plan = _plan_scripts(_cfg("NVidia", gpu))
+                self.assertLess(plan.index(driver), plan.index("install_pmix.sh"))
+                self.assertLess(plan.index(driver), plan.index("install_mpis.sh"))
+
     def test_a100_plan_exact_order(self):
         # The full expected A100 flow, in order, per install.sh.
         expected = [
             "install_doca.sh",
+            "install_nvidiagpudriver.sh",
             "install_pmix.sh",
             "install_mpis.sh",
-            "install_nvidiagpudriver.sh",
             "install_nccl.sh",
             "install_docker.sh",
             "install_dcgm.sh",
@@ -105,7 +116,6 @@ class InstallShParityTests(unittest.TestCase):
             "install_mpifileutils.sh",
             "install_amd_libs.sh",
             "install_intel_libs.sh",
-            "install_dynolog_drl.sh",
             "hpc-tuning.sh",
             "install_waagent.sh",
             "install_azure_persistent_rdma_naming.sh",
@@ -114,15 +124,59 @@ class InstallShParityTests(unittest.TestCase):
             "install_monitoring_tools.sh",
             "install_health_checks.sh",
             "write_kernel_os_version.sh",
+            "install_azsecpack_prereqs.sh",
             "add-udev-rules.sh",
             "copy_test_file.sh",
             "disable_cloudinit.sh",
             "setup_sku_customizations.sh",
             "trivy_scan.sh",
-            "disable_auto_upgrade.sh",
             "disable_predictive_interface_renaming.sh",
         ]
         self.assertEqual(_plan_scripts(_cfg("NVidia", "A100")), expected)
+
+
+# Since the upstream sync (ADO 983), some ports are behind their bash script and
+# run bash until a resync ticket updates them (Step.resync). This list is pinned
+# on purpose: re-enabling a port, or marking another one stale, should be a
+# deliberate change that also updates this test.
+class ResyncTests(unittest.TestCase):
+    EXPECTED = {
+        "install-pmix": "ADO 984",
+        "install-mpis": "ADO 984",
+        "install-mpifileutils": "ADO 984",
+        "install-nv-driver": "ADO 985",
+        "install-nv-grid": "ADO 985",
+        "install-nvloom": "ADO 985",
+        "install-nvbandwidth": "ADO 985",
+        "install-rocm": "ADO 986",
+        "install-rccl": "ADO 986",
+        "install-doca": "ADO 987",
+        "install-nccl": "ADO 987",
+        "install-dcgm": "ADO 987",
+        "install-lustre": "ADO 988",
+        "hpc-tuning": "ADO 988",
+        "install-persistent-rdma-naming": "ADO 988",
+        "install-aznfs": "ADO 988",
+    }
+
+    def _steps(self):
+        return build_plan(_cfg("NVidia", "A100"))
+
+    def test_stale_ports_are_marked_with_their_ticket(self):
+        marked = {s.op: s.resync for s in self._steps() if s.resync}
+        self.assertEqual(marked, self.EXPECTED)
+
+    def test_marked_steps_have_a_bash_script_to_fall_back_to(self):
+        for step in self._steps():
+            if step.resync:
+                with self.subTest(op=step.op):
+                    self.assertTrue(step.script)
+                    self.assertIsNotNone(step.action)
+                    self.assertTrue((_REPO_ROOT / "components" / step.script).is_file())
+
+    def test_new_upstream_step_runs_as_bash(self):
+        steps = {s.op: s for s in self._steps()}
+        self.assertIsNone(steps["install-azsecpack-prereqs"].action)   # ADO 990
 
 
 # Same plan, different targets: check the SKU/vendor/arch gates pull in the right
@@ -179,8 +233,8 @@ class GatingTests(unittest.TestCase):
 
     def test_steps_a_distros_install_sh_never_runs_are_skipped(self):
         # Azure Linux's install.sh has no disable_cloudinit.sh; only the Ubuntu
-        # install.sh scripts run the two distro-local disable scripts.
-        ubuntu_only = {"disable_auto_upgrade.sh", "disable_predictive_interface_renaming.sh"}
+        # install.sh scripts run the distro-local disable script.
+        ubuntu_only = {"disable_predictive_interface_renaming.sh"}
         cases = {
             "Ubuntu24": (True, True),   # (runs disable_cloudinit, runs ubuntu-only)
             "Ubuntu22": (True, True),
@@ -197,8 +251,7 @@ class GatingTests(unittest.TestCase):
 
     def test_those_skips_carry_a_warning_reason(self):
         steps = {s.op: s for s in build_plan(_cfg("NVidia", "A100"))}
-        for op in ("disable-cloudinit", "disable-auto-upgrade",
-                   "disable-predictive-interface-renaming"):
+        for op in ("disable-cloudinit", "disable-predictive-interface-renaming"):
             with self.subTest(op=op):
                 self.assertTrue(steps[op].skip_warning)
         self.assertEqual(steps["install-rocm"].skip_warning, "")   # normal gating
