@@ -113,6 +113,7 @@ def cmd_versions(args_list) -> int:
     """`azhpc versions --os <OS> --vendor <V> --gpu <SKU>` — print the resolved
     component versions for a target without building anything."""
     from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_report import resolve_report, format_report
 
     p = argparse.ArgumentParser(prog="azhpc versions")
@@ -120,7 +121,10 @@ def cmd_versions(args_list) -> int:
     p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
     p.add_argument("--gpu", required=True)
     p.add_argument("--arch", default="x86_64")
-    p.add_argument("--node-type", dest="node_type", default="azure-vm")
+    # Same values and default as bash's TARGET_NODE_TYPE; versions.json
+    # overrides are keyed on them, so anything else would never match.
+    p.add_argument("--node-type", dest="node_type", choices=NODE_TYPES,
+                   default=DEFAULT_NODE_TYPE)
     p.add_argument("--spec", default="versions.json")
     ns = p.parse_args(args_list)
 
@@ -149,6 +153,7 @@ def cmd_validate(args_list) -> int:
     """`azhpc validate --os <OS> --vendor <V> --gpu <SKU>` — check versions.json
     for internal consistency for a target. Exit 0 if clean, 1 if issues."""
     from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_validate import check_cuda_consistency
 
     p = argparse.ArgumentParser(prog="azhpc validate")
@@ -156,7 +161,10 @@ def cmd_validate(args_list) -> int:
     p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
     p.add_argument("--gpu", required=True)
     p.add_argument("--arch", default="x86_64")
-    p.add_argument("--node-type", dest="node_type", default="azure-vm")
+    # Same values and default as bash's TARGET_NODE_TYPE; versions.json
+    # overrides are keyed on them, so anything else would never match.
+    p.add_argument("--node-type", dest="node_type", choices=NODE_TYPES,
+                   default=DEFAULT_NODE_TYPE)
     p.add_argument("--spec", default="versions.json")
     ns = p.parse_args(args_list)
 

@@ -231,7 +231,7 @@ class DocaVersionParseTests(unittest.TestCase):
 
 class MpifileutilsConfigTests(unittest.TestCase):
     # The env dict is exactly what a component sees at runtime: COMPONENT_VERSIONS is the
-    # parsed versions.json, and the rest (distro/arch/gpu/sku/node_type) is what
+    # parsed versions.json, and the rest (distro/arch/gpu/sku/target node type) is what
     # get_component_config uses to pick the right entry out of it.
     def _env(self, versions):
         return {
@@ -240,7 +240,7 @@ class MpifileutilsConfigTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_common_version(self):
@@ -270,7 +270,7 @@ class MpifileutilsInstallTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_install_orchestrates_all_steps(self):
@@ -322,7 +322,7 @@ class LibfabricInstallTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "NCv6",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_version(self):
@@ -379,7 +379,7 @@ class IntelLibsInstallTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_version(self):
@@ -467,7 +467,7 @@ class MonitoringToolsTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_version(self):
@@ -561,7 +561,7 @@ class CudaSamplesTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_samples_version(self):
@@ -621,7 +621,7 @@ class NvbandwidthTests(unittest.TestCase):
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "GB200",
-            "NODE_TYPE": "azure-vm",
+            "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
     def test_get_config_resolves_version(self):

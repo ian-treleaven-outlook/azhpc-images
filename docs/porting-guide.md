@@ -5,7 +5,7 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **9 run natively in Python, 27
+[`azhpc.py`](../azhpc.py#L192), has 36 steps; **10 run natively in Python, 26
 still shell out to bash.** Each remaining script is an independent,
 self-contained task — claim the ADO task, port it, open a PR.
 
@@ -131,8 +131,8 @@ Four rules, all load-bearing:
 3. **Log through `utils.logger`, never `print()`.** Pass your step's `op` label
    first so output correlates with the step.
 4. **Read configuration from `env`.** It already carries `COMPONENT_VERSIONS`
-   (the contents of `versions.json`), `DISTRIBUTION`, `ARCHITECTURE`, `SKU`,
-   `NODE_TYPE`, and the `*_DIR` paths — see `component_env()`.
+   (the contents of `versions.json`), `DISTRIBUTION`, `ARCHITECTURE`, `GPU`,
+   `SKU`, `TARGET_NODE_TYPE`, and the `*_DIR` paths — see `component_env()`.
 
 ---
 
@@ -155,25 +155,33 @@ Everything you need exists. Use these rather than rolling your own.
 ## 5. Configuration: the five-tier version hierarchy
 
 `config_for()` resolves a component by walking `versions.json` **most-specific
-first**:
+first**, in the same order as bash's `get_component_config`:
 
 ```
-1. component.distribution.architecture.<gpu_sku>.<node_type>
-2. component.distribution.architecture.<gpu_sku>.default
-3. component.distribution.architecture.<gpu_sku>
+1. component.distribution.architecture.<node_type>.<gpu_sku>
+2. component.distribution.architecture.<node_type>.default
+3. component.distribution.architecture.<node_type>   (if it is a config, not a
+                                                      table of per-SKU overrides)
 4. component.distribution.architecture
 5. component.common
 ```
 
-A real example — NCCL, three machines, one file:
+Steps 1–3 only apply when both `GPU` and `SKU` are set. `<node_type>` is the
+deployment target from `TARGET_NODE_TYPE` — `azure_vm_regular` (default),
+`azure_vm_akshost`, `baremetal_1p` or `baremetal_3p`. `<gpu_sku>` is the vendor
+and SKU normalised, e.g. `nvidia_v100`.
 
-| Machine | Tier hit | Version |
+A real example — NCCL on Ubuntu 24.04, three machines, one file:
+
+| Machine | Step hit | Version |
 |---|---|---|
-| GB200 baremetal · ubuntu24.04 · aarch64 | 1 | `2.28.3-1` |
-| GB200 VM · ubuntu24.04 · aarch64 | 4 | `2.29.3-1` |
-| A100 · x86_64 | 5 | `2.29.7-1` |
+| GB200 · aarch64 · `baremetal_3p` | 3 | `2.28.3-1` |
+| GB200 · aarch64 · `azure_vm_regular` | 4 | `2.29.7-1` |
+| A100 · x86_64 · `azure_vm_regular` | 5 | `2.30.4-1` |
 
-Only one of those was written down explicitly; the rest fall through.
+Each machine gets the most specific entry that exists for it. Step 1 is for a
+single SKU on a single target: CUDA on Ubuntu 24.04 x86_64 is `13.0`, but a V100
+on a regular VM gets `12.9` from `cuda…x86_64.azure_vm_regular.nvidia_v100`.
 
 **This is the single most important function in the project** — every component
 depends on it. Which is exactly why it has a differential test (§9).
@@ -346,7 +354,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **126 tests, ~standard library only** — `unittest` and
+The suite is **150 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -396,7 +404,7 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 27 unported steps
+## 12. Remaining work — the 26 unported steps
 
 Each row is one ADO task, ordered as they appear in `build_plan()`.
 
@@ -421,24 +429,23 @@ Each row is one ADO task, ordered as they appear in `build_plan()`.
 | 17 | `install-waagent` | `install_waagent.sh` |
 | 18 | `install-persistent-rdma-naming` | `install_azure_persistent_rdma_naming.sh` |
 | 19 | `install-health-checks` | `install_health_checks.sh` |
-| 20 | `write-kernel-os-version` | `write_kernel_os_version.sh` |
-| 21 | `add-udev-rules` | `add-udev-rules.sh` |
-| 22 | `copy-test-file` | `copy_test_file.sh` |
-| 23 | `disable-cloudinit` | `disable_cloudinit.sh` |
-| 24 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
-| 25 | `trivy-scan` | `trivy_scan.sh` |
-| 26 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
-| 27 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
+| 20 | `add-udev-rules` | `add-udev-rules.sh` |
+| 21 | `copy-test-file` | `copy_test_file.sh` |
+| 22 | `disable-cloudinit` | `disable_cloudinit.sh` |
+| 23 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
+| 24 | `trivy-scan` | `trivy_scan.sh` |
+| 25 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
+| 26 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
 
 **Already ported (study these):** `install-doca`, `install-libfabric`,
 `install-nvbandwidth`, `install-mpifileutils`, `install-intel-libs`,
 `cleanup-downloads`, `install-aznfs`, `install-hpcdiag`,
-`install-monitoring-tools`.
+`install-monitoring-tools`, `write-kernel-os-version`.
 
 ### Suggested starting points
 
-New to the codebase? Take `add-udev-rules`, `copy-test-file`,
-`disable-cloudinit`, or `write-kernel-os-version` — small and self-contained.
+New to the codebase? Take `add-udev-rules`, `copy-test-file`, or
+`disable-cloudinit` — small and self-contained.
 The GPU driver steps (`install-nv-driver`, `install-rocm`) are the most
 involved; save those until you've done one of the others.
 

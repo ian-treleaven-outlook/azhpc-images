@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from utils.component_config import get_component_config
+from utils.component_config import DEFAULT_NODE_TYPE, get_component_config
 
 _CUDA_IN_URL = re.compile(r"cuda(\d+)")
 
@@ -60,7 +60,7 @@ def cuda_major_in_url(url):
 
 
 def check_cuda_consistency(versions, *, distribution, architecture,
-                           gpu=None, sku=None, node_type="azure-vm"):
+                           gpu=None, sku=None, node_type=DEFAULT_NODE_TYPE):
     """Return a list of violation messages where the HPC-X build the image
     installs disagrees with the resolved CUDA driver major. Empty = consistent.
 
