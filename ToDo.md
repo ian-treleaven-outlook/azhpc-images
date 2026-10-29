@@ -10,9 +10,8 @@ item 3 was found while writing the contributor guide.
 
 Fixed on `port/batch-2`: `build_plan()` now runs `install-rocm` right after
 DOCA/libfabric and before `install-pmix`, as `install.sh` does, and
-`tests/python/test_build_plan.py` checks ordered parity for MI300, NCv6 and H100
-as well as A100 (GB200 is excluded because its plan names a driver script that
-`install.sh` doesn't use). The original write-up follows for reference.
+`tests/python/test_build_plan.py` checks ordered parity for MI300, NCv6, H100 and
+GB200 as well as A100. The original write-up follows for reference.
 
 **What was wrong**
 
@@ -51,8 +50,8 @@ It was left alone to keep that change scoped to the actual regressions.
 - [x] Move `install-rocm` ahead of `install-pmix` in `build_plan()`
 - [x] Add an ordered-subsequence parity test for the AMD/MI300 plan, mirroring
       `test_a100_plan_is_ordered_subsequence_of_install_sh`
-- [x] Re-check the other non-A100 plans (NCv6 and H100 now checked; GB200 can't
-      be until the `install_nvidiagpudriver_gb200.sh` scope is agreed)
+- [x] Re-check the other non-A100 plans (NCv6, H100 and GB200 now checked; GB200
+      now uses the shared driver script, as `install.sh` does)
 
 ---
 

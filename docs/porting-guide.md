@@ -5,7 +5,7 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **30 run natively in Python, 6
+[`azhpc.py`](../azhpc.py#L192), has 35 steps; **30 run natively in Python, 5
 still shell out to bash.** Each remaining script is an independent,
 self-contained task — claim the ADO task, port it, open a PR.
 
@@ -399,7 +399,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **633 tests, ~standard library only** — `unittest` and
+The suite is **637 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -449,18 +449,17 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 6 unported steps
+## 12. Remaining work — the 5 unported steps
 
 Each row is one ADO task, ordered as they appear in `build_plan()`.
 
 | # | Step (`op`) | Script |
 |---|---|---|
 | 1 | `install-mpis` | `install_mpis.sh` |
-| 2 | `install-nv-driver-gb200` | `install_nvidiagpudriver_gb200.sh` |
+| 2 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
 | 3 | `install-nv-grid` | `install_nvidiagriddriver.sh` |
-| 4 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
-| 5 | `install-nccl` | `install_nccl.sh` |
-| 6 | `install-lustre` | `install_lustre_client.sh` |
+| 4 | `install-nccl` | `install_nccl.sh` |
+| 5 | `install-lustre` | `install_lustre_client.sh` |
 
 **Already ported (study these):** `install-doca`, `install-libfabric`,
 `install-pmix`, `install-nvshmem`, `install-nvloom`, `install-nvbandwidth`,
@@ -476,9 +475,12 @@ Each row is one ADO task, ordered as they appear in `build_plan()`.
 ### What's left
 
 The remaining steps are the largest and most involved: the MPI stacks, the
-NVIDIA and GRID drivers, NCCL and Lustre. `install-nv-driver-gb200` names a
-script that no longer exists (GB200 uses the shared `install_nvidiagpudriver.sh`
-in bash), so its scope needs agreeing before any port.
+NVIDIA and GRID drivers, NCCL and Lustre.
+
+`install-nv-driver` covers GB200/GB300 (and VR200, built as GB200) too, as in
+bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, and
+the shared script switches to IMEX/CDMM when `NVLINK_RACKSCALE=true` (packer sets
+it for GB*/VR* SKUs). Its port must cover that rackscale branch.
 
 ---
 

@@ -33,6 +33,9 @@ DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
 # aarch64, versions.json lookups...). We do the same.
 SKU_ALIASES = {"VR200": "GB200"}
 
+# SKUs with rackscale NVLink (after SKU_ALIASES), which expect NVLINK_RACKSCALE=true.
+RACKSCALE_GPUS = {"GB200", "GB300"}
+
 
 def build_sku(gpu: str) -> str:
     """The SKU bash actually builds for `gpu`, e.g. "VR200" -> "GB200".
@@ -267,9 +270,15 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
         Step("install-mpis", "install_mpis.sh"),
 
-        # --- NVIDIA driver branch (mutually exclusive by SKU) ---
-        Step("install-nv-driver-gb200", "install_nvidiagpudriver_gb200.sh",
-             base="distro", when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        # --- NVIDIA driver branch ---
+        # One shared driver script for every NVIDIA SKU except NCv6 (GRID), as
+        # in install.sh. GB200/GB300/VR200 differences (IMEX, CDMM, no fabric
+        # manager) are inside install_nvidiagpudriver.sh, switched on by the
+        # NVLINK_RACKSCALE env var that packer sets. (The old dedicated
+        # install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
+        # On GB200 the driver must come before NVSHMEM/NVLOOM/nvbandwidth.
+        Step("install-nv-driver", "install_nvidiagpudriver.sh",
+             when=lambda c: nvidia(c) and c.gpu != "NCv6"),
         Step("install-nvshmem", "install_nvshmem.sh",
              action=install_nvshmem.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
@@ -281,8 +290,6 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nv-grid", "install_nvidiagriddriver.sh",
              when=lambda c: nvidia(c) and c.gpu == "NCv6"),
-        Step("install-nv-driver", "install_nvidiagpudriver.sh",
-             when=lambda c: nvidia(c) and c.gpu not in {"GB200", "NCv6"}),
 
         # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", when=nvidia),
@@ -413,6 +420,17 @@ class ImageBuilder:
                  architecture=env.get("ARCHITECTURE", ""),
                  node_type=env.get("TARGET_NODE_TYPE", ""),
                  planned_steps=len(plan))
+
+        # Rackscale NVLink SKUs rely on NVLINK_RACKSCALE=true, which packer sets
+        # (startswith "GB"/"VR") and the shared driver/tuning scripts read. Like
+        # bash, we don't derive it ourselves; but a manual build without it
+        # silently gets the non-rackscale driver path, so say so.
+        if cfg.gpu in RACKSCALE_GPUS and env.get("NVLINK_RACKSCALE", "").lower() != "true":
+            log_warn("resolve-config",
+                     f"NVLINK_RACKSCALE is not 'true' for {cfg.gpu}: the driver step "
+                     "will install fabric manager instead of IMEX/CDMM, as bash would "
+                     "(packer normally sets it for GB*/VR* SKUs)",
+                     gpu=cfg.gpu, nvlink_rackscale=env.get("NVLINK_RACKSCALE", ""))
 
         # --- Phase 2: bootstrap (system prep) ---
         # Runs install_utils.sh first; abort the build if it fails.

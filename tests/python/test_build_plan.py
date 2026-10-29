@@ -74,12 +74,11 @@ class InstallShParityTests(unittest.TestCase):
             f"plan={plan}\ninstall.sh={install_sh}")
 
     def test_other_targets_are_ordered_subsequences_of_install_sh(self):
-        # Same check for the AMD and non-InfiniBand paths, which the A100 test
-        # can't see (this is how the ROCm-after-MPI ordering slipped through).
-        # GB200 is left out: its plan names install_nvidiagpudriver_gb200.sh,
-        # which install.sh doesn't use (see the porting guide).
+        # Same check for the AMD, non-InfiniBand and GB200 paths, which the A100
+        # test can't see (this is how the ROCm-after-MPI ordering slipped through).
         install_sh = _install_sh_scripts()
-        for vendor, gpu in (("AMD", "MI300"), ("NVidia", "NCv6"), ("NVidia", "H100")):
+        for vendor, gpu in (("AMD", "MI300"), ("NVidia", "NCv6"), ("NVidia", "H100"),
+                            ("NVidia", "GB200")):
             with self.subTest(gpu=gpu):
                 plan = _plan_scripts(_cfg(vendor, gpu))
                 self.assertTrue(
@@ -206,14 +205,36 @@ class GatingTests(unittest.TestCase):
 
     def test_gb200_branch(self):
         plan = _plan_scripts(_cfg("NVidia", "GB200"))
-        self.assertIn("install_nvidiagpudriver_gb200.sh", plan)
+        # GB200 uses the shared driver script, as install.sh does; the old
+        # dedicated install_nvidiagpudriver_gb200.sh was removed upstream.
+        self.assertIn("install_nvidiagpudriver.sh", plan)
+        self.assertNotIn("install_nvidiagpudriver_gb200.sh", plan)
         self.assertIn("install_nvshmem.sh", plan)
         self.assertIn("install_nvloom.sh", plan)
         self.assertIn("install_nvbandwidth_tool.sh", plan)
+        # The driver must be installed before the NVLink tools that need it.
+        for tool in ("install_nvshmem.sh", "install_nvloom.sh", "install_nvbandwidth_tool.sh"):
+            self.assertLess(plan.index("install_nvidiagpudriver.sh"), plan.index(tool))
         self.assertNotIn("install_intel_libs.sh", plan)  # aarch64
         self.assertNotIn("install_amd_libs.sh", plan)    # aarch64
         self.assertNotIn("install_aznfs.sh", plan)       # not-GB200 group
         self.assertNotIn("install_health_checks.sh", plan)
+
+    def test_every_plan_script_exists(self):
+        # A Step whose bash script is missing fails the build (exit 127) when it
+        # runs as bash, and has no parity reference. This is how the deleted
+        # install_nvidiagpudriver_gb200.sh went unnoticed.
+        for vendor, gpu in (("NVidia", "A100"), ("NVidia", "GB200"),
+                            ("NVidia", "NCv6"), ("AMD", "MI300")):
+            cfg = _cfg(vendor, gpu)
+            for step in build_plan(cfg):
+                if not step.script or not step.when(cfg):
+                    continue
+                base = (_REPO_ROOT / cfg.distro_dir if step.base == "distro"
+                        else _REPO_ROOT / "components")
+                with self.subTest(gpu=gpu, script=step.script):
+                    self.assertTrue((base / step.script).is_file(),
+                                    f"{base / step.script} does not exist")
 
 
 # A component action is just a python function, so it can raise as well as return
@@ -310,6 +331,25 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertFalse([c for c in warn.call_args_list if c.args[0] == "test-step"])
         self.assertTrue([c for c in info.call_args_list
                          if c.args[0] == "test-step" and "skipped" in c.args[1]])
+
+    def _rackscale_warnings(self, gpu, env):
+        """Run build() for `gpu` with an empty plan; return the rackscale warnings."""
+        builder = ImageBuilder(_REPO_ROOT, _cfg("NVidia", gpu))
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value=env), \
+             mock.patch.object(build_config, "build_plan", return_value=[]), \
+             mock.patch.object(build_config, "log_warn") as warn:
+            self.assertEqual(builder.build(), 0)
+        return [c for c in warn.call_args_list if "NVLINK_RACKSCALE" in c.args[1]]
+
+    def test_gb200_without_nvlink_rackscale_warns(self):
+        self.assertEqual(len(self._rackscale_warnings("GB200", {})), 1)
+
+    def test_gb200_with_nvlink_rackscale_is_quiet(self):
+        self.assertEqual(self._rackscale_warnings("GB200", {"NVLINK_RACKSCALE": "TRUE"}), [])
+
+    def test_non_rackscale_sku_is_quiet(self):
+        self.assertEqual(self._rackscale_warnings("A100", {}), [])
 
 
 if __name__ == "__main__":
