@@ -111,6 +111,26 @@ class ExecProgramTelemetryTests(unittest.TestCase):
         self.assertEqual(len(detail.splitlines()), 50)
         self.assertEqual(logged.call_args.kwargs["exit_code"], 4)
 
+    def test_expected_failure_is_logged_at_info_not_error(self):
+        # A probe like `dnf list installed <pkg>` exits non-zero to say "no".
+        with mock.patch.object(process, "log_error_detail") as error, \
+             mock.patch.object(process, "log_info") as info:
+            rc = process.exec_program(["bash", "-c", "exit 1"], "test",
+                                      failure_is_error=False)
+        self.assertEqual(rc, 1)
+        error.assert_not_called()
+        finished = info.call_args_list[-1]
+        self.assertIn("expected answer", finished.args[1])
+        self.assertEqual(finished.kwargs["exit_code"], 1)
+
+    def test_run_capture_expected_failure_is_not_an_error(self):
+        with mock.patch.object(process.subprocess, "run", return_value=_completed(1)), \
+             mock.patch.object(process, "log_error_detail") as error:
+            rc, _ = run_capture(["dnf", "list", "installed", "x"], "test",
+                                failure_is_error=False)
+        self.assertEqual(rc, 1)
+        error.assert_not_called()
+
 
 # A build step can run for half an hour (make, apt). If someone Ctrl-Cs the CLI, or
 # the pipeline times out and SIGTERMs us, the child must not be left running - an

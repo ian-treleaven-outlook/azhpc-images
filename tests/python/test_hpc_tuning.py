@@ -153,10 +153,12 @@ class InstallTests(unittest.TestCase):
         """Run install(env) with commands mocked.
 
         `rcs` maps a command (tuple) to a fake exit code. Returns (exit code,
-        all commands in order, info/warn/error log mocks).
+        all commands in order, info/warn/error log mocks). The keyword
+        arguments of each run_capture call are kept in self.capture_kwargs.
         """
         rcs = rcs or {}
         commands = []
+        self.capture_kwargs = []
 
         def fake_exec(command, op, **kwargs):
             commands.append(command)
@@ -164,6 +166,7 @@ class InstallTests(unittest.TestCase):
 
         def fake_capture(command, op, **kwargs):
             commands.append(command)
+            self.capture_kwargs.append(kwargs)
             return (0 if azsec_installed else 1), ""
 
         with mock.patch.object(hpc_tuning, "exec_program", side_effect=fake_exec), \
@@ -261,6 +264,9 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn(_AZSEC_REMOVE, commands)
         self.assertTrue(any(c.kwargs.get("installed") is False
                             for c in info.call_args_list))
+        # The probe's non-zero exit is an answer, not a failure: the command
+        # runner is told not to log it as an ERROR.
+        self.assertEqual(self.capture_kwargs[0].get("failure_is_error"), False)
 
     def test_azure_linux_only_removes_azsec(self):
         rc, commands, _, _, _ = self.install({"DISTRIBUTION": "azurelinux3.0"})

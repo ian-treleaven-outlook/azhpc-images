@@ -349,12 +349,12 @@ def _remove_azsec_monitor(env: dict[str, str]) -> bool:
     """`if dnf list installed azsec-monitor ...; then dnf remove -y azsec-monitor; fi`."""
     # Bash hides this probe's output (`>/dev/null 2>&1`). run_capture() keeps
     # it out of the INFO log too (output goes to DEBUG) and returns the exit
-    # code. A non-zero exit is normal here (package not installed), even
-    # though the command runner logs it as a failed command.
-    rc, _ = run_capture(["dnf", "list", "installed", _AZSEC_PACKAGE], _OP, env=env)
+    # code. A non-zero exit is the normal "not installed" answer, so
+    # failure_is_error=False stops it being logged as a failed command.
+    rc, _ = run_capture(["dnf", "list", "installed", _AZSEC_PACKAGE], _OP, env=env,
+                        failure_is_error=False)
     if rc != 0:
-        log_info(_OP, f"{_AZSEC_PACKAGE} is not installed; nothing to remove "
-                      "(the non-zero 'dnf list' exit above is expected)",
+        log_info(_OP, f"{_AZSEC_PACKAGE} is not installed; nothing to remove",
                  package=_AZSEC_PACKAGE, installed=False)
         return True
     log_info(_OP, f"{_AZSEC_PACKAGE} (auoms) is installed; removing it to "

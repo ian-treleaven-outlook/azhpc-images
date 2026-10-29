@@ -61,12 +61,16 @@ def _kill_process_group(proc: subprocess.Popen, op: str) -> None:
         pass                                    # exited between poll and killpg
 
 
-def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None) -> int:
+def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None,
+                 failure_is_error: bool = True) -> int:
     """Run an external program, streaming and logging its output.
 
     stdout and stderr are merged and read line-by-line so each line is logged
     (at debug/verbose level) as it is produced. Returns the program's exit code,
     or 127 if it could not be executed.
+
+    Pass failure_is_error=False when a non-zero exit is a normal answer rather
+    than a failure (see _log_result), so build logs don't show a false ERROR.
 
     If we're interrupted (Ctrl-C) or terminated while the child is running, the
     child's whole process group is torn down before we exit.
@@ -135,23 +139,33 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
         # the caller giving up on us. Never leave the child running.
         _kill_process_group(proc, op)
 
-    _log_result(op, command, returncode, time.monotonic() - started, tail)
+    _log_result(op, command, returncode, time.monotonic() - started, tail,
+                failure_is_error)
     return returncode
 
 
 def _log_result(op: str, command: list[str], returncode: int, elapsed: float,
-                tail) -> None:
+                tail, failure_is_error: bool = True) -> None:
     """Log how a finished command went, for build telemetry.
 
     Success is one INFO line with the exit code and duration. Failure is an
     ERROR that includes the command's last output lines, so the cause shows up
     even at the default INFO level, when the full output was only logged at
     debug level.
+
+    With failure_is_error=False the caller is asking a yes/no question (e.g.
+    "is this package installed?"), so a non-zero exit is an answer, not a
+    failure: it is logged at INFO instead, and nothing shows up as an ERROR.
     """
     fields = {"command": command[0], "exit_code": returncode,
               "duration_s": round(elapsed, 1)}
     if returncode == 0:
         log_info(op, f"Command succeeded in {elapsed:.1f}s: {command[0]}", **fields)
+        return
+    if not failure_is_error:
+        log_info(op, f"Command exited with code {returncode} after {elapsed:.1f}s "
+                     f"(an expected answer for this check): {' '.join(command)}",
+                 **fields)
         return
     log_error_detail(
         op,
@@ -161,7 +175,8 @@ def _log_result(op: str, command: list[str], returncode: int, elapsed: float,
         **fields)
 
 
-def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None) -> tuple[int, str]:
+def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None,
+                failure_is_error: bool = True) -> tuple[int, str]:
     """Run an external program and return its exit code *and* captured stdout.
 
     Unlike exec_program (which streams output to the log and returns only the
@@ -169,6 +184,9 @@ def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None
     commands whose output is data, e.g. `ofed_info` or `apt-cache show openmpi`.
     stderr is kept separate (logged, not returned) so it can't corrupt the parse.
     Returns (127, "") if the program could not be executed.
+
+    Pass failure_is_error=False when a non-zero exit is a normal answer (a
+    probe such as `dnf list installed <pkg>`), so it isn't logged as an ERROR.
     """
     log_info(op, f"Running command: {' '.join(command)}")
     started = time.monotonic()
@@ -196,5 +214,6 @@ def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None
                 log_debug(op, line.rstrip())
                 tail.append(line.rstrip())
 
-    _log_result(op, command, proc.returncode, time.monotonic() - started, tail)
+    _log_result(op, command, proc.returncode, time.monotonic() - started, tail,
+                failure_is_error)
     return (proc.returncode, proc.stdout or "")
