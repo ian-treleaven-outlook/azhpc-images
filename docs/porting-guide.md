@@ -5,9 +5,11 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 35 steps; **30 run natively in Python, 5
-still shell out to bash.** Each remaining script is an independent,
-self-contained task — claim the ADO task, port it, open a PR.
+[`azhpc.py`](../azhpc.py#L192), has 35 steps; **all 35 run natively in Python.**
+Each bash script is kept as that step's fallback and parity reference: delete a
+Step's `action=` and it runs the bash script again. The plan mirrors
+`distros/ubuntu24.04/install.sh`; the other distros' `install.sh` scripts still
+differ from it in places (see §12).
 
 > Much of the design rationale here comes from Gio Martinez's project
 > presentation, *Azure HPC Images Python Refactor* (Aug 2026). He designed and
@@ -401,7 +403,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **637 tests, ~standard library only** — `unittest` and
+The suite is **857 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -451,38 +453,31 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 5 unported steps
+## 12. Status — every step ported
 
-Each row is one ADO task, ordered as they appear in `build_plan()`.
-
-| # | Step (`op`) | Script |
-|---|---|---|
-| 1 | `install-mpis` | `install_mpis.sh` |
-| 2 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
-| 3 | `install-nv-grid` | `install_nvidiagriddriver.sh` |
-| 4 | `install-nccl` | `install_nccl.sh` |
-| 5 | `install-lustre` | `install_lustre_client.sh` |
-
-**Already ported (study these):** `install-doca`, `install-libfabric`,
-`install-pmix`, `install-nvshmem`, `install-nvloom`, `install-nvbandwidth`,
-`install-docker`, `install-dcgm`, `install-rocm`, `install-rccl`,
-`install-mpifileutils`, `install-amd-libs`, `install-intel-libs`,
-`install-dynolog-drl`, `cleanup-downloads`, `hpc-tuning`, `install-waagent`,
-`install-persistent-rdma-naming`, `install-aznfs`, `install-hpcdiag`,
-`install-monitoring-tools`, `install-health-checks`, `write-kernel-os-version`,
-`add-udev-rules`, `copy-test-file`, `disable-cloudinit`,
-`setup-sku-customizations`, `trivy-scan`, `disable-auto-upgrade`,
-`disable-predictive-interface-renaming`.
-
-### What's left
-
-The remaining steps are the largest and most involved: the MPI stacks, the
-NVIDIA and GRID drivers, NCCL and Lustre.
+All 35 steps have a Python `action=`. Nested component scripts that a ported
+step calls (e.g. `install_gdrcopy.sh`, `install_nvidia_fabric_manager.sh`,
+`configure_nvidia_persistence.sh`, `install_nvidia_container_toolkit.sh`,
+`install_azure_persistent_rdma_naming_monitor.sh`) still run as bash, invoked
+by the Python step exactly as the bash step did; `install_cuda_samples` runs as
+its Python port, called by both driver steps.
 
 `install-nv-driver` covers GB200/GB300 (and VR200, built as GB200) too, as in
 bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, and
 the shared script switches to IMEX/CDMM when `NVLINK_RACKSCALE=true` (packer sets
-it for GB*/VR* SKUs). Its port must cover that rackscale branch.
+it for GB*/VR* SKUs).
+
+### Known gap: distros other than Ubuntu 24.04
+
+`build_plan()` follows `distros/ubuntu24.04/install.sh`. The other distros'
+`install.sh` scripts differ from it in which component scripts they run — for
+example Azure Linux uses `install_mofed.sh` instead of `install_doca.sh` and
+doesn't run `install_lustre_client.sh`; AlmaLinux and Rocky don't run
+`add-udev-rules.sh` (Rocky also skips `install_dynolog_drl.sh`) and run extra
+scripts such as `network-config.sh`. `DISTRO_DIRS` also names
+`almalinux9.7`/`rocky9.7` directories that don't exist (they are `9.x`).
+Only the Ubuntu-only and Azure Linux cloud-init skips are handled so far; the
+rest needs per-distro plans before RPM builds use the Python path.
 
 ---
 

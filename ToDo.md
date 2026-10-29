@@ -92,9 +92,16 @@ consequences for upstream submission.
 
 ---
 
-## 3. `install_cuda_samples` is ported but orphaned
+## 3. `install_cuda_samples` is ported but orphaned — RESOLVED
 
-**What's odd**
+Not dead code: `install_nvidiagpudriver.sh` and `install_nvidiagriddriver.sh`
+call `install_cuda_samples.sh` themselves (that's why no `install.sh` or `Step`
+runs it). On `port/batch-3`, both driver ports call
+`install_cuda_samples.install(env)` at the same point, and the module was
+brought up to the current bash and the logging standard. The original
+write-up follows for reference.
+
+**What was odd**
 
 `components/python/install_cuda_samples.py` exists and exposes a complete
 `install(env)`. Its bash counterpart `components/install_cuda_samples.sh` also
@@ -110,12 +117,11 @@ intent is unclear.
 
 **Action**
 
-- [ ] Determine whether `install_cuda_samples.sh` is dead code upstream, or is
-      meant to run on some path that currently misses it
-- [ ] If it should run: add a `Step` with the correct `when=` gate and wire
-      `action=install_cuda_samples.install`
-- [ ] If it is genuinely dead: raise removal with upstream rather than deleting
-      it locally — it is upstream's file, not ours
+- [x] Determine whether `install_cuda_samples.sh` is dead code upstream, or is
+      meant to run on some path that currently misses it (it's called by the
+      two driver scripts)
+- [x] If it should run: wire it (done via the driver ports, not a `Step`)
+- [x] If it is genuinely dead: n/a
 
 ---
 
