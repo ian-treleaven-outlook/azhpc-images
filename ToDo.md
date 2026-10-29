@@ -125,6 +125,24 @@ intent is unclear.
 
 ---
 
+## 4. Ports behind upstream after the October 2026 sync
+
+The upstream sync (ADO 983) left 16 ports behind their bash scripts. Those steps
+are marked `resync="ADO <id>"` in `build_plan()` and run bash until updated (see
+`docs/porting-guide.md` §12 for the list). Until they are resynced, roughly half
+of an image build runs bash, so the Python path isn't fully exercised.
+
+Also found during the sync, and left for ADO 988: the AZNFS port rewrites `yum`
+to `tdnf` in the Azure Linux installer, but the bash rewrites it to `dnf`.
+
+**Action**
+
+- [ ] ADO 984–988: resync the 16 ports and remove their `resync=`
+- [ ] ADO 989: retire the dynolog and Ubuntu 22.04/24.04 auto-upgrade ports
+- [ ] ADO 990: port `install_azsecpack_prereqs.sh`
+
+---
+
 ## Housekeeping
 
 - [ ] **Delete this file before opening the upstream PR** — it is fork-local
