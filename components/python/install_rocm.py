@@ -92,10 +92,9 @@ utils/build_config.py sets this module's install() as the `action=` of the
 "install-rocm" Step (AMD images only). Deleting `action=` from that Step makes
 the build run the bash script again, which is why the .sh file is kept.
 
-Known ordering drift (not changed here): build_plan() runs this step AFTER
-install-pmix / install-mpis, while distros/*/install.sh runs install_rocm.sh
-BEFORE them (so HPC-X can rebuild UCX with ROCm support). ToDo.md item 1
-tracks this; porting the script deliberately leaves the Step where it is.
+Ordering: build_plan() runs this step BEFORE install-pmix / install-mpis,
+exactly as distros/*/install.sh runs install_rocm.sh before them, so the
+HPC-X step can rebuild UCX with ROCm support. install() logs this reason.
 
 install() returns 0 for success or 3 for failure. It logs problems and returns
 3; it never lets an exception escape to the build loop.
@@ -110,8 +109,14 @@ Behaviour kept from bash
     apply from the next boot, which is when the image is used.)
   * `sudo` is kept on `udevadm trigger`, exactly as bash runs it.
   * Appends stay appends (amd_rocm.repo, blacklist.conf), so a rerun adds the
-    blocks again, as bash does. The udev rules, init script and service unit
-    are overwritten.
+    blocks again, as bash does; a warning is logged when the text is already
+    there. The udev rules, init script and service unit are overwritten.
+  * Ubuntu blacklists amdgpu, so nothing loads it at boot except the
+    rocmstartup service's script, once all the GPUs have appeared. A warning
+    says so in the log.
+  * `systemctl start rocmstartup` runs on the build VM too, as in bash. The
+    script then polls the PCI bus for AMD GPUs for up to ~15 minutes, and a
+    build VM may have none; a warning is logged before starting it.
   * Both Ubuntu versions run the same `amdgpu-install` command. Bash has an
     if/else for ubuntu24.04 with identical branches plus a commented-out TODO
     ("go back to bundled userspace once we move back to ROCm 7.0"); see the
@@ -302,6 +307,20 @@ def _write(path: str, text: str, *, append: bool) -> None:
     log_debug(_OP, f"Contents written to {path}:\n{text}")
 
 
+def _has_line(path: str, line: str) -> bool:
+    """True if the file at `path` already has `line` as one of its lines.
+
+    A missing or unreadable file counts as "no"; the write that follows will
+    report any real problem.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            # splitlines() drops the "\\n" at the end of each line.
+            return line in handle.read().splitlines()
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Per-distro ROCm installs. Each returns True on success. They may raise
 # OSError from file operations; install() catches it.
@@ -351,9 +370,10 @@ def _install_azurelinux(env: dict[str, str], config: dict, kernel: str) -> bool:
         return False
 
     # Appended (bash `cat <<EOF >>`), so a rerun adds a second [amd_rocm] block.
-    if os.path.exists(_AMD_ROCM_REPO_FILE):
-        log_warn(_OP, f"{_AMD_ROCM_REPO_FILE} already exists; appending another "
-                      "[amd_rocm] block, as bash does", path=_AMD_ROCM_REPO_FILE)
+    if _has_line(_AMD_ROCM_REPO_FILE, "[amd_rocm]"):
+        log_warn(_OP, f"{_AMD_ROCM_REPO_FILE} already has an [amd_rocm] section; "
+                      "appending another one, as bash does on a rerun",
+                 path=_AMD_ROCM_REPO_FILE)
     _write(_AMD_ROCM_REPO_FILE, amd_rocm_repo_text(version), append=True)
     log_info(_OP, "Added the AMD ROCm dnf repo", repo="amd_rocm", version=version)
 
@@ -384,6 +404,17 @@ def _setup_udev(env: dict[str, str]) -> bool:
 
 def _blacklist_amdgpu(env: dict[str, str], kernel: str) -> bool:
     """Ubuntu only: stop amdgpu auto-loading and rebuild the initramfs."""
+    # BASH BEHAVIOUR (kept): with amdgpu blacklisted, the only thing that loads
+    # it is the rocmstartup service's script, after all the GPUs have shown up
+    # on the PCI bus. Until then the GPUs have no driver.
+    log_warn(_OP, "Blacklisting amdgpu: it will not auto-load at boot; only "
+                  f"{_SERVICE_NAME}.service loads it, once all GPUs are present",
+             path=_BLACKLIST_FILE, service=_SERVICE_NAME)
+    # `tee -a` appends, so a rerun adds the same line again.
+    if _has_line(_BLACKLIST_FILE, _BLACKLIST_LINE.rstrip("\n")):
+        log_warn(_OP, f"{_BLACKLIST_FILE} already has 'blacklist amdgpu'; "
+                      "appending it again, as bash does on a rerun",
+                 path=_BLACKLIST_FILE)
     _write(_BLACKLIST_FILE, _BLACKLIST_LINE, append=True)
     if not _run_all([["update-initramfs", "-c", "-k", kernel]], env):
         return False
@@ -405,6 +436,12 @@ def _install_boot_service(env: dict[str, str]) -> bool:
     _write(_SERVICE_FILE, _SERVICE_UNIT, append=False)
     os.chmod(_SERVICE_FILE, _SERVICE_FILE_MODE)
 
+    # BASH BEHAVIOUR (kept): the service is started on the build VM, not just
+    # enabled for the image's first boot. Its script waits up to ~15 minutes
+    # (91 checks, 10 s apart) for AMD GPUs that a build VM may not have.
+    log_warn(_OP, f"Starting {_SERVICE_NAME} on the build VM, as bash does: its "
+                  "script polls for AMD GPUs for up to ~15 minutes and the build "
+                  "VM may have none", service=_SERVICE_NAME, script=_INIT_SCRIPT)
     if not _run_all([["systemctl", "start", _SERVICE_NAME],
                      ["systemctl", "enable", _SERVICE_NAME]], env):
         return False
@@ -452,6 +489,8 @@ def install(env: dict[str, str]) -> int:
     log_info(_OP, f"Installing ROCm {version} on {distribution}",
              version=version, distro=distribution, kernel=kernel,
              source=config.get("url", "dnf (azurelinux-repos-amd + amd_rocm repo)"))
+    log_info(_OP, "ROCm is installed before PMIx/MPI, as in install.sh, so the "
+                  "HPC-X step can rebuild UCX with ROCm support")
 
     try:
         # ---- 2. ROCm itself, per distro ------------------------------------

@@ -284,6 +284,18 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(_read(self.paths["_GRUB_DEFAULT"]), "GRUB_TIMEOUT=0\n")
         logs["warn"].assert_called_once()
 
+    def test_gb200_rerun_warns_that_options_are_already_there(self):
+        self._write_grub()
+        env = dict(self.env, SKU="GB200", DISTRIBUTION="azurelinux3.0")
+        self.assertEqual(self._install(env=env)[0], 0)
+        rc, _, logs = self._install(env=env)
+
+        self.assertEqual(rc, 0)
+        # Added again, like bash's sed.
+        self.assertEqual(_read(self.paths["_GRUB_DEFAULT"]).count("efi_mmap"), 2)
+        warned = [c.kwargs["path"] for c in logs["warn"].call_args_list]
+        self.assertEqual(warned, [self.paths["_GRUB_DEFAULT"], self.paths["_GRUB_CFG"]])
+
     def test_gb200_missing_grub_file_returns_3_before_systemctl(self):
         # sed -i fails on a missing file, which stops bash.
         env = dict(self.env, SKU="GB200", DISTRIBUTION="azurelinux3.0")

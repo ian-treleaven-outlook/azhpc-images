@@ -110,7 +110,8 @@ Behaviour kept from bash
     (awk printf "%d"), jobs = (mem_gb + 15) / 16 clamped to 1..16. If
     /proc/meminfo has no MemTotal line, awk prints nothing, bash's arithmetic
     treats it as 0 and uses 1 job; we do the same (with a warning).
-  * /etc/sysctl.conf is appended to, so a rerun adds the two lines again.
+  * /etc/sysctl.conf is appended to, so a rerun adds the two lines again
+    (with a warning when they are already there).
   * The Azure Linux branch doesn't read versions.json, as in bash.
 
 Deliberate differences from bash
@@ -484,6 +485,18 @@ def _configure_sysctl(env: dict[str, str], is_ubuntu: bool) -> bool:
                       "they take effect at boot from sysctl.conf")
 
     # Two `echo ... | tee -a` lines: one append per setting, each with "\n".
+    # `tee -a` appends even when the line is already there (e.g. on a rerun),
+    # so the file can end up with duplicates; harmless, but worth a warning.
+    try:
+        with open(_SYSCTL_CONF, encoding="utf-8") as handle:
+            existing = handle.read().splitlines()
+    except OSError:          # missing (or unreadable): nothing to duplicate
+        existing = []
+    already = [setting for setting in _SYSCTL_SETTINGS if setting in existing]
+    if already:
+        log_warn(_OP, f"{_SYSCTL_CONF} already has {', '.join(already)}; "
+                      "appending again, as bash does on a rerun",
+                 path=_SYSCTL_CONF, settings=already)
     with open(_SYSCTL_CONF, "a", encoding="utf-8") as handle:
         handle.write("".join(f"{setting}\n" for setting in _SYSCTL_SETTINGS))
     log_info(_OP, f"Appended to {_SYSCTL_CONF}", path=_SYSCTL_CONF,

@@ -142,6 +142,10 @@ class InstallTests(unittest.TestCase):
     def _info_messages(self):
         return [c.args[1] for c in self.info.call_args_list]
 
+    def _warns_about(self, text):
+        """The log_warn calls (of the last install) whose message contains text."""
+        return [c for c in self.warn.call_args_list if text in c.args[1]]
+
     # ---- success paths ------------------------------------------------------
     def test_ubuntu_success(self):
         self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 0)
@@ -189,11 +193,44 @@ class InstallTests(unittest.TestCase):
                          "old\n" + install_rocm.amd_rocm_repo_text("7.0.3"))
         self.assertFalse(self._read("_UDEV_RULES_FILE").startswith("old"))
         self.assertEqual(self._read("_SERVICE_FILE"), _EXPECTED_UNIT)
-        self.warn.assert_called_once()          # rerun warning for the repo append
+        # "old" is not an [amd_rocm] section, so no rerun warning.
+        self.assertEqual(self._warns_about("already has"), [])
 
         Path(self.paths["_BLACKLIST_FILE"]).write_text("blacklist foo\n", encoding="utf-8")
         self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 0)
         self.assertEqual(self._read("_BLACKLIST_FILE"), "blacklist foo\nblacklist amdgpu\n")
+        self.assertEqual(self._warns_about("already has"), [])
+
+    def test_rerun_appends_warn_when_the_text_is_already_there(self):
+        self.assertEqual(self._install("azurelinux3.0", _AZL_CFG), 0)
+        self.assertEqual(self._install("azurelinux3.0", _AZL_CFG), 0)
+        self.assertEqual(self._read("_AMD_ROCM_REPO_FILE"),
+                         install_rocm.amd_rocm_repo_text("7.0.3") * 2)
+        self.assertEqual(len(self._warns_about("already has an [amd_rocm]")), 1)
+
+        self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 0)
+        self.assertEqual(self._warns_about("already has"), [])
+        self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 0)
+        self.assertEqual(self._read("_BLACKLIST_FILE"), "blacklist amdgpu\n" * 2)
+        self.assertEqual(len(self._warns_about("already has 'blacklist amdgpu'")), 1)
+
+    def test_warns_before_starting_rocmstartup_on_every_distro(self):
+        for distro, cfg in (("ubuntu24.04", _UBUNTU_CFG), ("azurelinux3.0", _AZL_CFG)):
+            with self.subTest(distro=distro):
+                self.assertEqual(self._install(distro, cfg), 0)
+                warns = self._warns_about("Starting rocmstartup")
+                self.assertEqual(len(warns), 1)
+                self.assertEqual(warns[0].kwargs["service"], "rocmstartup")
+
+    def test_ubuntu_warns_that_amdgpu_is_blacklisted(self):
+        self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 0)
+        self.assertEqual(len(self._warns_about("Blacklisting amdgpu")), 1)
+        self.assertEqual(self._install("azurelinux3.0", _AZL_CFG), 0)
+        self.assertEqual(self._warns_about("Blacklisting amdgpu"), [])
+
+    def test_logs_why_rocm_runs_before_pmix_and_mpi(self):
+        self._install("azurelinux3.0", _AZL_CFG)
+        self.assertIn("before PMIx/MPI", self._info_messages()[1])
 
     def test_udev_reload_failure_skips_trigger_and_continues(self):
         # bash: `udevadm control --reload-rules && sudo udevadm trigger` under
@@ -203,7 +240,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(["sudo", "udevadm", "trigger"], self._commands())
         self.assertIn(["systemctl", "enable", "rocmstartup"], self._commands())
-        self.warn.assert_called_once()
+        self.assertEqual(len(self._warns_about("udev rules reload failed")), 1)
 
     # ---- logging ------------------------------------------------------------
     def test_key_log_lines(self):

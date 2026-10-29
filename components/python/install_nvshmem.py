@@ -62,7 +62,8 @@ meaningless version. Python stops with an error (return 3) instead:
 
 Known quirk kept for parity
 ---------------------------
-The Ubuntu `apt install` has no `-y`. See _install_ubuntu() for what that means.
+The Ubuntu `apt install` has no `-y`. See _install_ubuntu() for what that means;
+a warning is logged before it runs.
 """
 
 # Lets type hints such as `str | None` work on Python versions older than 3.10.
@@ -71,7 +72,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from utils.component_config import config_for, write_component_version
-from utils.logger import log_error, log_info
+from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py. Every log line from this module uses it.
@@ -224,8 +225,12 @@ def _install_ubuntu(cuda_major: str, env: dict[str, str]) -> str | None:
         f"libnvshmem3-cuda-{cuda_major}",
         f"libnvshmem3-dev-cuda-{cuda_major}",
     ]
+    log_warn(_OP, "Running `apt install` without -y, as bash does: if apt needs "
+                  "to ask for confirmation it reads no answer and aborts",
+             command=" ".join(command))
     if exec_program(command, _OP, env=env) != 0:
-        log_error(_OP, "apt could not install the NVSHMEM packages")
+        log_error(_OP, "apt could not install the NVSHMEM packages (if apt "
+                       "printed 'Abort.', it wanted a confirmation; bash has no -y)")
         return None
 
     # apt prints "WARNING: apt does not have a stable CLI interface..." to

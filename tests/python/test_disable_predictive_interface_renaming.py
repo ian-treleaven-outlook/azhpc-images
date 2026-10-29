@@ -102,8 +102,11 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(renaming, "_GRUB_SETTINGS_FILE", self.path), \
              mock.patch.object(renaming, "exec_program",
                                return_value=grub_rc) as run, \
+             mock.patch.object(renaming, "log_info") as log_info, \
+             mock.patch.object(renaming, "log_warn") as log_warn, \
              mock.patch.object(renaming, "log_error") as log_error:
             rc = renaming.install(env)
+        self.log_info, self.log_warn = log_info, log_warn
         return rc, run, log_error
 
     def _read(self):
@@ -119,6 +122,14 @@ class InstallTests(unittest.TestCase):
         run.assert_called_once_with(
             ["update-grub"], "disable-predictive-interface-renaming", env=env)
         log_error.assert_not_called()
+        self.log_warn.assert_not_called()
+        added = self.log_info.call_args_list[0]
+        self.assertEqual(added.kwargs["lines_changed"], 1)
+
+    def test_lines_changed_counts_every_matching_line(self):
+        rc, _, _ = self._install(contents=_CFG + _CFG)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.log_info.call_args_list[0].kwargs["lines_changed"], 2)
 
     def test_no_match_leaves_file_and_still_runs_update_grub(self):
         rc, run, _ = self._install(contents=_CFG_AT_START)
@@ -126,6 +137,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._read(), _CFG_AT_START)
         run.assert_called_once()
+        # net.ifnames=0 was not added: the log must say so.
+        self.log_warn.assert_called_once()
+        self.assertEqual(self.log_warn.call_args.kwargs,
+                         {"path": self.path, "search": _SEARCH, "lines_changed": 0})
 
     def test_grub_cmdline_linux_from_env_changes_the_search(self):
         # With GRUB_CMDLINE_LINUX="quiet" the search text is
@@ -140,7 +155,6 @@ class InstallTests(unittest.TestCase):
             'earlyprintk=ttyS0 net.ifnames=0"\n')
 
     def test_missing_file_returns_3_without_running_update_grub(self):
-        # This is also what happens on RPM distros, which have no such file.
         rc, run, log_error = self._install(contents=None)
 
         self.assertEqual(rc, 3)

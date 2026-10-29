@@ -117,7 +117,7 @@ import shutil
 import tempfile
 
 from utils.component_config import config_for, write_component_version
-from utils.logger import log_debug, log_error, log_info
+from utils.logger import log_debug, log_error, log_info, log_warn
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -360,6 +360,14 @@ def _install_azurelinux(env, cuda: int, sku_cuda: int | None) -> str | None:
              dcgm_version=dcgm, version_source="versions.json", cuda_major=cuda,
              sku_cuda_major=sku_cuda)
     package = f"datacenter-gpu-manager-4-cuda{_AZURE_LINUX_CUDA_MAJOR}-{dcgm}"
+    # The bug only changes the result for a V100: bash meant it to get cuda12.
+    # Warn so a V100 image build's log shows the package it really received.
+    sku = env.get("SKU", "")
+    if sku == "V100":
+        log_warn(_OP, "Azure Linux V100: installing the cuda13 DCGM package "
+                      "because install.sh passes no SKU argument to "
+                      "install_dcgm.sh (kept for bash parity)",
+                 sku=sku, package=package)
     return dcgm if _run_all([["dnf", "install", "-y", package]], env) else None
 
 

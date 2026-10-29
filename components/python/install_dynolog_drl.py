@@ -223,6 +223,10 @@ def build_environment(distribution: str) -> str:
     """The shell lines bash runs after the dependencies, which change the
     environment of every later command. Put at the top of each build script.
     """
+    # Bash also saves ORIGINAL_PATH="$PATH" at the start, apparently to restore
+    # PATH afterwards, but never uses it again. Nothing needs restoring here:
+    # these lines only affect the one `bash -c` build script they start, and
+    # the build's own PATH is never changed. So that variable is not ported.
     branch = dependency_branch(distribution)
     if branch == "ubuntu":
         # Use Rust 1.82 from the rustc-1.82 package.

@@ -245,6 +245,31 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(m["capture"].call_args_list[1].args[0], ["rpm", "-qa"])
         m["record"].assert_called_with("MOBY_ENGINE", "25.0.3-11.azl3.x86_64")
 
+    def test_azure_linux_warns_when_first_moby_match_is_not_moby_engine(self):
+        # GPU=AMD skips containerd, so its socket warning can't interfere.
+        output = "moby-containerd-2.0.0-3.azl3.x86_64\n" + _RPM_OUT
+        rc, m = self._install(_env("azurelinux3.0", GPU="AMD"),
+                              captures={"rpm": (0, output)})
+        self.assertEqual(rc, 0)
+        m["record"].assert_called_with("MOBY_ENGINE", "2.0.0-3.azl3.x86_64")
+        m["warn"].assert_called_once()
+        self.assertEqual(m["warn"].call_args.kwargs,
+                         {"matched_package": "moby-containerd-2.0.0-3.azl3.x86_64",
+                          "version": "2.0.0-3.azl3.x86_64"})
+
+    def test_azure_linux_moby_engine_first_does_not_warn(self):
+        rc, m = self._install(_env("azurelinux3.0", GPU="AMD"))
+        self.assertEqual(rc, 0)
+        m["warn"].assert_not_called()
+
+    def test_rpm_moby_source_line(self):
+        self.assertEqual(install_docker.rpm_moby_source_line(_RPM_OUT),
+                         "moby-engine-25.0.3-11.azl3.x86_64")
+        # "moby-x" gives a blank cut result, so the next match is the source.
+        self.assertEqual(install_docker.rpm_moby_source_line("moby-x\n" + _RPM_OUT),
+                         "moby-engine-25.0.3-11.azl3.x86_64")
+        self.assertIsNone(install_docker.rpm_moby_source_line("bash-5.2\n"))
+
     def test_rhel_family(self):
         rc, m = self._install(_env("almalinux9.8"))
 

@@ -301,6 +301,18 @@ class InstallTests(unittest.TestCase):
         self.record.assert_called_once_with("RCCL", "2.22.3-1.azl3")
         self.assertEqual(self.sysctl_conf.read_text(),     # appended, not replaced
                          "existing=1\nkernel.numa_balancing=0\nvm.max_map_count=1048576\n")
+        self.warn.assert_not_called()       # "existing=1" is not one of ours
+
+    def test_rerun_warns_that_sysctl_lines_are_already_there(self):
+        self.sysctl_conf.write_text("vm.max_map_count=1048576\n")
+        self.assertEqual(self._install("azurelinux3.0", None), 0)
+        self.warn.assert_called_once()
+        self.assertEqual(self.warn.call_args.kwargs["settings"],
+                         ["vm.max_map_count=1048576"])
+        # Still appended, like bash's `tee -a`.
+        self.assertEqual(self.sysctl_conf.read_text(),
+                         "vm.max_map_count=1048576\nkernel.numa_balancing=0\n"
+                         "vm.max_map_count=1048576\n")
 
     def test_no_matching_cmake_line_warns_and_continues(self):
         def fake(path):

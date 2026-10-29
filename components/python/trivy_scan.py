@@ -273,6 +273,12 @@ def install(env: dict[str, str]) -> int:
 
     Returns 0 on success, 3 on failure.
     """
+    # NOTE: this function only replaces trivy_scan.sh inside the Python build
+    # (the "trivy-scan" Step). packer/build.pkr.hcl runs
+    # `bash ../../components/trivy_scan.sh` itself after the build, and every
+    # distros/*/install.sh still calls $COMPONENT_DIR/trivy_scan.sh directly,
+    # so those scans use the bash script, not this port. A fix made here must
+    # also be made in the .sh file until they are switched over.
     # ---- 1. Latest release version ----------------------------------------
     rc, output = run_capture(_LATEST_RELEASE_COMMAND, _OP, env=env)
     if rc != 0:

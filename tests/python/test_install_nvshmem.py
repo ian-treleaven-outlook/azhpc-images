@@ -178,8 +178,10 @@ class InstallTests(unittest.TestCase):
                                return_value=list_result) as capture, \
              mock.patch.object(install_nvshmem, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(install_nvshmem, "log_warn") as log_warn, \
              mock.patch.object(install_nvshmem, "log_error") as log_error:
             rc = install_nvshmem.install(env)
+        self.log_warn = log_warn
         return rc, run, capture, record, log_error
 
     # ---- success paths -----------------------------------------------------
@@ -203,6 +205,14 @@ class InstallTests(unittest.TestCase):
         capture.assert_called_once_with(["apt", "list", "--installed"], _OP, env=env)
         record.assert_called_once_with("NVSHMEM", "3.4.5-1")
         log_error.assert_not_called()
+        # The missing -y is announced before apt runs.
+        self.log_warn.assert_called_once()
+        self.assertEqual(self.log_warn.call_args.kwargs["command"],
+                         " ".join(_APT_INSTALL))
+
+    def test_azure_linux_does_not_warn_about_apt(self):
+        self._install(_env("azurelinux3.0"))
+        self.log_warn.assert_not_called()
 
     def test_cuda_major_comes_from_the_cuda_driver_version(self):
         env = _env("ubuntu22.04", driver_version="12.9")

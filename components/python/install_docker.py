@@ -253,18 +253,31 @@ def rpm_moby_version(output: str) -> str | None:
     matches (moby-engine, moby-cli, moby-containerd, moby-runc, ...), and only
     the first in rpm's listing order is recorded, which need not be moby-engine.
     """
-    values = []
-    for line in _lines(output):
-        if "moby" not in line:
-            continue
-        if "-" not in line:
-            values.append(line)
-            continue
-        fields = line.split("-")
-        # fields[2:4] is the 3rd and 4th fields (Python counts from 0); a
-        # slice past the end just returns fewer items, never an error.
-        values.append("-".join(fields[2:4]))
+    values = [_cut_fields_3_4(line) for line in _lines(output) if "moby" in line]
     return first_word("\n".join(values))
+
+
+def _cut_fields_3_4(line: str) -> str:
+    """`cut -d'-' -f3,4` applied to one line (see rpm_moby_version)."""
+    if "-" not in line:
+        return line
+    fields = line.split("-")
+    # fields[2:4] is the 3rd and 4th fields (Python counts from 0); a
+    # slice past the end just returns fewer items, never an error.
+    return "-".join(fields[2:4])
+
+
+def rpm_moby_source_line(output: str) -> str | None:
+    """The `rpm -qa` line that rpm_moby_version() takes its value from.
+
+    That is the first line containing "moby" whose cut result is not blank
+    (blank results vanish in bash's word splitting). Used to warn when the
+    recorded MOBY_ENGINE value really belongs to another moby-* package.
+    """
+    for line in _lines(output):
+        if "moby" in line and first_word(_cut_fields_3_4(line)) is not None:
+            return line
+    return None
 
 
 def moby_version_command(distribution: str) -> list[str]:
@@ -455,6 +468,16 @@ def install(env: dict[str, str]) -> int:
         log_error(_OP, f"could not determine the installed moby-engine version "
                        f"from `{' '.join(command)}`", distro=distribution, exit_code=rc)
         return 3
+    if distribution == _AZURE_LINUX:
+        # BASH QUIRK (kept for parity): `rpm -qa | grep moby` matches every
+        # moby-* package, and the first one listed wins. If that isn't
+        # moby-engine, MOBY_ENGINE gets e.g. moby-containerd's version.
+        source = rpm_moby_source_line(output) or ""
+        if not source.startswith("moby-engine-"):
+            log_warn(_OP, "MOBY_ENGINE is taken from the first `rpm -qa | grep "
+                          "moby` match, which is not moby-engine; recording its "
+                          "version anyway, like bash",
+                     matched_package=source, version=moby)
     if not _record("MOBY_ENGINE", moby):
         return 3
 

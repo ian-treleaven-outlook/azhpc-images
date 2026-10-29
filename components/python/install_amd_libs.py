@@ -111,7 +111,11 @@ Rerun behavior (same as bash)
 The modulefile is appended to (bash's `>>`), and the `amd/aocl` symlink is
 created without replacing an existing one (bash's `ln -s` without `-f`). So a
 second run appends the modulefile text again and then fails at the symlink,
-exactly as the bash script does under `set -e`.
+exactly as the bash script does under `set -e`; the error log says so.
+
+If /opt/amd/lib or /opt/amd/include is already a real folder (not a symlink),
+`ln -sfn` creates the link inside it rather than replacing it. That is kept
+too, with a warning.
 """
 
 from __future__ import annotations
@@ -122,7 +126,7 @@ import shutil
 
 from utils.component_config import config_for, write_component_version
 from utils.download import ChecksumError, download_and_verify
-from utils.logger import log_error, log_info
+from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program
 
 # The Step's `op` label in build_config.py. Every log line uses it.
@@ -246,10 +250,20 @@ def _install_aocl(version: str, sha256: str, env: dict[str, str]) -> bool:
 
     module_dir = os.path.join(env["MODULE_FILES_DIRECTORY"], "amd")
     modulefile = os.path.join(module_dir, f"aocl-{version}")
+    aocl_link = os.path.join(module_dir, "aocl")
     try:
         # Point the default lib/include folders at the multi-threaded build.
-        make_symlink(mt_lib, os.path.join(_INSTALL_PREFIX, "lib"), replace=True)
-        make_symlink(mt_include, os.path.join(_INSTALL_PREFIX, "include"), replace=True)
+        for target, link in ((mt_lib, os.path.join(_INSTALL_PREFIX, "lib")),
+                             (mt_include, os.path.join(_INSTALL_PREFIX, "include"))):
+            # BASH QUIRK (kept): if the name is a real folder (not a symlink),
+            # `ln -sfn` doesn't replace it; it puts the link INSIDE it (e.g.
+            # /opt/amd/lib/lib), so /opt/amd/lib still isn't the MT build.
+            if os.path.isdir(link) and not os.path.islink(link):
+                log_warn(_OP, f"{link} is an existing folder, so `ln -sfn` creates "
+                              f"the link inside it instead of replacing it, as bash "
+                              "does", path=link, target=target,
+                         link=os.path.join(link, os.path.basename(target)))
+            make_symlink(target, link, replace=True)
 
         os.makedirs(module_dir, exist_ok=True)
         # Mode "a" appends, like bash's `>>`.
@@ -257,7 +271,17 @@ def _install_aocl(version: str, sha256: str, env: dict[str, str]) -> bool:
             handle.write(aocl_modulefile(_INSTALL_PREFIX))
 
         # No replace: like bash's `ln -s`, this fails if amd/aocl already exists.
-        make_symlink(modulefile, os.path.join(module_dir, "aocl"), replace=False)
+        try:
+            make_symlink(modulefile, aocl_link, replace=False)
+        except FileExistsError as exc:
+            # This is how a rerun ends, in bash too: `ln -s` has no -f, so the
+            # link left by the first run makes it fail and `set -e` stops.
+            log_error(_OP, f"could not create {aocl_link}: {exc}. It already "
+                           "exists, which happens when this step is run again: "
+                           "bash's `ln -s` (no -f) fails the same way. The "
+                           f"modulefile {modulefile} has also been appended to "
+                           "a second time.", path=aocl_link, target=modulefile)
+            return False
 
         write_component_version("AOCL", version)
     except OSError as exc:

@@ -138,11 +138,12 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_dcgm, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_dcgm, "log_info") as log_info, \
+             mock.patch.object(install_dcgm, "log_warn") as log_warn, \
              mock.patch.object(install_dcgm, "log_error") as log_error:
             rc = install_dcgm.install(env)
         return rc, {"exec": exec_program, "capture": run_capture,
                     "config_for": config_for, "record": record,
-                    "info": log_info, "error": log_error, **seen}
+                    "info": log_info, "warn": log_warn, "error": log_error, **seen}
 
     @staticmethod
     def _commands(mocks):
@@ -216,6 +217,23 @@ class InstallTests(unittest.TestCase):
             *_SERVICE,
         ])
         m["record"].assert_called_once_with("DCGM", _AZL_DCGM)
+
+    def test_azure_linux_v100_warns_about_the_cuda13_package(self):
+        rc, m = self._install(_env("azurelinux3.0", SKU="V100"), cuda_cfg=_CUDA_12,
+                              dcgm_cfg={"version": _AZL_DCGM})
+        self.assertEqual(rc, 0)
+        m["warn"].assert_called_once()
+        self.assertEqual(m["warn"].call_args.kwargs,
+                         {"sku": "V100",
+                          "package": "datacenter-gpu-manager-4-cuda13-4.6.0"})
+
+    def test_azure_linux_other_sku_and_ubuntu_v100_do_not_warn(self):
+        rc, m = self._install(_env("azurelinux3.0"), dcgm_cfg={"version": _AZL_DCGM})
+        self.assertEqual(rc, 0)
+        m["warn"].assert_not_called()
+        rc, m = self._install(_env(SKU="V100"), cuda_cfg=_CUDA_12)
+        self.assertEqual(rc, 0)
+        m["warn"].assert_not_called()
 
     def test_azure_linux_does_not_need_the_sku_cuda_version(self):
         rc, m = self._install(_env("azurelinux3.0"), cuda_cfg=None,

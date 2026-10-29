@@ -106,7 +106,7 @@ import re
 import shutil
 
 from utils.component_config import config_for, write_component_version
-from utils.logger import log_error, log_info
+from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -197,14 +197,14 @@ def azure_linux_pmix_version(dnf_output: str, architecture: str) -> str | None:
         between "pmix" and the arch), but it does match e.g. "openpmix.x86_64".
       * If several lines match, bash's unquoted ${PMIX_VERSION} is split into
         words and write_component_version records only its first argument,
-        i.e. the version from the first matching line. We return that too.
+        i.e. the version from the first matching line. We return that too
+        (install() logs a warning when there are several).
 
     Returns None when no line matches, or when the first matching line doesn't
     fit the sed pattern (sed would then pass the whole line through and bash
     would record a garbage word such as the package name).
     """
-    postfix = "aarch64" if architecture == "aarch64" else "x86_64"
-    grep = re.compile(f"pmix.{postfix}", re.IGNORECASE)
+    grep = _pmix_grep(architecture)
 
     # split("\n") (not splitlines()) because grep only treats "\n" as a line
     # break; splitlines() would also split on characters such as "\r" or "\f".
@@ -217,6 +217,22 @@ def azure_linux_pmix_version(dnf_output: str, architecture: str) -> str | None:
                 return match.group(1)
             return None
     return None
+
+
+def _pmix_grep(architecture: str) -> re.Pattern:
+    """bash's  grep -i pmix.${postfix}  as a compiled regex (see above)."""
+    postfix = "aarch64" if architecture == "aarch64" else "x86_64"
+    return re.compile(f"pmix.{postfix}", re.IGNORECASE)
+
+
+def pmix_match_count(dnf_output: str, architecture: str) -> int:
+    """How many `dnf list installed` lines bash's grep -i pmix.<arch> matches.
+
+    More than one means bash records only the first line's version (see
+    azure_linux_pmix_version), which install() warns about.
+    """
+    grep = _pmix_grep(architecture)
+    return sum(1 for line in dnf_output.split("\n") if grep.search(line))
 
 
 # --------------------------------------------------------------------------- #
@@ -311,6 +327,13 @@ def _install_azurelinux(env: dict[str, str], version: str) -> str | None:
     if installed is None:
         log_error(_OP, "could not find the installed pmix version in `dnf list installed`")
         return None
+    # BASH QUIRK (kept): with several matching lines, bash records only the
+    # first line's version. Warn so the log shows a choice was made.
+    matches = pmix_match_count(output, env.get("ARCHITECTURE", ""))
+    if matches > 1:
+        log_warn(_OP, f"{matches} lines of `dnf list installed` match "
+                      "pmix.<arch>; recording the first one's version, as bash does",
+                 matches=matches, recorded=installed)
     return installed
 
 

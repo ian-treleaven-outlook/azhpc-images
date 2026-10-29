@@ -57,15 +57,12 @@ the .sh file is kept.
 Like every action, install() receives the build environment (a dict of
 environment variables) and returns 0 for success or 3 for failure.
 
-Ubuntu only (known drift, left unchanged)
------------------------------------------
-The bash script exists only in distros/ubuntu24.04 and distros/ubuntu22.04, but
-build_plan schedules this step for every distro. On an RPM distro (Azure Linux,
-AlmaLinux, Rocky) the bash step fails because the script is missing. This module
-fails there too, for the closest equivalent reason: the Ubuntu cloud-image file
-/etc/default/grub.d/50-cloudimg-settings.cfg does not exist, so install() logs
-an error and returns 3 before running update-grub. The step's gating is
-deliberately not changed by this port.
+Ubuntu only
+-----------
+build_plan runs this step only on Ubuntu, as install.sh does; on other distros
+it is skipped with a warning. (If it were run elsewhere anyway, the Ubuntu
+cloud-image file /etc/default/grub.d/50-cloudimg-settings.cfg would be missing,
+so install() would log an error and return 3 before running update-grub.)
 
 Flagged bash behavior (mirrored, not fixed)
 -------------------------------------------
@@ -73,7 +70,8 @@ If the image's 50-cloudimg-settings.cfg has the console parameters at the very
 start of the quoted value (as in the GRUB_CMDLINE_LINUX_DEFAULT example above),
 the search text never matches, so net.ifnames=0 is not added and the step
 still succeeds. Whether that happens depends on the base image's file, which is
-not in this repository.
+not in this repository. install() logs a warning (with the file and the search
+text) whenever no line matched, so a build log shows it.
 
 Deliberate differences
 ----------------------
@@ -86,7 +84,7 @@ regex characters such as `.` or `*`, a `/` (which breaks the sed command), or
 
 from __future__ import annotations
 
-from utils.logger import log_error, log_info
+from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program
 
 # The Step's `op` label in build_config.py. Every log line from this module uses it.
@@ -158,11 +156,18 @@ def _update_settings_file(search: str) -> bool:
         return False
 
     if updated == original:
-        # Not an error: bash's sed also succeeds when nothing matches.
-        log_info(_OP, f"{search.strip()!r} not found in {_GRUB_SETTINGS_FILE}; "
-                      f"file unchanged")
+        # Not an error: bash's sed also succeeds when nothing matches. But it
+        # means net.ifnames=0 was NOT added, so interfaces keep their
+        # predictable names - worth a warning in the build log.
+        log_warn(_OP, f"No line in {_GRUB_SETTINGS_FILE} contains the search "
+                      f"text, so {_KERNEL_PARAMETER} was not added (bash's sed "
+                      "succeeds silently here too)",
+                 path=_GRUB_SETTINGS_FILE, search=search, lines_changed=0)
     else:
-        log_info(_OP, f"Added {_KERNEL_PARAMETER} in {_GRUB_SETTINGS_FILE}")
+        # Every line that contains the search text is changed exactly once.
+        changed = sum(1 for line in original.split("\n") if search in line)
+        log_info(_OP, f"Added {_KERNEL_PARAMETER} in {_GRUB_SETTINGS_FILE}",
+                 path=_GRUB_SETTINGS_FILE, lines_changed=changed)
     return True
 
 

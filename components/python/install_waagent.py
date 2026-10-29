@@ -81,7 +81,7 @@ Deliberate differences from bash
   * A missing waagent version or sha256 fails the step before anything is
     installed (bash would try to download "vnull.tar.gz"). On Azure Linux the
     config isn't used, exactly as in bash (versions.json has an azurelinux3.0
-    entry that the script never reads).
+    entry that the script never reads; a warning says so in the log).
   * Work directory: bash downloads and unpacks in its current directory (the
     distro build dir). We use _WORK_DIR, emptied first so a leftover from an
     earlier run can't get in the way. As in bash, only the unpacked
@@ -94,6 +94,7 @@ Deliberate differences from bash
 # Lets type hints such as `str | None` work on Python versions older than 3.10.
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -308,6 +309,23 @@ def restart_service(distribution: str) -> str | None:
     return None
 
 
+def unused_azure_linux_entry(env: dict[str, str]):
+    """versions.json's waagent -> azurelinux3.0 entry, or None if there is none.
+
+    Bash never reads it (Azure Linux updates the distro's package instead), so
+    install() warns that the pinned version there is ignored. Reads the raw
+    COMPONENT_VERSIONS JSON; text that isn't valid JSON counts as "no entry",
+    because this is only used for a warning.
+    """
+    try:
+        versions = json.loads(env.get("COMPONENT_VERSIONS") or "{}")
+    except ValueError:       # json.JSONDecodeError is a kind of ValueError
+        return None
+    waagent = versions.get("waagent") if isinstance(versions, dict) else None
+    entry = waagent.get(_AZURE_LINUX) if isinstance(waagent, dict) else None
+    return entry if entry else None
+
+
 def backup_timestamp() -> str:
     """The suffix bash's `date +%F_%T` gives, e.g. "2026-10-29_15:07:42".
 
@@ -368,6 +386,14 @@ def _set_conf(key: str, value: str) -> bool:
         action = "replaced"
     elif existed:
         action = "appended"
+        # BASH QUIRK (kept): `echo "$key=$value" >>` appends right after the
+        # last character. If the file didn't end with a newline, the new key
+        # lands on the same line as the old last line (e.g.
+        # "Foo=1OS.EnableRDMA=y"), and waagent won't see either setting right.
+        if text and not text.endswith("\n"):
+            log_warn(_OP, f"{_WAAGENT_CONF} did not end with a newline, so {key} "
+                          "was glued onto its last line, as bash's `echo >>` does",
+                     path=_WAAGENT_CONF, key=key, value=value)
     else:
         action = "created"
     log_info(_OP, f"Set {key}={value} in {_WAAGENT_CONF} ({action})",
@@ -541,6 +567,15 @@ def install(env: dict[str, str]) -> int:
                  distro=distribution, method="dnf update", source="distro repository")
         if not _run_all([["dnf", "update", "-y", "WALinuxAgent"]], env):
             return 3
+        # BASH QUIRK (kept): versions.json pins a waagent version for
+        # azurelinux3.0, but bash never reads it; dnf installs whatever the
+        # distro repository has. Warn so nobody assumes the pin is applied.
+        entry = unused_azure_linux_entry(env)
+        if entry is not None:
+            log_warn(_OP, "versions.json has a waagent entry for azurelinux3.0 that "
+                          "is not used: Azure Linux takes WALinuxAgent from the "
+                          "distro repository, as in bash",
+                     distro=distribution, unused_entry=entry)
         # Unlike the other distros, bash doesn't check sku_uses_ipoib here.
         log_info(_OP, "Azure Linux: OS.EnableRDMA=y is set for every SKU and node type",
                  distro=distribution, sku=env.get("SKU", ""),

@@ -175,8 +175,10 @@ class _InstallTestBase(unittest.TestCase):
              mock.patch.object(install_pmix, "run_capture", return_value=capture) as cap, \
              mock.patch.object(install_pmix, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(install_pmix, "log_warn") as log_warn, \
              mock.patch.object(install_pmix, "log_error"):
             rc = install_pmix.install(env)
+        self.log_warn = log_warn
         return rc, commands, ex, cap, record
 
     def _read(self, key):
@@ -297,6 +299,18 @@ class AzureLinuxTests(_InstallTestBase):
         self.assertEqual(commands, self._DNF)
         cap.assert_called_once_with(["dnf", "list", "installed"], _OP, env=env)
         record.assert_called_once_with("PMIX", "5.0.1-1")
+        self.log_warn.assert_not_called()       # only one pmix.x86_64 line
+
+    def test_several_matching_lines_warn_with_count_and_recorded_value(self):
+        dnf_list = "openpmix.x86_64   4.2.9-12.el9   @System\n" + _DNF_LIST
+        rc, _, _, _, record = self._install(_env("azurelinux3.0"),
+                                            capture=(0, dnf_list))
+
+        self.assertEqual(rc, 0)
+        record.assert_called_once_with("PMIX", "4.2.9-12")
+        self.log_warn.assert_called_once()
+        self.assertEqual(self.log_warn.call_args.kwargs,
+                         {"matches": 2, "recorded": "4.2.9-12"})
 
     def test_aarch64_uses_the_aarch64_line(self):
         dnf_list = _DNF_LIST.replace("pmix.aarch64              5.0.1-1",

@@ -96,7 +96,8 @@ so the bash build applies the GB200 GRUB/irqbalance changes on VR200 too. The
 Python build sets SKU=VR200, so this step skips them there.
 
 Rerun behaviour (same as bash): the GB200 replacement text still contains
-"lockdown=integrity", so running the step twice adds the options twice.
+"lockdown=integrity", so running the step twice adds the options twice. A
+warning is logged when the options are already in a file before the edit.
 
 Which commands still run as programs
 ------------------------------------
@@ -487,11 +488,26 @@ def _setup_nvidia_extras() -> bool:
     return True
 
 
+def _add_gb200_options(path: str):
+    """The edit for one GRUB file: warn on a rerun, then do bash's sed.
+
+    Returns a function (text -> (new text, lines changed)) for _edit_in_place.
+    """
+    def edit(text: str) -> tuple[str, int]:
+        # BASH QUIRK (kept): the replacement still starts with
+        # "lockdown=integrity", so a second run matches again and adds the
+        # options a second time. Warn when they are already there.
+        if _GB200_CMDLINE in text:
+            log_warn(_OP, f"GB200 kernel options are already in {path}; adding "
+                          "them again, as bash's sed does on a rerun", path=path)
+        return replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE)
+    return edit
+
+
 def _setup_gb200(env: dict[str, str]) -> bool:
     """Azure Linux 3.0 + GB200: GRUB kernel options, then irqbalance off."""
     for path in (_GRUB_DEFAULT, _GRUB_CFG):
-        changed = _edit_in_place(
-            path, lambda text: replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE))
+        changed = _edit_in_place(path, _add_gb200_options(path))
         if changed is None:
             return False
         if changed == 0:

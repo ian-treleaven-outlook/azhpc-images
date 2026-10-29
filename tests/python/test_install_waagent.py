@@ -329,6 +329,47 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("OS.EnableRDMA=y\n", self.conf.read_text(encoding="utf-8"))
 
+    def test_azure_linux_warns_that_its_versions_entry_is_unused(self):
+        env = _env("azurelinux3.0")
+        entry = {"x86_64": {"version": "2.11.8.8", "sha256": "abc"}}
+        env["COMPONENT_VERSIONS"] = json.dumps({"waagent": {"azurelinux3.0": entry}})
+        rc, m = self._install(env)
+        self.assertEqual(rc, 0)
+        m["log_warn"].assert_called_once()
+        self.assertEqual(m["log_warn"].call_args.kwargs["unused_entry"], entry)
+
+    def test_azure_linux_without_an_entry_or_with_bad_json_does_not_warn(self):
+        for versions in (json.dumps({"waagent": {"common": {"version": "1"}}}),
+                         "{not json", ""):
+            with self.subTest(versions=versions):
+                env = _env("azurelinux3.0")
+                env["COMPONENT_VERSIONS"] = versions
+                rc, m = self._install(env)
+                self.assertEqual(rc, 0)
+                m["log_warn"].assert_not_called()
+
+    def test_ubuntu_ignores_the_azure_linux_entry(self):
+        env = _env("ubuntu24.04")
+        versions = json.loads(env["COMPONENT_VERSIONS"])
+        versions["waagent"]["azurelinux3.0"] = {"x86_64": {"version": "2.11.8.8"}}
+        env["COMPONENT_VERSIONS"] = json.dumps(versions)
+        rc, m = self._install(env)
+        self.assertEqual(rc, 0)
+        m["log_warn"].assert_not_called()
+
+    def test_conf_without_final_newline_warns_that_the_key_was_glued_on(self):
+        self.conf.write_text(_CONF_BEFORE.rstrip("\n"), encoding="utf-8")
+        rc, m = self._install(_env("ubuntu24.04"))
+        self.assertEqual(rc, 0)
+        # Only the first append is glued on; it adds the missing newline.
+        m["log_warn"].assert_called_once()
+        self.assertEqual(m["log_warn"].call_args.kwargs["key"],
+                         "Extensions.InitialGoalStatePeriod")
+        # Normal case (file ends with "\n"): no warning.
+        self.conf.write_text(_CONF_BEFORE, encoding="utf-8")
+        rc, m = self._install(_env("ubuntu24.04"))
+        m["log_warn"].assert_not_called()
+
     def test_el8_runs_the_pip_setup_twice_with_python3(self):
         rc, m = self._install(_env("almalinux8.10"))
 

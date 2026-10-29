@@ -192,8 +192,10 @@ class InstallTests(unittest.TestCase):
                                side_effect=download), \
              mock.patch.object(install_amd_libs, "write_component_version",
                                side_effect=write_error) as record, \
-             mock.patch.object(install_amd_libs, "log_error"):
+             mock.patch.object(install_amd_libs, "log_warn") as log_warn, \
+             mock.patch.object(install_amd_libs, "log_error") as log_error:
             rc = install_amd_libs.install(env or self.env)
+        self.log_warn, self.log_error = log_warn, log_error
         return rc, fake, record
 
     def _expected_commands(self):
@@ -247,6 +249,29 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(h.read(), install_amd_libs.aocl_modulefile(self.prefix) * 2)
         record.assert_not_called()
         self.assertEqual(len(fake.commands), 3)         # AOCC was not attempted
+        # The error explains that this is bash's rerun behaviour.
+        self.log_error.assert_called_once()
+        self.assertIn("run again", self.log_error.call_args.args[1])
+        self.assertEqual(self.log_error.call_args.kwargs["path"],
+                         os.path.join(self.modules, "amd", "aocl"))
+        # /opt/amd/lib is a symlink by now, not a real folder: no warning.
+        self.log_warn.assert_not_called()
+
+    def test_real_lib_folder_warns_and_gets_the_link_inside_it(self):
+        real_lib = os.path.join(self.prefix, "lib")
+        os.makedirs(real_lib)
+        rc, _, _ = self._install()
+
+        self.assertEqual(rc, 0)
+        # Like `ln -sfn`: the link lands inside the folder.
+        self.assertFalse(os.path.islink(real_lib))
+        self.assertTrue(os.path.islink(os.path.join(real_lib, "lib")))
+        self.log_warn.assert_called_once()
+        self.assertEqual(self.log_warn.call_args.kwargs["path"], real_lib)
+
+    def test_normal_install_does_not_warn(self):
+        self.assertEqual(self._install()[0], 0)
+        self.log_warn.assert_not_called()
 
     # ---- configuration -----------------------------------------------------
     def test_missing_config_returns_3_before_doing_anything(self):
