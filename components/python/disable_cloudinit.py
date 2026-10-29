@@ -103,17 +103,18 @@ All of this was checked by running the bash script and this module against
 the same scratch directory tree in WSL and comparing every file byte for
 byte (contents and modes) and the commands run.
 
-Azure Linux (flagged, behaviour kept)
--------------------------------------
-distros/azurelinux3.0/install.sh does NOT run disable_cloudinit.sh, but the
-"disable-cloudinit" Step in utils/build_config.py has no `when=` gate, so the
-Python build runs it on Azure Linux too. "azurelinux3.0" contains none of
+Azure Linux: skipped, as in bash
+--------------------------------
+distros/azurelinux3.0/install.sh does NOT run disable_cloudinit.sh, so
+build_plan skips this step on Azure Linux and logs a warning saying so. That
+matches bash, but it may be an upstream gap worth a closer look: Azure Linux
+images keep cloud-init's network configuration.
+
+If install() is called on Azure Linux anyway (outside build_plan), it behaves
+like the bash script would: "azurelinux3.0" contains none of
 almalinux/rocky/rhel, so it takes the Ubuntu/netplan branch. Azure Linux uses
-systemd-networkd, not netplan: /etc/netplan normally doesn't exist, so writing
-/etc/netplan/50-cloud-init.yaml fails (as `bash -c "cat > ..."` would), and
-the step fails after writing the cloud-init config file. The bash step through
-build_plan behaves the same way. This port keeps that behaviour and logs a
-warning; fixing the gating is a separate decision.
+systemd-networkd, not netplan, so writing /etc/netplan/50-cloud-init.yaml fails
+and the step returns 3, after logging a warning.
 
 How it fits into the Python build
 ---------------------------------

@@ -41,15 +41,16 @@ Step makes the build run the bash script again. That is why the .sh file is kept
 Like every action, install() receives the build environment (a dict of
 environment variables) and returns 0 for success or 3 for failure.
 
-Ubuntu only (known drift, left unchanged)
------------------------------------------
-The bash script exists only in distros/ubuntu24.04 and distros/ubuntu22.04, but
-build_plan schedules this step for every distro. On an RPM distro (Azure Linux,
-AlmaLinux, Rocky) the bash step fails because the script is missing. This module
-fails there too, for the closest equivalent reason: the apt file
-/etc/apt/apt.conf.d/20auto-upgrades does not exist, so install() logs an error
-and returns 3 before running systemctl. The step's gating is deliberately not
-changed by this port.
+Ubuntu only, as in bash
+-----------------------
+The bash script exists only in distros/ubuntu24.04 and distros/ubuntu22.04, and
+only those install.sh scripts run it. build_plan does the same: on other
+distros the step is skipped and the build log shows a warning saying why.
+
+If install() is called on an RPM distro anyway (outside build_plan), it fails
+for the closest equivalent reason to the missing bash script: the apt file
+/etc/apt/apt.conf.d/20auto-upgrades does not exist, so it logs an error and
+returns 3 before running systemctl.
 
 Deliberate differences
 ----------------------

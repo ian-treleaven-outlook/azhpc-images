@@ -178,6 +178,32 @@ class GatingTests(unittest.TestCase):
             with self.subTest(gpu=gpu):
                 self.assertIn("install_docker.sh", _plan_scripts(_cfg(vendor, gpu)))
 
+    def test_steps_a_distros_install_sh_never_runs_are_skipped(self):
+        # Azure Linux's install.sh has no disable_cloudinit.sh; only the Ubuntu
+        # install.sh scripts run the two distro-local disable scripts.
+        ubuntu_only = {"disable_auto_upgrade.sh", "disable_predictive_interface_renaming.sh"}
+        cases = {
+            "Ubuntu24": (True, True),   # (runs disable_cloudinit, runs ubuntu-only)
+            "Ubuntu22": (True, True),
+            "Azure3":   (False, False),
+            "Alma9":    (True, False),
+            "Rocky8":   (True, False),
+        }
+        for os_name, (cloudinit, ubuntu) in cases.items():
+            with self.subTest(os=os_name):
+                plan = set(_plan_scripts(_cfg("NVidia", "A100", os=os_name)))
+                self.assertEqual("disable_cloudinit.sh" in plan, cloudinit)
+                self.assertEqual(ubuntu_only <= plan, ubuntu)
+                self.assertFalse(ubuntu_only & plan and not ubuntu)
+
+    def test_those_skips_carry_a_warning_reason(self):
+        steps = {s.op: s for s in build_plan(_cfg("NVidia", "A100"))}
+        for op in ("disable-cloudinit", "disable-auto-upgrade",
+                   "disable-predictive-interface-renaming"):
+            with self.subTest(op=op):
+                self.assertTrue(steps[op].skip_warning)
+        self.assertEqual(steps["install-rocm"].skip_warning, "")   # normal gating
+
     def test_gb200_branch(self):
         plan = _plan_scripts(_cfg("NVidia", "GB200"))
         self.assertIn("install_nvidiagpudriver_gb200.sh", plan)
@@ -258,6 +284,32 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertEqual(summary.args[0], "build-image")
         self.assertEqual(summary.kwargs["python_steps"], 1)
         self.assertEqual(summary.kwargs["bash_steps"], 0)
+
+    def _run_skipped(self, step):
+        """Run build() with one step whose `when` is false; return the loggers."""
+        builder = ImageBuilder(_REPO_ROOT, _cfg("NVidia", "A100"))
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value={}), \
+             mock.patch.object(build_config, "build_plan", return_value=[step]), \
+             mock.patch.object(build_config, "log_info") as info, \
+             mock.patch.object(build_config, "log_warn") as warn:
+            self.assertEqual(builder.build(), 0)
+        return info, warn
+
+    def test_skip_with_a_reason_is_a_warning(self):
+        step = Step("test-step", "x.sh", action=lambda env: 0,
+                    when=lambda c: False, skip_warning="install.sh never runs x.sh")
+        _, warn = self._run_skipped(step)
+        skipped = [c for c in warn.call_args_list if c.args[0] == "test-step"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("install.sh never runs x.sh", skipped[0].args[1])
+
+    def test_ordinary_skip_is_info_only(self):
+        step = Step("test-step", "x.sh", action=lambda env: 0, when=lambda c: False)
+        info, warn = self._run_skipped(step)
+        self.assertFalse([c for c in warn.call_args_list if c.args[0] == "test-step"])
+        self.assertTrue([c for c in info.call_args_list
+                         if c.args[0] == "test-step" and "skipped" in c.args[1]])
 
 
 if __name__ == "__main__":

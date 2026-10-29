@@ -52,6 +52,10 @@ DISTRO_DIRS = {
 }
 GPU_ARGS = {"NVidia": "NVIDIA", "AMD": "AMD"}
 
+# The --os values whose install.sh runs the Ubuntu-only distro scripts
+# (disable_auto_upgrade.sh, disable_predictive_interface_renaming.sh).
+UBUNTU_OSES = {"Ubuntu24", "Ubuntu22"}
+
 def _detect_distribution() -> str:
     """Mirror: . /etc/os-release; echo $ID$VERSION_ID  -> e.g. 'ubuntu24.04'."""
     data: dict[str, str] = {}
@@ -204,6 +208,10 @@ class Step:
     args: tuple[str, ...] = ()
     base: str = "component"       # "component" (components/) or "distro" (build_dir)
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
+    # Why the step is skipped when `when` is false, if that skip deserves a
+    # WARNING rather than the usual INFO line — e.g. a distro's install.sh never
+    # runs this script, which may be an upstream gap someone should look at.
+    skip_warning: str = ""
 
 def _cleanup_downloads(env: dict[str, str]) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
@@ -336,16 +344,29 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=add_udev_rules.install),
         Step("copy-test-file", "copy_test_file.sh",
              action=copy_test_file.install),
+        # Not on Azure Linux: its install.sh never runs disable_cloudinit.sh.
         Step("disable-cloudinit", "disable_cloudinit.sh",
-             action=disable_cloudinit.install),
+             action=disable_cloudinit.install,
+             when=lambda c: c.os != "Azure3",
+             skip_warning="distros/azurelinux3.0/install.sh never runs "
+                          "disable_cloudinit.sh, so it is skipped to match bash "
+                          "(possibly an upstream gap: cloud-init networking stays on)"),
         Step("setup-sku-customizations", "setup_sku_customizations.sh",
              action=setup_sku_customizations.install),
         Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install),
+        # Ubuntu only: these scripts exist only in distros/ubuntu22.04 and
+        # distros/ubuntu24.04, and only those install.sh scripts run them.
         Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro",
-             action=disable_auto_upgrade.install),
+             action=disable_auto_upgrade.install,
+             when=lambda c: c.os in UBUNTU_OSES,
+             skip_warning="only the Ubuntu install.sh scripts run "
+                          "disable_auto_upgrade.sh; skipped to match bash"),
         Step("disable-predictive-interface-renaming",
              "disable_predictive_interface_renaming.sh", base="distro",
-             action=disable_predictive_interface_renaming.install),
+             action=disable_predictive_interface_renaming.install,
+             when=lambda c: c.os in UBUNTU_OSES,
+             skip_warning="only the Ubuntu install.sh scripts run "
+                          "disable_predictive_interface_renaming.sh; skipped to match bash"),
     ]
 
 class ImageBuilder:
@@ -408,10 +429,16 @@ class ImageBuilder:
         # Counts for the summary line at the end.
         counts = {"python": 0, "bash": 0, "skipped": 0}
         for step in plan:
-            # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA)
+            # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA).
+            # A skip that may hide a problem (e.g. install.sh for this distro
+            # never runs the script) is logged as a WARNING with the reason.
             if not step.when(cfg):
                 counts["skipped"] += 1
-                log_info(step.op, "skipped: not applicable to this target")
+                if step.skip_warning:
+                    log_warn(step.op, f"skipped: {step.skip_warning}",
+                             os=cfg.os, script=step.script)
+                else:
+                    log_info(step.op, "skipped: not applicable to this target")
                 continue
 
             # Record whether this step ran as Python or bash, so a failure in a
