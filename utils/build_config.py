@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -301,7 +301,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=copy_test_file.install),
         Step("disable-cloudinit", "disable_cloudinit.sh"),
         Step("setup-sku-customizations", "setup_sku_customizations.sh"),
-        Step("trivy-scan", "trivy_scan.sh"),
+        Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install),
         Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro",
              action=disable_auto_upgrade.install),
         Step("disable-predictive-interface-renaming",
