@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -261,6 +261,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # --- x86_64 libraries ---
         Step("install-amd-libs", "install_amd_libs.sh",
+             action=install_amd_libs.install,
              when=lambda c: c.architecture == "x86_64"),
         Step("install-intel-libs", "install_intel_libs.sh",
              action=install_intel_libs.install,
