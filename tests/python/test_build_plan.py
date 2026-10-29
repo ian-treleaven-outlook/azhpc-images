@@ -332,6 +332,69 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertTrue([c for c in info.call_args_list
                          if c.args[0] == "test-step" and "skipped" in c.args[1]])
 
+    def _run_one_step(self, step):
+        """Run build() with a one-step plan; bash is stubbed to succeed.
+
+        Returns (exit code, exec_program mock, log_info mock, log_warn mock).
+        """
+        builder = ImageBuilder(_REPO_ROOT, _cfg("NVidia", "A100"))
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value={}), \
+             mock.patch.object(build_config, "build_plan", return_value=[step]), \
+             mock.patch.object(build_config, "exec_program", return_value=0) as bash, \
+             mock.patch.object(build_config, "log_info") as info, \
+             mock.patch.object(build_config, "log_warn") as warn:
+            rc = builder.build()
+        return rc, bash, info, warn
+
+    def test_step_marked_resync_runs_bash_with_a_warning(self):
+        action = mock.Mock(return_value=0)
+        step = Step("test-step", "x.sh", action=action, resync="ADO 987")
+        rc, bash, info, warn = self._run_one_step(step)
+
+        self.assertEqual(rc, 0)
+        action.assert_not_called()                    # the stale port never runs
+        bash.assert_called_once()
+        self.assertEqual(Path(bash.call_args.args[0][0]).name, "x.sh")
+        warned = [c for c in warn.call_args_list if c.args[0] == "test-step"]
+        self.assertEqual(len(warned), 1)
+        self.assertIn("ADO 987", warned[0].args[1])
+        self.assertEqual(warned[0].kwargs["resync"], "ADO 987")
+        summary = info.call_args_list[-1]
+        self.assertEqual(summary.kwargs["bash_steps"], 1)
+        self.assertEqual(summary.kwargs["python_steps"], 0)
+
+    def test_step_without_resync_runs_python_and_does_not_warn(self):
+        action = mock.Mock(return_value=0)
+        rc, bash, _, warn = self._run_one_step(Step("test-step", "x.sh", action=action))
+        self.assertEqual(rc, 0)
+        action.assert_called_once()
+        bash.assert_not_called()
+        self.assertFalse([c for c in warn.call_args_list if c.args[0] == "test-step"])
+
+    def test_runner_property(self):
+        port = lambda env: 0
+        self.assertEqual(Step("a", "a.sh", action=port).runner, "python")
+        self.assertEqual(Step("a", "a.sh").runner, "bash")
+        self.assertEqual(Step("a", "a.sh", action=port, resync="ADO 1").runner, "bash")
+
+    def test_dry_run_shows_the_runner_a_build_would_use(self):
+        import contextlib
+        import io
+        import azhpc
+
+        plan = [Step("ported", "p.sh", action=lambda env: 0),
+                Step("stale", "s.sh", action=lambda env: 0, resync="ADO 987"),
+                Step("bash-only", "b.sh")]
+        out = io.StringIO()
+        with mock.patch.object(azhpc, "build_plan", return_value=plan), \
+             contextlib.redirect_stdout(out):
+            azhpc.print_build_plan(_cfg("NVidia", "A100"))
+        lines = {line.split()[1]: line for line in out.getvalue().splitlines()[1:]}
+        self.assertTrue(lines["ported"].endswith("(python)"))
+        self.assertTrue(lines["stale"].endswith("(bash, resync ADO 987)"))
+        self.assertTrue(lines["bash-only"].endswith("(bash)"))
+
     def _rackscale_warnings(self, gpu, env):
         """Run build() for `gpu` with an empty plan; return the rackscale warnings."""
         builder = ImageBuilder(_REPO_ROOT, _cfg("NVidia", gpu))

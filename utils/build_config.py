@@ -215,6 +215,22 @@ class Step:
     # WARNING rather than the usual INFO line — e.g. a distro's install.sh never
     # runs this script, which may be an upstream gap someone should look at.
     skip_warning: str = ""
+    # Set when the Python port is behind its bash script, e.g. upstream changed
+    # the script after it was ported. The value names the ticket that will
+    # update the port, e.g. "ADO 987". While it is set, build() runs the bash
+    # script instead of `action` and logs a WARNING, so a build never runs a
+    # stale port. Remove it once the port matches the bash again.
+    resync: str = ""
+
+    @property
+    def runner(self) -> str:
+        """How build() runs this step: "python" (its action) or "bash".
+
+        A step runs as bash when it has no Python action, or when its port is
+        marked resync (behind its bash script). build() and `azhpc.py
+        --dry-run` both use this, so the dry run shows what a build would do.
+        """
+        return "python" if self.action is not None and not self.resync else "bash"
 
 def _cleanup_downloads(env: dict[str, str]) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
@@ -464,8 +480,14 @@ class ImageBuilder:
                 continue
 
             # Record whether this step ran as Python or bash, so a failure in a
-            # real build can be traced to the right implementation.
-            runner = "python" if step.action is not None else "bash"
+            # real build can be traced to the right implementation. A port
+            # marked `resync` is out of date, so its bash script runs instead.
+            runner = step.runner
+            if step.action is not None and step.resync:
+                log_warn(step.op,
+                         f"Python port is behind {step.script} ({step.resync}); "
+                         "running the bash script instead",
+                         script=step.script, resync=step.resync)
             log_info(step.op, f"starting ({runner})", runner=runner, script=step.script)
             step_started = time.monotonic()
 
@@ -475,7 +497,7 @@ class ImageBuilder:
             # can't escape as a traceback and break the documented exit codes.
             # The traceback is still logged, as the error's detail block.
             try:
-                if step.action is not None:
+                if runner == "python":
                     rc = step.action(env)
                 else:
                     # "distro" specific scripts live in build_dir; the rest in components/
