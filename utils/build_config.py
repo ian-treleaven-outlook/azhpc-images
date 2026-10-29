@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -256,7 +256,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # --- AMD branch ---
         Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
              when=amd),
-        Step("install-rccl", "install_rccl.sh", when=amd),
+        Step("install-rccl", "install_rccl.sh", action=install_rccl.install,
+             when=amd),
 
         # Lustre client, then mpifileutils which builds against it (upstream #557
         # moved lustre here so mpifileutils picks up Lustre support).
