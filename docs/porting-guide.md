@@ -5,7 +5,7 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **9 run natively in Python, 27
+[`azhpc.py`](../azhpc.py#L192), has 36 steps; **10 run natively in Python, 26
 still shell out to bash.** Each remaining script is an independent,
 self-contained task — claim the ADO task, port it, open a PR.
 
@@ -346,7 +346,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **126 tests, ~standard library only** — `unittest` and
+The suite is **137 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -396,7 +396,7 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 27 unported steps
+## 12. Remaining work — the 26 unported steps
 
 Each row is one ADO task, ordered as they appear in `build_plan()`.
 
@@ -421,24 +421,23 @@ Each row is one ADO task, ordered as they appear in `build_plan()`.
 | 17 | `install-waagent` | `install_waagent.sh` |
 | 18 | `install-persistent-rdma-naming` | `install_azure_persistent_rdma_naming.sh` |
 | 19 | `install-health-checks` | `install_health_checks.sh` |
-| 20 | `write-kernel-os-version` | `write_kernel_os_version.sh` |
-| 21 | `add-udev-rules` | `add-udev-rules.sh` |
-| 22 | `copy-test-file` | `copy_test_file.sh` |
-| 23 | `disable-cloudinit` | `disable_cloudinit.sh` |
-| 24 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
-| 25 | `trivy-scan` | `trivy_scan.sh` |
-| 26 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
-| 27 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
+| 20 | `add-udev-rules` | `add-udev-rules.sh` |
+| 21 | `copy-test-file` | `copy_test_file.sh` |
+| 22 | `disable-cloudinit` | `disable_cloudinit.sh` |
+| 23 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
+| 24 | `trivy-scan` | `trivy_scan.sh` |
+| 25 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
+| 26 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
 
 **Already ported (study these):** `install-doca`, `install-libfabric`,
 `install-nvbandwidth`, `install-mpifileutils`, `install-intel-libs`,
 `cleanup-downloads`, `install-aznfs`, `install-hpcdiag`,
-`install-monitoring-tools`.
+`install-monitoring-tools`, `write-kernel-os-version`.
 
 ### Suggested starting points
 
-New to the codebase? Take `add-udev-rules`, `copy-test-file`,
-`disable-cloudinit`, or `write-kernel-os-version` — small and self-contained.
+New to the codebase? Take `add-udev-rules`, `copy-test-file`, or
+`disable-cloudinit` — small and self-contained.
 The GPU driver steps (`install-nv-driver`, `install-rocm`) are the most
 involved; save those until you've done one of the others.
 

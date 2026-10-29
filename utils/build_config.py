@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version
 from utils.sku import sku_has_infiniband
 
 MODULE_DIRS = {
@@ -280,7 +280,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              when=lambda c: c.gpu not in {"GB200", "NCv6"}),
 
         # record kernel + OS version into the image
-        Step("write-kernel-os-version", "write_kernel_os_version.sh"),
+        Step("write-kernel-os-version", "write_kernel_os_version.sh",
+             action=write_kernel_os_version.install),
 
         # final configuration steps
         Step("add-udev-rules", "add-udev-rules.sh"),
