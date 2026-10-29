@@ -26,6 +26,21 @@ VALID_GPUS = {
     "AMD": {"MI300", "MI400", "MI500"},
 }
 DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
+
+# Placeholder SKUs that bash builds as another SKU. distros/ubuntu24.04/install.sh:
+#     export SKU=$([[ $2 == "VR200" ]] && echo "GB200" || echo "$2")
+# so a VR200 image is built exactly like a GB200 one (driver, NVLink tools,
+# aarch64, versions.json lookups...). We do the same.
+SKU_ALIASES = {"VR200": "GB200"}
+
+
+def build_sku(gpu: str) -> str:
+    """The SKU bash actually builds for `gpu`, e.g. "VR200" -> "GB200".
+
+    dict.get(key, default) returns `default` when the key isn't in the dict,
+    so any SKU without an alias is returned unchanged.
+    """
+    return SKU_ALIASES.get(gpu, gpu)
 DISTRO_DIRS = {
     "Ubuntu24": "distros/ubuntu24.04",
     "Ubuntu22": "distros/ubuntu22.04",
@@ -162,10 +177,20 @@ def resolve_config(args) -> BuildConfig:
         except (json.JSONDecodeError, OSError):
             raise ConfigError(f"spec file is malformed JSON: {args.spec}", 2)
 
+    # Placeholder SKUs are built as another SKU, as in bash (see SKU_ALIASES).
+    # The requested name stays in every log line's "gpu" field (azhpc.py sets
+    # it before this runs), so telemetry still shows VR200 was asked for.
+    gpu = build_sku(args.gpu)
+    if gpu != args.gpu:
+        log_warn("resolve-config",
+                 f"GPU '{args.gpu}' is built as {gpu}: a placeholder mapping copied "
+                 "from distros/ubuntu24.04/install.sh",
+                 requested_gpu=args.gpu, build_gpu=gpu)
+
     # build and return the immutable config object
     return BuildConfig(
         vendor=args.vendor,
-        gpu=args.gpu,
+        gpu=gpu,
         os=args.os,
         fips=bool(args.fips),
         spec_path=spec_path,

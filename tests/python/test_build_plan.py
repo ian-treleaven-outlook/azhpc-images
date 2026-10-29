@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import re
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
 from utils import build_config
-from utils.build_config import BuildConfig, ImageBuilder, Step, build_plan
+from utils.build_config import BuildConfig, ImageBuilder, Step, build_plan, resolve_config
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _INSTALL_SH = _REPO_ROOT / "distros" / "ubuntu24.04" / "install.sh"
@@ -129,6 +130,23 @@ class InstallShParityTests(unittest.TestCase):
 # components and leave out the ones meant for other paths (IB vs non-IB, NVIDIA vs AMD,
 # GB200's aarch64 branch, etc.).
 class GatingTests(unittest.TestCase):
+    def test_vr200_is_built_as_gb200_with_a_warning(self):
+        # distros/ubuntu24.04/install.sh maps VR200 -> GB200; resolve_config does too.
+        args = Namespace(vendor="NVidia", gpu="VR200", os="Ubuntu24", spec=None, fips=False)
+        with mock.patch.object(build_config, "log_warn") as warned:
+            cfg = resolve_config(args)
+        self.assertEqual(cfg.gpu, "GB200")
+        self.assertEqual(cfg.architecture, "aarch64")
+        warned.assert_called_once()
+        self.assertEqual(warned.call_args.kwargs["requested_gpu"], "VR200")
+        self.assertEqual(_plan_scripts(cfg), _plan_scripts(_cfg("NVidia", "GB200")))
+
+    def test_other_gpus_are_not_remapped(self):
+        args = Namespace(vendor="NVidia", gpu="H100", os="Ubuntu24", spec=None, fips=False)
+        with mock.patch.object(build_config, "log_warn") as warned:
+            cfg = resolve_config(args)
+        self.assertEqual(cfg.gpu, "H100")
+        warned.assert_not_called()
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))
         self.assertIn("install_doca.sh", plan)          # IB SKU -> DOCA
