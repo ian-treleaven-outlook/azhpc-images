@@ -1,0 +1,7 @@
+#%Module 1.0
+#
+#  HPCx 2.18
+#
+conflict        mpi
+module load /opt/hpcx-v2.18-gcc-mlnx_ofed-redhat8-cuda12-x86_64/modulefiles/hpcx-rebuild
+

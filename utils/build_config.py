@@ -4,13 +4,15 @@ from dataclasses import dataclass
 from typing import Callable
 from pathlib import Path
 import json
-from utils.logger import log_info, log_warn, log_error
+from utils.logger import log_info, log_warn, log_error, log_error_detail
 from utils.process import exec_program
 import os
 import platform
 import subprocess
+import time
+import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_dynolog_drl, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -24,6 +26,24 @@ VALID_GPUS = {
     "AMD": {"MI300", "MI400", "MI500"},
 }
 DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
+
+# Placeholder SKUs that bash builds as another SKU. distros/ubuntu24.04/install.sh:
+#     export SKU=$([[ $2 == "VR200" ]] && echo "GB200" || echo "$2")
+# so a VR200 image is built exactly like a GB200 one (driver, NVLink tools,
+# aarch64, versions.json lookups...). We do the same.
+SKU_ALIASES = {"VR200": "GB200"}
+
+# SKUs with rackscale NVLink (after SKU_ALIASES), which expect NVLINK_RACKSCALE=true.
+RACKSCALE_GPUS = {"GB200", "GB300"}
+
+
+def build_sku(gpu: str) -> str:
+    """The SKU bash actually builds for `gpu`, e.g. "VR200" -> "GB200".
+
+    dict.get(key, default) returns `default` when the key isn't in the dict,
+    so any SKU without an alias is returned unchanged.
+    """
+    return SKU_ALIASES.get(gpu, gpu)
 DISTRO_DIRS = {
     "Ubuntu24": "distros/ubuntu24.04",
     "Ubuntu22": "distros/ubuntu22.04",
@@ -34,6 +54,10 @@ DISTRO_DIRS = {
     "Azure3": "distros/azurelinux3.0",
 }
 GPU_ARGS = {"NVidia": "NVIDIA", "AMD": "AMD"}
+
+# The --os values whose install.sh runs the Ubuntu-only distro scripts
+# (disable_auto_upgrade.sh, disable_predictive_interface_renaming.sh).
+UBUNTU_OSES = {"Ubuntu24", "Ubuntu22"}
 
 def _detect_distribution() -> str:
     """Mirror: . /etc/os-release; echo $ID$VERSION_ID  -> e.g. 'ubuntu24.04'."""
@@ -68,6 +92,10 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     env["COMPONENT_DIR"] = str(repo_root / "components")
     env["UTILS_DIR"]     = str(repo_root / "utils")
     env["TEST_DIR"]      = str(repo_root / "tests")
+    # The same directory under the name set_properties.sh exports and
+    # copy_test_file.sh / copy_test_file.py read. Without it the bash script
+    # would copy from "/" instead of the repo's tests (the Python one fails).
+    env["AZHPC_IMAGES_TEST_DIR"] = str(repo_root / "tests")
 
     env["DISTRIBUTION"]        = distribution
     env["ARCHITECTURE"]        = platform.machine()              # uname -m
@@ -156,10 +184,20 @@ def resolve_config(args) -> BuildConfig:
         except (json.JSONDecodeError, OSError):
             raise ConfigError(f"spec file is malformed JSON: {args.spec}", 2)
 
+    # Placeholder SKUs are built as another SKU, as in bash (see SKU_ALIASES).
+    # The requested name stays in every log line's "gpu" field (azhpc.py sets
+    # it before this runs), so telemetry still shows VR200 was asked for.
+    gpu = build_sku(args.gpu)
+    if gpu != args.gpu:
+        log_warn("resolve-config",
+                 f"GPU '{args.gpu}' is built as {gpu}: a placeholder mapping copied "
+                 "from distros/ubuntu24.04/install.sh",
+                 requested_gpu=args.gpu, build_gpu=gpu)
+
     # build and return the immutable config object
     return BuildConfig(
         vendor=args.vendor,
-        gpu=args.gpu,
+        gpu=gpu,
         os=args.os,
         fips=bool(args.fips),
         spec_path=spec_path,
@@ -173,6 +211,10 @@ class Step:
     args: tuple[str, ...] = ()
     base: str = "component"       # "component" (components/) or "distro" (build_dir)
     when: Callable[[BuildConfig], bool] = lambda cfg: True  # condition
+    # Why the step is skipped when `when` is false, if that skip deserves a
+    # WARNING rather than the usual INFO line — e.g. a distro's install.sh never
+    # runs this script, which may be an upstream gap someone should look at.
+    skip_warning: str = ""
 
 def _cleanup_downloads(env: dict[str, str]) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
@@ -202,8 +244,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
     (System prep / install_utils.sh runs separately via ImageBuilder._bootstrap
     before this plan executes. Inline shell in install.sh that isn't a component
-    script — the non-IB rdma-core install + mana_ib blacklist, the AMD moby
-    docker setup, and the tarball cleanup — is not represented here yet.)
+    script — the non-IB rdma-core install + mana_ib blacklist and the tarball
+    cleanup — is handled here only for the cleanup.)
     """
     def nvidia(c):
         return c.vendor == "NVidia"
@@ -219,58 +261,77 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_libfabric.install,
              when=lambda c: not sku_has_infiniband(c.gpu)),
 
-        # PMIX + MPI libraries
-        Step("install-pmix", "install_pmix.sh"),
-        Step("install-mpis", "install_mpis.sh"),
+        # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
+        # install_mpis.sh can rebuild HPC-X's UCX with ROCm support.
+        Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
+             when=amd),
 
-        # --- NVIDIA driver branch (mutually exclusive by SKU) ---
-        Step("install-nv-driver-gb200", "install_nvidiagpudriver_gb200.sh",
-             base="distro", when=lambda c: nvidia(c) and c.gpu == "GB200"),
+        # PMIX + MPI libraries
+        Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
+        Step("install-mpis", "install_mpis.sh", action=install_mpis.install),
+
+        # --- NVIDIA driver branch ---
+        # One shared driver script for every NVIDIA SKU except NCv6 (GRID), as
+        # in install.sh. GB200/GB300/VR200 differences (IMEX, CDMM, no fabric
+        # manager) are inside install_nvidiagpudriver.sh, switched on by the
+        # NVLINK_RACKSCALE env var that packer sets. (The old dedicated
+        # install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
+        # On GB200 the driver must come before NVSHMEM/NVLOOM/nvbandwidth.
+        Step("install-nv-driver", "install_nvidiagpudriver.sh",
+             action=install_nvidiagpudriver.install,
+             when=lambda c: nvidia(c) and c.gpu != "NCv6"),
         Step("install-nvshmem", "install_nvshmem.sh",
+             action=install_nvshmem.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nvloom", "install_nvloom.sh",
+             action=install_nvloom.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nvbandwidth", "install_nvbandwidth_tool.sh",
              action=install_nvbandwidth_tool.install,
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nv-grid", "install_nvidiagriddriver.sh",
+             action=install_nvidiagriddriver.install,
              when=lambda c: nvidia(c) and c.gpu == "NCv6"),
-        Step("install-nv-driver", "install_nvidiagpudriver.sh",
-             when=lambda c: nvidia(c) and c.gpu not in {"GB200", "NCv6"}),
 
-        # NCCL, docker, DCGM (NVIDIA)
-        Step("install-nccl", "install_nccl.sh", when=nvidia),
-        Step("install-docker", "install_docker.sh", when=nvidia),
-        Step("install-dcgm", "install_dcgm.sh", when=nvidia),
+        # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
+        Step("install-nccl", "install_nccl.sh", action=install_nccl.install,
+             when=nvidia),
+        Step("install-docker", "install_docker.sh", action=install_docker.install),
+        Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
+             when=nvidia),
 
-        # --- AMD branch ---
-        Step("install-rocm", "install_rocm.sh", when=amd),
-        Step("install-rccl", "install_rccl.sh", when=amd),
+        # --- AMD branch (ROCm itself runs earlier, before PMIx/MPI) ---
+        Step("install-rccl", "install_rccl.sh", action=install_rccl.install,
+             when=amd),
 
         # Lustre client, then mpifileutils which builds against it (upstream #557
         # moved lustre here so mpifileutils picks up Lustre support).
-        Step("install-lustre", "install_lustre_client.sh"),
+        Step("install-lustre", "install_lustre_client.sh",
+             action=install_lustre_client.install),
         Step("install-mpifileutils", "install_mpifileutils.sh",
              action=install_mpifileutils.install),
 
         # --- x86_64 libraries ---
         Step("install-amd-libs", "install_amd_libs.sh",
+             action=install_amd_libs.install,
              when=lambda c: c.architecture == "x86_64"),
         Step("install-intel-libs", "install_intel_libs.sh",
              action=install_intel_libs.install,
              when=lambda c: c.architecture == "x86_64"),
 
         # dynolog + dyno-relay-logger
-        Step("install-dynolog-drl", "install_dynolog_drl.sh"),
+        Step("install-dynolog-drl", "install_dynolog_drl.sh",
+             action=install_dynolog_drl.install),
 
         # free space: remove downloaded tarballs/installers (inline rm in install.sh)
         Step("cleanup-downloads", action=_cleanup_downloads),
 
         # optimizations + persistent RDMA naming
-        Step("hpc-tuning", "hpc-tuning.sh"),
-        Step("install-waagent", "install_waagent.sh"),
+        Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install),
+        Step("install-waagent", "install_waagent.sh", action=install_waagent.install),
         Step("install-persistent-rdma-naming",
-             "install_azure_persistent_rdma_naming.sh"),
+             "install_azure_persistent_rdma_naming.sh",
+             action=install_azure_persistent_rdma_naming.install),
 
         # not-GB200 group
         Step("install-aznfs", "install_aznfs.sh", action=install_aznfs.install,
@@ -281,6 +342,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_monitoring_tools.install,
              when=lambda c: c.gpu != "GB200"),
         Step("install-health-checks", "install_health_checks.sh",
+             action=install_health_checks.install,
              args=(cfg.gpu_arg,),
              when=lambda c: c.gpu not in {"GB200", "NCv6"}),
 
@@ -289,14 +351,33 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=write_kernel_os_version.install),
 
         # final configuration steps
-        Step("add-udev-rules", "add-udev-rules.sh"),
-        Step("copy-test-file", "copy_test_file.sh"),
-        Step("disable-cloudinit", "disable_cloudinit.sh"),
-        Step("setup-sku-customizations", "setup_sku_customizations.sh"),
-        Step("trivy-scan", "trivy_scan.sh"),
-        Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro"),
+        Step("add-udev-rules", "add-udev-rules.sh",
+             action=add_udev_rules.install),
+        Step("copy-test-file", "copy_test_file.sh",
+             action=copy_test_file.install),
+        # Not on Azure Linux: its install.sh never runs disable_cloudinit.sh.
+        Step("disable-cloudinit", "disable_cloudinit.sh",
+             action=disable_cloudinit.install,
+             when=lambda c: c.os != "Azure3",
+             skip_warning="distros/azurelinux3.0/install.sh never runs "
+                          "disable_cloudinit.sh, so it is skipped to match bash "
+                          "(possibly an upstream gap: cloud-init networking stays on)"),
+        Step("setup-sku-customizations", "setup_sku_customizations.sh",
+             action=setup_sku_customizations.install),
+        Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install),
+        # Ubuntu only: these scripts exist only in distros/ubuntu22.04 and
+        # distros/ubuntu24.04, and only those install.sh scripts run them.
+        Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro",
+             action=disable_auto_upgrade.install,
+             when=lambda c: c.os in UBUNTU_OSES,
+             skip_warning="only the Ubuntu install.sh scripts run "
+                          "disable_auto_upgrade.sh; skipped to match bash"),
         Step("disable-predictive-interface-renaming",
-             "disable_predictive_interface_renaming.sh", base="distro"),
+             "disable_predictive_interface_renaming.sh", base="distro",
+             action=disable_predictive_interface_renaming.install,
+             when=lambda c: c.os in UBUNTU_OSES,
+             skip_warning="only the Ubuntu install.sh scripts run "
+                          "disable_predictive_interface_renaming.sh; skipped to match bash"),
     ]
 
 class ImageBuilder:
@@ -333,28 +414,66 @@ class ImageBuilder:
         components = self.repo_root / "components"
         env = component_env(self.repo_root, cfg)
 
-        log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
+        plan = build_plan(cfg)
+        build_started = time.monotonic()
+        # Fields on this line describe the whole run, so a log query can find
+        # every build of, say, NCv6 on azurelinux3.0.
+        log_info("build-image", f"Building {cfg.os} for {cfg.gpu}",
+                 vendor=cfg.vendor, gpu=cfg.gpu, os=cfg.os,
+                 distribution=env.get("DISTRIBUTION", ""),
+                 architecture=env.get("ARCHITECTURE", ""),
+                 node_type=env.get("TARGET_NODE_TYPE", ""),
+                 planned_steps=len(plan))
+
+        # Rackscale NVLink SKUs rely on NVLINK_RACKSCALE=true, which packer sets
+        # (startswith "GB"/"VR") and the shared driver/tuning scripts read. Like
+        # bash, we don't derive it ourselves; but a manual build without it
+        # silently gets the non-rackscale driver path, so say so.
+        if cfg.gpu in RACKSCALE_GPUS and env.get("NVLINK_RACKSCALE", "").lower() != "true":
+            log_warn("resolve-config",
+                     f"NVLINK_RACKSCALE is not 'true' for {cfg.gpu}: the driver step "
+                     "will install fabric manager instead of IMEX/CDMM, as bash would "
+                     "(packer normally sets it for GB*/VR* SKUs)",
+                     gpu=cfg.gpu, nvlink_rackscale=env.get("NVLINK_RACKSCALE", ""))
 
         # --- Phase 2: bootstrap (system prep) ---
         # Runs install_utils.sh first; abort the build if it fails.
+        bootstrap_started = time.monotonic()
         rc = self._bootstrap(build_dir, env)
+        elapsed = time.monotonic() - bootstrap_started
         if rc != 0:
-            log_error("bootstrap", f"system prep failed with exit code {rc}")
+            log_error("bootstrap", f"system prep failed with exit code {rc} after {elapsed:.1f}s",
+                      exit_code=rc, duration_s=round(elapsed, 1))
             return 3
+        log_info("bootstrap", f"done in {elapsed:.1f}s", duration_s=round(elapsed, 1))
 
         # --- Phase 3: run each step of the plan, in order ---
-        for step in build_plan(cfg):
-            # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA)
+        # Counts for the summary line at the end.
+        counts = {"python": 0, "bash": 0, "skipped": 0}
+        for step in plan:
+            # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA).
+            # A skip that may hide a problem (e.g. install.sh for this distro
+            # never runs the script) is logged as a WARNING with the reason.
             if not step.when(cfg):
-                log_info(step.op, "skipped")
+                counts["skipped"] += 1
+                if step.skip_warning:
+                    log_warn(step.op, f"skipped: {step.skip_warning}",
+                             os=cfg.os, script=step.script)
+                else:
+                    log_info(step.op, "skipped: not applicable to this target")
                 continue
 
-            log_info(step.op, "starting")
+            # Record whether this step ran as Python or bash, so a failure in a
+            # real build can be traced to the right implementation.
+            runner = "python" if step.action is not None else "bash"
+            log_info(step.op, f"starting ({runner})", runner=runner, script=step.script)
+            step_started = time.monotonic()
 
             # (b) run it: a python action, or the bash script via exec_program.
             # A python action that raises (bad tarball, missing file, ...) is
             # turned into a normal rc=3 failure here, so an unexpected exception
             # can't escape as a traceback and break the documented exit codes.
+            # The traceback is still logged, as the error's detail block.
             try:
                 if step.action is not None:
                     rc = step.action(env)
@@ -364,17 +483,30 @@ class ImageBuilder:
                     rc = exec_program([str(base_dir / step.script), *step.args],
                                       step.op, cwd=str(build_dir), env=env)
             except Exception as exc:
-                log_error(step.op, f"unhandled error: {exc.__class__.__name__}: {exc}")
+                elapsed = time.monotonic() - step_started
+                log_error_detail(
+                    step.op,
+                    f"unhandled error after {elapsed:.1f}s: "
+                    f"{exc.__class__.__name__}: {exc}",
+                    traceback.format_exc(),
+                    runner=runner, duration_s=round(elapsed, 1))
                 return 3
 
             # (c) stop the whole build on the first failure
+            elapsed = time.monotonic() - step_started
             if rc != 0:
-                log_error(step.op, f"failed with exit code {rc}")
+                log_error(step.op, f"failed with exit code {rc} after {elapsed:.1f}s",
+                          runner=runner, exit_code=rc, duration_s=round(elapsed, 1))
                 return 3
-            log_info(step.op, "done")
+            counts[runner] += 1
+            log_info(step.op, f"done in {elapsed:.1f}s",
+                     runner=runner, duration_s=round(elapsed, 1))
 
         # --- Phase 4: every step passed ---
-        log_info("build-image", "Image built successfully")
+        total = time.monotonic() - build_started
+        log_info("build-image", f"Image built successfully in {total:.1f}s",
+                 duration_s=round(total, 1), python_steps=counts["python"],
+                 bash_steps=counts["bash"], skipped_steps=counts["skipped"])
         return 0
 
         

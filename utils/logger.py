@@ -5,6 +5,10 @@ Configuration (override via environment variables before import):
   LOG_LEVEL    debug | info | warn | error  (default: info)
   LOG_FILE     path                         (default: a timestamped file under LOG_DIR)
   RUN_ID       string         (default: ADO BUILD_BUILDID, else a UUID)
+
+Every log helper also accepts optional keyword fields for telemetry, e.g.
+    log_info("install-pmix", "Recorded version", component="PMIX", version="4.2.9")
+JSON records carry them under "data"; text records append them as key=value.
 """
 
 from __future__ import annotations
@@ -85,76 +89,115 @@ def _redact(s: str) -> str:
     s = _TOKENS.sub(r"\1[REDACTED]", s)
     return s
 
-def _log(level: str, op: str, message: str) -> None:
-    """Emit a single log record."""
-    # Skip anything below the configured LOG_LEVEL threshold.
-    if not _enabled(level):
-        return
+# Each structured field is also shown in text logs, as key=value. Values that
+# aren't plain JSON types (e.g. a Path) are converted with str().
+_JSON_TYPES = (str, int, float, bool, type(None))
 
-    message = _redact(message)
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _clean_fields(fields: dict) -> dict:
+    """Make extra fields safe to log: JSON-friendly values, secrets redacted."""
+    clean = {}
+    for key, value in fields.items():
+        if not isinstance(value, _JSON_TYPES):
+            value = str(value)
+        if isinstance(value, str):
+            value = _redact(value)
+        clean[key] = value
+    return clean
 
-    if LOG_FORMAT == "json":
-        line = json.dumps({
-            "ts": ts, "level": level, "op": op, "msg": message,
-            "run_id": RUN_ID, "implementation": IMPLEMENTATION,
-            "version": VERSION, "commit": BUILD_COMMIT,
-            "vendor": VENDOR, "gpu": GPU, "os": OS,
-            "fips": FIPS == "true",
-        }, separators=(",", ":"))
-        line_raw = line
-    else:
-        upper = level.upper()
-        ts_short = ts[11:19]  # HH:MM:SS
 
-        lvl_pretty = upper
-        if sys.stdout.isatty() and level in _COLORS:
-            lvl_pretty = f"{_COLORS[level]}{upper}{_RESET}"
-
-        line = f"{ts_short}  {lvl_pretty:<14}  {op:<14} | {message}"
-        line_raw = f"{ts}  {upper:<5}  {op:<14} | {message}"
-
+def _write(line: str, line_raw: str) -> None:
+    """Print `line` and append `line_raw` (no colors, full timestamp) to LOG_FILE."""
     print(line)
     if LOG_FILE:
-        # File gets the uncolored, full-timestamp version. If the log file isn't
-        # writable (e.g. /var/log/azhpc without root), degrade gracefully —
-        # keep printing to the screen instead of crashing the caller.
+        # If the log file isn't writable (e.g. /var/log/azhpc without root),
+        # degrade gracefully — keep printing instead of crashing the caller.
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as fh:
                 fh.write(line_raw + "\n")
         except OSError:
             pass
 
-def log_info(op: str, message: str) -> None:
-    """INFO: a high-level operation."""
-    _log("info", op, message)
 
+def _log(level: str, op: str, message: str, fields: dict | None = None,
+         detail: str | None = None) -> None:
+    """Emit a single log record.
 
-def log_warn(op: str, message: str) -> None:
-    """WARN: unexpected, but the build continues."""
-    _log("warn", op, message)
+    `fields` are optional structured values (e.g. component="pmix",
+    version="4.2.9"). In JSON they go under "data" so a log query can filter on
+    them; in text they're appended as key=value. `detail` is an optional
+    multi-line block (command output, a stack trace), shown under the message.
+    """
+    # Skip anything below the configured LOG_LEVEL threshold.
+    if not _enabled(level):
+        return
 
+    message = _redact(message)
+    fields = _clean_fields(fields or {})
+    if detail is not None:
+        detail = _redact(detail)
 
-def log_debug(op: str, message: str) -> None:
-    """DEBUG: only emitted when LOG_LEVEL=debug."""
-    _log("debug", op, message)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-def log_error(op: str, message: str) -> None:
-    """ERROR: caller decides whether to exit."""
-    _log("error", op, message)
-
-
-def log_error_detail(op: str, message: str, detail: str) -> None:
-    """ERROR plus a multi-line detail block (stderr / stack trace)."""
     if LOG_FORMAT == "json":
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        print(json.dumps({
-            "ts": ts, "level": "error", "op": op,
-            "msg": _redact(message), "error_detail": _redact(detail),
-        }, separators=(",", ":")))
-    else:
-        log_error(op, message)
-        for ln in detail.splitlines():
-            print(f"    | {ln}")
+        record = {
+            "ts": ts, "level": level, "op": op, "msg": message,
+            "run_id": RUN_ID, "implementation": IMPLEMENTATION,
+            "version": VERSION, "commit": BUILD_COMMIT,
+            "vendor": VENDOR, "gpu": GPU, "os": OS,
+            "fips": FIPS == "true",
+        }
+        if fields:
+            record["data"] = fields
+        if detail is not None:
+            record["error_detail"] = detail
+        line = json.dumps(record, separators=(",", ":"))
+        _write(line, line)
+        return
+
+    upper = level.upper()
+    ts_short = ts[11:19]  # HH:MM:SS
+
+    lvl_pretty = upper
+    if sys.stdout.isatty() and level in _COLORS:
+        lvl_pretty = f"{_COLORS[level]}{upper}{_RESET}"
+
+    suffix = ""
+    if fields:
+        suffix = "  [" + " ".join(f"{key}={value}" for key, value in fields.items()) + "]"
+
+    _write(f"{ts_short}  {lvl_pretty:<14}  {op:<14} | {message}{suffix}",
+           f"{ts}  {upper:<5}  {op:<14} | {message}{suffix}")
+    for detail_line in (detail or "").splitlines():
+        _write(f"    | {detail_line}", f"    | {detail_line}")
+
+
+# Every helper takes optional keyword fields, e.g.
+#     log_info("install-pmix", "Installing PMIx", version="4.2.9", distro="ubuntu24.04")
+def log_info(op: str, message: str, **fields) -> None:
+    """INFO: a high-level operation."""
+    _log("info", op, message, fields)
+
+
+def log_warn(op: str, message: str, **fields) -> None:
+    """WARN: unexpected, but the build continues."""
+    _log("warn", op, message, fields)
+
+
+def log_debug(op: str, message: str, **fields) -> None:
+    """DEBUG: only emitted when LOG_LEVEL=debug."""
+    _log("debug", op, message, fields)
+
+
+def log_error(op: str, message: str, **fields) -> None:
+    """ERROR: caller decides whether to exit."""
+    _log("error", op, message, fields)
+
+
+def log_error_detail(op: str, message: str, detail: str, **fields) -> None:
+    """ERROR plus a multi-line detail block (command output, stack trace).
+
+    JSON records carry the same run/vendor/os fields as every other record, and
+    both formats are written to LOG_FILE, detail included.
+    """
+    _log("error", op, message, fields, detail)

@@ -1,0 +1,16 @@
+[Unit]
+Description=Customizations based on SKU
+After=network-online.target openibd.service rdma-hw.target
+Wants=network-online.target
+After=nvidia-fabricmanager.service
+Wants=nvidia-fabricmanager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/setup_sku_customizations.sh
+ExecStop=/usr/sbin/remove_sku_customizations.sh
+RemainAfterExit=true
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

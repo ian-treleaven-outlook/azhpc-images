@@ -53,12 +53,16 @@ class RunCaptureTests(unittest.TestCase):
     def test_returns_nonzero_code_with_partial_stdout(self):
         """A failing command still returns its exit code and whatever stdout it produced."""
         with mock.patch.object(process.subprocess, "run",
-                               return_value=_completed(1, stdout="partial")), \
-             mock.patch.object(process, "log_error") as logged:
+                               return_value=_completed(1, stdout="partial", stderr="E: boom")), \
+             mock.patch.object(process, "log_error_detail") as logged:
             rc, out = run_capture(["ofed_info"], "test")
         self.assertEqual(rc, 1)
         self.assertEqual(out, "partial")
-        logged.assert_called_once()   # a nonzero exit is reported as an error
+        # A nonzero exit is reported as an error, with the command's last output
+        # lines as detail, so the cause is visible at the default INFO level.
+        logged.assert_called_once()
+        self.assertIn("E: boom", logged.call_args[0][2])
+        self.assertEqual(logged.call_args.kwargs["exit_code"], 1)
 
     def test_only_stdout_is_returned_not_stderr(self):
         """stderr is logged but must not be folded into the parsed output."""
@@ -77,6 +81,55 @@ class RunCaptureTests(unittest.TestCase):
         self.assertEqual(rc, 127)
         self.assertEqual(out, "")
         logged.assert_called_once()   # a launch failure is reported as an error
+
+
+# exec_program's telemetry: every command ends with one line saying how it went.
+# These run tiny real commands (bash is always present where the suite runs).
+@unittest.skipUnless(os.name == "posix", "runs real POSIX commands")
+class ExecProgramTelemetryTests(unittest.TestCase):
+    def test_success_logs_exit_code_and_duration(self):
+        with mock.patch.object(process, "log_info") as info:
+            rc = process.exec_program(["bash", "-c", "echo hello"], "test")
+        self.assertEqual(rc, 0)
+        finished = info.call_args_list[-1]
+        self.assertIn("succeeded", finished.args[1])
+        self.assertEqual(finished.kwargs["exit_code"], 0)
+        self.assertIn("duration_s", finished.kwargs)
+
+    def test_failure_logs_the_last_output_lines_as_error_detail(self):
+        # 60 lines of output, then fail: only the last 50 are kept as detail.
+        script = "for i in $(seq 1 60); do echo line-$i; done; echo 'E: broken' >&2; exit 4"
+        with mock.patch.object(process, "log_error_detail") as logged:
+            rc = process.exec_program(["bash", "-c", script], "test")
+        self.assertEqual(rc, 4)
+        logged.assert_called_once()
+        message, detail = logged.call_args.args[1], logged.call_args.args[2]
+        self.assertIn("exit code 4", message)
+        self.assertIn("E: broken", detail)          # stderr is folded in
+        self.assertIn("line-60", detail)
+        self.assertNotIn("line-10\n", detail + "\n")  # oldest lines dropped
+        self.assertEqual(len(detail.splitlines()), 50)
+        self.assertEqual(logged.call_args.kwargs["exit_code"], 4)
+
+    def test_expected_failure_is_logged_at_info_not_error(self):
+        # A probe like `dnf list installed <pkg>` exits non-zero to say "no".
+        with mock.patch.object(process, "log_error_detail") as error, \
+             mock.patch.object(process, "log_info") as info:
+            rc = process.exec_program(["bash", "-c", "exit 1"], "test",
+                                      failure_is_error=False)
+        self.assertEqual(rc, 1)
+        error.assert_not_called()
+        finished = info.call_args_list[-1]
+        self.assertIn("expected answer", finished.args[1])
+        self.assertEqual(finished.kwargs["exit_code"], 1)
+
+    def test_run_capture_expected_failure_is_not_an_error(self):
+        with mock.patch.object(process.subprocess, "run", return_value=_completed(1)), \
+             mock.patch.object(process, "log_error_detail") as error:
+            rc, _ = run_capture(["dnf", "list", "installed", "x"], "test",
+                                failure_is_error=False)
+        self.assertEqual(rc, 1)
+        error.assert_not_called()
 
 
 # A build step can run for half an hour (make, apt). If someone Ctrl-Cs the CLI, or

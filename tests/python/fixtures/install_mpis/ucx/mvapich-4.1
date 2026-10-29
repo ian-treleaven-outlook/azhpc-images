@@ -1,0 +1,14 @@
+#%Module 1.0
+#
+#  MVAPICH 4.1
+#
+conflict        mpi
+prepend-path    PATH            /opt/mvapich-4.1/bin
+prepend-path    LD_LIBRARY_PATH /opt/mvapich-4.1/lib:/opt/hpcx-v2.25.1-gcc-doca_ofed-ubuntu24.04-cuda13-x86_64/ucx/lib
+prepend-path    MANPATH         /opt/mvapich-4.1/share/man
+setenv          MPI_BIN         /opt/mvapich-4.1/bin
+setenv          MPI_INCLUDE     /opt/mvapich-4.1/include
+setenv          MPI_LIB         /opt/mvapich-4.1/lib
+setenv          MPI_MAN         /opt/mvapich-4.1/share/man
+setenv          MPI_HOME        /opt/mvapich-4.1
+

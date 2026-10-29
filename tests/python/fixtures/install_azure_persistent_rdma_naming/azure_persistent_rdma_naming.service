@@ -1,0 +1,12 @@
+[Unit]
+Description=Azure persistent RDMA naming
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/azure_persistent_rdma_naming.sh
+RemainAfterExit=true
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

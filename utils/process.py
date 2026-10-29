@@ -16,11 +16,17 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import time
+from collections import deque
 
-from utils.logger import log_info, log_debug, log_warn, log_error
+from utils.logger import log_info, log_debug, log_warn, log_error, log_error_detail
 
 # How long to wait for a child to exit after SIGTERM before escalating.
 _GRACE_SECONDS = 5
+
+# How many of a command's last output lines to keep. On failure they are logged
+# at error level, so the cause is visible even when debug output is switched off.
+_TAIL_LINES = 50
 
 
 def _kill_process_group(proc: subprocess.Popen, op: str) -> None:
@@ -55,17 +61,22 @@ def _kill_process_group(proc: subprocess.Popen, op: str) -> None:
         pass                                    # exited between poll and killpg
 
 
-def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None) -> int:
+def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = None,
+                 failure_is_error: bool = True) -> int:
     """Run an external program, streaming and logging its output.
 
     stdout and stderr are merged and read line-by-line so each line is logged
     (at debug/verbose level) as it is produced. Returns the program's exit code,
     or 127 if it could not be executed.
 
+    Pass failure_is_error=False when a non-zero exit is a normal answer rather
+    than a failure (see _log_result), so build logs don't show a false ERROR.
+
     If we're interrupted (Ctrl-C) or terminated while the child is running, the
     child's whole process group is torn down before we exit.
     """
     log_info(op, f"Running command: {' '.join(command)}")
+    started = time.monotonic()
 
     try:
         proc = subprocess.Popen(
@@ -81,7 +92,8 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
         # The program could not be started at all (no return code exists).
-        log_error(op, f"Failed to execute {' '.join(command)}: {exc}")
+        log_error(op, f"Failed to execute {' '.join(command)}: {exc}",
+                  command=command[0], exit_code=127)
         return 127
 
     def _on_signal(signum, _frame):
@@ -103,6 +115,10 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
     except ValueError:
         previous.clear()
 
+    # The last few output lines, kept so a failure can show them (see below).
+    # A deque with maxlen drops the oldest line once it is full.
+    tail: deque[str] = deque(maxlen=_TAIL_LINES)
+
     try:
         # Stream output live: each line is logged as soon as it arrives.
         assert proc.stdout is not None
@@ -113,6 +129,7 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
             text = line.split("\r")[-1].rstrip()
             if text:
                 log_debug(op, text)
+                tail.append(text)
 
         returncode = proc.wait()
     finally:
@@ -122,15 +139,44 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
         # the caller giving up on us. Never leave the child running.
         _kill_process_group(proc, op)
 
-    log_debug(op, f"Command exited with code {returncode}")
-
-    if returncode != 0:
-        log_error(op, f"Command failed with exit code {returncode}")
-
+    _log_result(op, command, returncode, time.monotonic() - started, tail,
+                failure_is_error)
     return returncode
 
 
-def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None) -> tuple[int, str]:
+def _log_result(op: str, command: list[str], returncode: int, elapsed: float,
+                tail, failure_is_error: bool = True) -> None:
+    """Log how a finished command went, for build telemetry.
+
+    Success is one INFO line with the exit code and duration. Failure is an
+    ERROR that includes the command's last output lines, so the cause shows up
+    even at the default INFO level, when the full output was only logged at
+    debug level.
+
+    With failure_is_error=False the caller is asking a yes/no question (e.g.
+    "is this package installed?"), so a non-zero exit is an answer, not a
+    failure: it is logged at INFO instead, and nothing shows up as an ERROR.
+    """
+    fields = {"command": command[0], "exit_code": returncode,
+              "duration_s": round(elapsed, 1)}
+    if returncode == 0:
+        log_info(op, f"Command succeeded in {elapsed:.1f}s: {command[0]}", **fields)
+        return
+    if not failure_is_error:
+        log_info(op, f"Command exited with code {returncode} after {elapsed:.1f}s "
+                     f"(an expected answer for this check): {' '.join(command)}",
+                 **fields)
+        return
+    log_error_detail(
+        op,
+        f"Command failed with exit code {returncode} after {elapsed:.1f}s: "
+        f"{' '.join(command)}",
+        "\n".join(tail) if tail else "(no output)",
+        **fields)
+
+
+def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None,
+                failure_is_error: bool = True) -> tuple[int, str]:
     """Run an external program and return its exit code *and* captured stdout.
 
     Unlike exec_program (which streams output to the log and returns only the
@@ -138,8 +184,12 @@ def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None
     commands whose output is data, e.g. `ofed_info` or `apt-cache show openmpi`.
     stderr is kept separate (logged, not returned) so it can't corrupt the parse.
     Returns (127, "") if the program could not be executed.
+
+    Pass failure_is_error=False when a non-zero exit is a normal answer (a
+    probe such as `dnf list installed <pkg>`), so it isn't logged as an ERROR.
     """
     log_info(op, f"Running command: {' '.join(command)}")
+    started = time.monotonic()
 
     try:
         proc = subprocess.run(
@@ -151,18 +201,19 @@ def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
         # The program could not be started at all (no return code exists).
-        log_error(op, f"Failed to execute {' '.join(command)}: {exc}")
+        log_error(op, f"Failed to execute {' '.join(command)}: {exc}",
+                  command=command[0], exit_code=127)
         return (127, "")
 
     # Log everything the command produced (stdout + stderr) at debug level, but
     # only stdout is returned for parsing.
+    tail: deque[str] = deque(maxlen=_TAIL_LINES)
     for stream in (proc.stdout, proc.stderr):
         for line in (stream or "").splitlines():
             if line.strip():
                 log_debug(op, line.rstrip())
+                tail.append(line.rstrip())
 
-    log_debug(op, f"Command exited with code {proc.returncode}")
-    if proc.returncode != 0:
-        log_error(op, f"Command failed with exit code {proc.returncode}")
-
+    _log_result(op, command, proc.returncode, time.monotonic() - started, tail,
+                failure_is_error)
     return (proc.returncode, proc.stdout or "")

@@ -26,7 +26,7 @@ from utils import package_manager
 from utils import package_installer
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_cuda_samples, install_nvbandwidth_tool, install_aznfs
+from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs
 
 
 # detect_package_manager() finds a manager by calling shutil.which on each candidate.
@@ -175,39 +175,46 @@ class MpifileutilsDepsTests(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
+# install_nccl.install_deps runs install_nccl.sh's exact apt/dnf commands (one
+# command per bash line, stopping at the first failure), chosen by DISTRIBUTION.
 class NcclDepsTests(unittest.TestCase):
-    def _fake_installer(self, manager_name, succeeds=True):
-        fake = mock.Mock()
-        fake.manager = (None if manager_name is None
-                        else PackageManager(name=manager_name,
-                                            path=f"/usr/bin/{manager_name}"))
-        fake.install_package.return_value = succeeds
-        return fake
+    def _deps(self, distro, rc=0):
+        with mock.patch.object(install_nccl, "exec_program", return_value=rc) as run, \
+             mock.patch.object(install_nccl, "log_info"), \
+             mock.patch.object(install_nccl, "log_error"):
+            result = install_nccl.install_deps(env={"DISTRIBUTION": distro})
+        return result, [c.args[0] for c in run.call_args_list]
 
-    def test_selects_apt_dep_list(self):
-        fake = self._fake_installer("apt-get")
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
+    def test_ubuntu_commands(self):
+        # libibverbs-dev is deliberately not installed (commented out in bash).
+        for distro in ("ubuntu22.04", "ubuntu24.04"):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["apt", "install", "-y", "build-essential", "devscripts",
+                     "debhelper", "fakeroot", "patchelf"],
+                    ["apt", "install", "-y", "zlib1g-dev"]])
+
+    def test_azure_linux_commands(self):
+        rc, commands = self._deps("azurelinux3.0")
         self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["build-essential", "devscripts", "debhelper", "fakeroot",
-             "zlib1g-dev", "libibverbs-dev"]
-        )
+        self.assertEqual(commands, [
+            ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "autoconf",
+             "automake", "git", "libtool", "patchelf"]])
 
-    def test_selects_rpm_dep_list(self):
-        fake = self._fake_installer("tdnf")
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
-        self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["rpm-build", "rpmdevtools", "autoconf", "automake", "git", "libtool"]
-        )
+    def test_rhel_family_commands(self):
+        for distro in ("almalinux9.8", "rocky8.10", ""):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "patchelf"]])
 
-    def test_returns_3_when_no_manager(self):
-        fake = self._fake_installer(None)
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
+    def test_failure_returns_3_and_stops(self):
+        rc, commands = self._deps("ubuntu24.04", rc=100)
         self.assertEqual(rc, 3)
+        self.assertEqual(len(commands), 1)        # zlib1g-dev not attempted
 
 
 # Pure string parsing, no mocks needed — parse_openmpi_version digs the version out of
@@ -545,66 +552,6 @@ class MonitoringToolsTests(unittest.TestCase):
         with mock.patch.object(install_monitoring_tools, "log_error") as logged:
             self.assertEqual(
                 install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
-
-
-class CudaSamplesTests(unittest.TestCase):
-    def _env(self):
-        return {
-            "COMPONENT_VERSIONS": json.dumps({
-                "cuda": {"common": {
-                    "driver": {"version": "12.4"},
-                    "samples": {"version": "12.4.1", "sha256": "s"},
-                }}
-            }),
-            "DISTRIBUTION": "ubuntu24.04",
-            "ARCHITECTURE": "x86_64",
-            "GPU": "NVIDIA",
-            "SKU": "A100",
-            "TARGET_NODE_TYPE": "azure_vm_regular",
-        }
-
-    def test_get_config_resolves_samples_version(self):
-        self.assertEqual(
-            install_cuda_samples.config_for("cuda", self._env())["samples"]["version"], "12.4.1")
-
-    def test_install_runs_all_build_steps(self):
-        env = self._env()
-        with mock.patch.object(install_cuda_samples, "download_and_verify",
-                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz") as dl, \
-             mock.patch.object(install_cuda_samples, "exec_program", return_value=0) as ex, \
-             mock.patch("tarfile.open"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("os.path.exists", return_value=False), \
-             mock.patch("shutil.move") as mv, \
-             mock.patch("shutil.rmtree"):
-            rc = install_cuda_samples.install(env)
-        self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        self.assertEqual(ex.call_count, 2)  # cmake, make
-        mv.assert_called_once()
-
-    def test_install_stops_on_build_failure(self):
-        env = self._env()
-        with mock.patch.object(install_cuda_samples, "download_and_verify",
-                               return_value="/tmp/cuda-samples-build/v12.4.1.tar.gz"), \
-             mock.patch.object(install_cuda_samples, "exec_program",
-                               side_effect=[0, 1]) as ex, \
-             mock.patch.object(install_cuda_samples, "log_error") as logged, \
-             mock.patch("tarfile.open"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("shutil.move") as mv, \
-             mock.patch("shutil.rmtree"):
-            rc = install_cuda_samples.install(env)
-        self.assertEqual(rc, 3)
-        self.assertEqual(ex.call_count, 2)  # stopped after make failed
-        mv.assert_not_called()
-        logged.assert_called()   # build failure is reported as an error
-
-    def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_cuda_samples, "log_error") as logged:
-            self.assertEqual(
-                install_cuda_samples.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
 

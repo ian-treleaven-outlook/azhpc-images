@@ -44,6 +44,7 @@ REQUIRED:
                             paths are marked (*); others use the generic path.
                                 NVidia : GB200* | GB300* | NCv6* | V100*
                                         A100 | H100 | H200 | VR200
+                                        (VR200 is built as GB200, as in bash)
                                 AMD    : MI300 | MI400 | MI500
     --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
                                     Alma9 | Alma8 | Rocky9 | Rocky8
@@ -112,7 +113,7 @@ def cmd_install(args_list) -> int:
 def cmd_versions(args_list) -> int:
     """`azhpc versions --os <OS> --vendor <V> --gpu <SKU>` — print the resolved
     component versions for a target without building anything."""
-    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS, build_sku
     from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_report import resolve_report, format_report
 
@@ -142,9 +143,10 @@ def cmd_versions(args_list) -> int:
     distribution = DISTRO_DIRS[ns.os].split("/")[-1]
     report = resolve_report(
         versions, distribution=distribution, architecture=ns.arch,
-        gpu=GPU_ARGS[ns.vendor], sku=ns.gpu, node_type=ns.node_type,
+        gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
     )
-    print(f"# Resolved component versions for {ns.vendor}/{ns.gpu} "
+    built_as = "" if build_sku(ns.gpu) == ns.gpu else f" (built as {build_sku(ns.gpu)})"
+    print(f"# Resolved component versions for {ns.vendor}/{ns.gpu}{built_as} "
           f"on {ns.os} ({ns.arch}, {ns.node_type})")
     print(format_report(report))
     return 0
@@ -152,7 +154,7 @@ def cmd_versions(args_list) -> int:
 def cmd_validate(args_list) -> int:
     """`azhpc validate --os <OS> --vendor <V> --gpu <SKU>` — check versions.json
     for internal consistency for a target. Exit 0 if clean, 1 if issues."""
-    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS
+    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS, build_sku
     from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_validate import check_cuda_consistency
 
@@ -182,9 +184,10 @@ def cmd_validate(args_list) -> int:
     distribution = DISTRO_DIRS[ns.os].split("/")[-1]
     issues = check_cuda_consistency(
         versions, distribution=distribution, architecture=ns.arch,
-        gpu=GPU_ARGS[ns.vendor], sku=ns.gpu, node_type=ns.node_type,
+        gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
     )
-    target = f"{ns.vendor}/{ns.gpu} on {ns.os} ({ns.arch}, {ns.node_type})"
+    built_as = "" if build_sku(ns.gpu) == ns.gpu else f" (built as {build_sku(ns.gpu)})"
+    target = f"{ns.vendor}/{ns.gpu}{built_as} on {ns.os} ({ns.arch}, {ns.node_type})"
     if not issues:
         print(f"OK: no version-consistency issues for {target}")
         return 0

@@ -1,0 +1,14 @@
+#%Module 1.0
+#
+#  OpenMPI 5.0.10
+#
+conflict        mpi
+prepend-path    PATH            /opt/openmpi-5.0.10/bin
+prepend-path    LD_LIBRARY_PATH /opt/openmpi-5.0.10/lib:/opt/hpcx-v2.25.1-gcc-doca_ofed-ubuntu24.04-cuda13-x86_64/hcoll/lib:/opt/hpcx-v2.25.1-gcc-doca_ofed-ubuntu24.04-cuda13-x86_64/ucx/lib
+prepend-path    MANPATH         /opt/openmpi-5.0.10/share/man
+setenv          MPI_BIN         /opt/openmpi-5.0.10/bin
+setenv          MPI_INCLUDE     /opt/openmpi-5.0.10/include
+setenv          MPI_LIB         /opt/openmpi-5.0.10/lib
+setenv          MPI_MAN         /opt/openmpi-5.0.10/share/man
+setenv          MPI_HOME        /opt/openmpi-5.0.10
+

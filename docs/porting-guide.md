@@ -5,9 +5,11 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **10 run natively in Python, 26
-still shell out to bash.** Each remaining script is an independent,
-self-contained task — claim the ADO task, port it, open a PR.
+[`azhpc.py`](../azhpc.py#L192), has 35 steps; **all 35 run natively in Python.**
+Each bash script is kept as that step's fallback and parity reference: delete a
+Step's `action=` and it runs the bash script again. The plan mirrors
+`distros/ubuntu24.04/install.sh`; the other distros' `install.sh` scripts still
+differ from it in places (see §12).
 
 > Much of the design rationale here comes from Gio Martinez's project
 > presentation, *Azure HPC Images Python Refactor* (Aug 2026). He designed and
@@ -148,6 +150,8 @@ Everything you need exists. Use these rather than rolling your own.
 | Run an external command | `utils.process` | `exec_program(command: list[str], op, *, cwd=None, env=None) -> int` |
 | Run and capture stdout | `utils.process` | `run_capture(command: list[str], op, *, cwd=None, env=None) -> tuple[int, str]` |
 | Install distro packages | `utils.package_installer` | `PackageInstaller().install_package(packages) -> bool` |
+| Pin packages against dnf updates (bash `dnf_pin_packages`) | `utils.package_pinning` | `dnf_pin_packages(packages, op, env=None) -> bool` |
+| SKU network mode / IPoIB (bash `sku_network_mode`, `sku_uses_ipoib`) | `utils.sku` | `sku_network_mode(sku, node_type)`, `sku_uses_ipoib(sku, node_type)`, `sku_uses_ucx(sku)` |
 | Logging | `utils.logger` | `log_info(op, msg)` · `log_warn(op, msg)` · `log_error(op, msg)` · `log_debug(op, msg)` · `log_error_detail(op, msg, detail)` |
 
 ---
@@ -273,6 +277,51 @@ In a pipeline it emits JSON automatically, and `run_id` is the ADO build ID — 
 a log line traces straight back to the build that produced it. Every line also
 carries vendor/GPU/OS for filtering across concurrent builds.
 
+### What the framework logs for you
+
+- **Every command** (`exec_program` / `run_capture`): `Running command: ...` at
+  INFO, its output at DEBUG, then one closing line with `exit_code` and
+  `duration_s`. On failure that line is an ERROR whose detail block holds the
+  command's **last 50 output lines**, so the real cause (e.g.
+  `E: Unable to locate package foo`) is visible at the default INFO level.
+- **Every step** (`build()`): `starting (python|bash)`, then `done in Ns` or the
+  failure, with `runner`, `exit_code` and `duration_s` fields. An unexpected
+  exception is logged with its traceback as the detail block.
+- **The run**: a first line with vendor, GPU, OS, distribution, architecture,
+  node type and planned step count; a last line with total duration and how
+  many steps ran as Python, as bash, or were skipped.
+
+### Structured fields
+
+Every log helper takes optional keyword fields:
+
+```python
+log_info(_OP, "Recorded version", component="PMIX", version=version)
+```
+
+JSON puts them under `"data"` (so a log query can filter on them); text appends
+`[component=PMIX version=4.2.9]`. Values are redacted like messages.
+
+### What a port should log
+
+The aim: from the INFO log alone, someone can tell what a step did to the
+image, and why it chose to.
+
+- **Start:** what is being installed and the resolved inputs —
+  `log_info(_OP, "Installing X", version=..., distro=..., source=url)`.
+- **Decisions:** which branch was taken and why (distro handler, vendor, a
+  skipped optional part), and any rerun/parity quirk worth a `log_warn`.
+- **Changes to the system:** each file written or edited — path, and whether it
+  was created, appended to or replaced — plus services enabled/started,
+  symlinks, packages pinned or held.
+- **Results:** every `write_component_version` value, and a closing
+  `log_info(_OP, "X installed", ...)` summary.
+- **Failures:** `log_error` with what failed and the values involved (path,
+  command, expected vs found). Don't repeat a command failure that
+  `exec_program` has already logged; add the *consequence* instead.
+- Use `log_debug` for bulky detail (parsed listings, full file contents).
+  Never log secrets; redaction is a safety net, not a licence.
+
 ---
 
 ## 8. Worked example
@@ -354,7 +403,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **150 tests, ~standard library only** — `unittest` and
+The suite is **857 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:
@@ -404,50 +453,31 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Remaining work — the 26 unported steps
+## 12. Status — every step ported
 
-Each row is one ADO task, ordered as they appear in `build_plan()`.
+All 35 steps have a Python `action=`. Nested component scripts that a ported
+step calls (e.g. `install_gdrcopy.sh`, `install_nvidia_fabric_manager.sh`,
+`configure_nvidia_persistence.sh`, `install_nvidia_container_toolkit.sh`,
+`install_azure_persistent_rdma_naming_monitor.sh`) still run as bash, invoked
+by the Python step exactly as the bash step did; `install_cuda_samples` runs as
+its Python port, called by both driver steps.
 
-| # | Step (`op`) | Script |
-|---|---|---|
-| 1 | `install-pmix` | `install_pmix.sh` |
-| 2 | `install-mpis` | `install_mpis.sh` |
-| 3 | `install-nv-driver-gb200` | `install_nvidiagpudriver_gb200.sh` |
-| 4 | `install-nvshmem` | `install_nvshmem.sh` |
-| 5 | `install-nvloom` | `install_nvloom.sh` |
-| 6 | `install-nv-grid` | `install_nvidiagriddriver.sh` |
-| 7 | `install-nv-driver` | `install_nvidiagpudriver.sh` |
-| 8 | `install-nccl` | `install_nccl.sh` |
-| 9 | `install-docker` | `install_docker.sh` |
-| 10 | `install-dcgm` | `install_dcgm.sh` |
-| 11 | `install-rocm` | `install_rocm.sh` |
-| 12 | `install-rccl` | `install_rccl.sh` |
-| 13 | `install-lustre` | `install_lustre_client.sh` |
-| 14 | `install-amd-libs` | `install_amd_libs.sh` |
-| 15 | `install-dynolog-drl` | `install_dynolog_drl.sh` |
-| 16 | `hpc-tuning` | `hpc-tuning.sh` |
-| 17 | `install-waagent` | `install_waagent.sh` |
-| 18 | `install-persistent-rdma-naming` | `install_azure_persistent_rdma_naming.sh` |
-| 19 | `install-health-checks` | `install_health_checks.sh` |
-| 20 | `add-udev-rules` | `add-udev-rules.sh` |
-| 21 | `copy-test-file` | `copy_test_file.sh` |
-| 22 | `disable-cloudinit` | `disable_cloudinit.sh` |
-| 23 | `setup-sku-customizations` | `setup_sku_customizations.sh` |
-| 24 | `trivy-scan` | `trivy_scan.sh` |
-| 25 | `disable-auto-upgrade` | `disable_auto_upgrade.sh` |
-| 26 | `disable-predictive-interface-renaming` | `disable_predictive_interface_renaming.sh` |
+`install-nv-driver` covers GB200/GB300 (and VR200, built as GB200) too, as in
+bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, and
+the shared script switches to IMEX/CDMM when `NVLINK_RACKSCALE=true` (packer sets
+it for GB*/VR* SKUs).
 
-**Already ported (study these):** `install-doca`, `install-libfabric`,
-`install-nvbandwidth`, `install-mpifileutils`, `install-intel-libs`,
-`cleanup-downloads`, `install-aznfs`, `install-hpcdiag`,
-`install-monitoring-tools`, `write-kernel-os-version`.
+### Known gap: distros other than Ubuntu 24.04
 
-### Suggested starting points
-
-New to the codebase? Take `add-udev-rules`, `copy-test-file`, or
-`disable-cloudinit` — small and self-contained.
-The GPU driver steps (`install-nv-driver`, `install-rocm`) are the most
-involved; save those until you've done one of the others.
+`build_plan()` follows `distros/ubuntu24.04/install.sh`. The other distros'
+`install.sh` scripts differ from it in which component scripts they run — for
+example Azure Linux uses `install_mofed.sh` instead of `install_doca.sh` and
+doesn't run `install_lustre_client.sh`; AlmaLinux and Rocky don't run
+`add-udev-rules.sh` (Rocky also skips `install_dynolog_drl.sh`) and run extra
+scripts such as `network-config.sh`. `DISTRO_DIRS` also names
+`almalinux9.7`/`rocky9.7` directories that don't exist (they are `9.x`).
+Only the Ubuntu-only and Azure Linux cloud-init skips are handled so far; the
+rest needs per-distro plans before RPM builds use the Python path.
 
 ---
 

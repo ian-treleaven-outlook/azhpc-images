@@ -1,0 +1,14 @@
+#%Module 1.0
+#
+#  Intel MPI 2021.16
+#
+conflict        mpi
+module load /opt/intel/oneapi/mpi/2021.16/etc/modulefiles/impi/2021.16
+setenv          MPI_BIN         /opt/intel/oneapi/mpi/2021.16/bin
+setenv          MPI_INCLUDE     /opt/intel/oneapi/mpi/2021.16/include
+setenv          MPI_LIB         /opt/intel/oneapi/mpi/2021.16/lib
+setenv          MPI_MAN         /opt/intel/oneapi/mpi/2021.16/share/man
+setenv          MPI_HOME        /opt/intel/oneapi/mpi/2021.16
+setenv          FI_PROVIDER     mlx
+# see https://community.intel.com/t5/Intel-MPI-Library/Suspected-unfixed-Intel-MPI-race-condition-in-collectives/td-p/1693452 for Intel MPI bug
+setenv          I_MPI_STARTUP_MODE         pmi_shm

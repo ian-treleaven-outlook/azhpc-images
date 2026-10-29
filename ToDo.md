@@ -6,9 +6,14 @@ item 3 was found while writing the contributor guide.
 
 ---
 
-## 1. `install_rocm.sh` ordering diverges from `install.sh` (AMD path)
+## 1. `install_rocm.sh` ordering diverges from `install.sh` (AMD path) — RESOLVED
 
-**What's wrong**
+Fixed on `port/batch-2`: `build_plan()` now runs `install-rocm` right after
+DOCA/libfabric and before `install-pmix`, as `install.sh` does, and
+`tests/python/test_build_plan.py` checks ordered parity for MI300, NCv6, H100 and
+GB200 as well as A100. The original write-up follows for reference.
+
+**What was wrong**
 
 `build_plan()` in `utils/build_config.py` schedules ROCm inside the AMD branch,
 *after* `install-dcgm`:
@@ -42,10 +47,11 @@ It was left alone to keep that change scoped to the actual regressions.
 
 **Action**
 
-- [ ] Move `install-rocm` ahead of `install-pmix` in `build_plan()`
-- [ ] Add an ordered-subsequence parity test for the AMD/MI300 plan, mirroring
+- [x] Move `install-rocm` ahead of `install-pmix` in `build_plan()`
+- [x] Add an ordered-subsequence parity test for the AMD/MI300 plan, mirroring
       `test_a100_plan_is_ordered_subsequence_of_install_sh`
-- [ ] Re-check the other non-A100 plans (NCv6, GB200) for the same blind spot
+- [x] Re-check the other non-A100 plans (NCv6, H100 and GB200 now checked; GB200
+      now uses the shared driver script, as `install.sh` does)
 
 ---
 
@@ -86,9 +92,16 @@ consequences for upstream submission.
 
 ---
 
-## 3. `install_cuda_samples` is ported but orphaned
+## 3. `install_cuda_samples` is ported but orphaned — RESOLVED
 
-**What's odd**
+Not dead code: `install_nvidiagpudriver.sh` and `install_nvidiagriddriver.sh`
+call `install_cuda_samples.sh` themselves (that's why no `install.sh` or `Step`
+runs it). On `port/batch-3`, both driver ports call
+`install_cuda_samples.install(env)` at the same point, and the module was
+brought up to the current bash and the logging standard. The original
+write-up follows for reference.
+
+**What was odd**
 
 `components/python/install_cuda_samples.py` exists and exposes a complete
 `install(env)`. Its bash counterpart `components/install_cuda_samples.sh` also
@@ -104,12 +117,11 @@ intent is unclear.
 
 **Action**
 
-- [ ] Determine whether `install_cuda_samples.sh` is dead code upstream, or is
-      meant to run on some path that currently misses it
-- [ ] If it should run: add a `Step` with the correct `when=` gate and wire
-      `action=install_cuda_samples.install`
-- [ ] If it is genuinely dead: raise removal with upstream rather than deleting
-      it locally — it is upstream's file, not ours
+- [x] Determine whether `install_cuda_samples.sh` is dead code upstream, or is
+      meant to run on some path that currently misses it (it's called by the
+      two driver scripts)
+- [x] If it should run: wire it (done via the driver ports, not a `Step`)
+- [x] If it is genuinely dead: n/a
 
 ---
 
