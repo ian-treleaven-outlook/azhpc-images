@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -248,7 +248,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # NCCL, docker, DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", when=nvidia),
-        Step("install-docker", "install_docker.sh", when=nvidia),
+        Step("install-docker", "install_docker.sh", action=install_docker.install,
+             when=nvidia),
         Step("install-dcgm", "install_dcgm.sh", when=nvidia),
 
         # --- AMD branch ---
