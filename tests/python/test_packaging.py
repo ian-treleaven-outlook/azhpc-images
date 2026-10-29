@@ -175,39 +175,46 @@ class MpifileutilsDepsTests(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
+# install_nccl.install_deps runs install_nccl.sh's exact apt/dnf commands (one
+# command per bash line, stopping at the first failure), chosen by DISTRIBUTION.
 class NcclDepsTests(unittest.TestCase):
-    def _fake_installer(self, manager_name, succeeds=True):
-        fake = mock.Mock()
-        fake.manager = (None if manager_name is None
-                        else PackageManager(name=manager_name,
-                                            path=f"/usr/bin/{manager_name}"))
-        fake.install_package.return_value = succeeds
-        return fake
+    def _deps(self, distro, rc=0):
+        with mock.patch.object(install_nccl, "exec_program", return_value=rc) as run, \
+             mock.patch.object(install_nccl, "log_info"), \
+             mock.patch.object(install_nccl, "log_error"):
+            result = install_nccl.install_deps(env={"DISTRIBUTION": distro})
+        return result, [c.args[0] for c in run.call_args_list]
 
-    def test_selects_apt_dep_list(self):
-        fake = self._fake_installer("apt-get")
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
+    def test_ubuntu_commands(self):
+        # libibverbs-dev is deliberately not installed (commented out in bash).
+        for distro in ("ubuntu22.04", "ubuntu24.04"):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["apt", "install", "-y", "build-essential", "devscripts",
+                     "debhelper", "fakeroot", "patchelf"],
+                    ["apt", "install", "-y", "zlib1g-dev"]])
+
+    def test_azure_linux_commands(self):
+        rc, commands = self._deps("azurelinux3.0")
         self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["build-essential", "devscripts", "debhelper", "fakeroot",
-             "zlib1g-dev", "libibverbs-dev"]
-        )
+        self.assertEqual(commands, [
+            ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "autoconf",
+             "automake", "git", "libtool", "patchelf"]])
 
-    def test_selects_rpm_dep_list(self):
-        fake = self._fake_installer("tdnf")
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
-        self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["rpm-build", "rpmdevtools", "autoconf", "automake", "git", "libtool"]
-        )
+    def test_rhel_family_commands(self):
+        for distro in ("almalinux9.8", "rocky8.10", ""):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "patchelf"]])
 
-    def test_returns_3_when_no_manager(self):
-        fake = self._fake_installer(None)
-        with mock.patch.object(install_nccl, "PackageInstaller", return_value=fake):
-            rc = install_nccl.install_deps(env={})
+    def test_failure_returns_3_and_stops(self):
+        rc, commands = self._deps("ubuntu24.04", rc=100)
         self.assertEqual(rc, 3)
+        self.assertEqual(len(commands), 1)        # zlib1g-dev not attempted
 
 
 # Pure string parsing, no mocks needed — parse_openmpi_version digs the version out of
