@@ -96,10 +96,8 @@ The NVIDIA Container Toolkit is a separate component with its own bash script
 (components/install_nvidia_container_toolkit.sh). It is still run as bash, with
 the same environment, exactly as install_docker.sh runs it.
 
-Known drift (not changed here): build_plan gates this Step to NVIDIA images
-only (`when=nvidia`), but distros/ubuntu24.04/install.sh runs install_docker.sh
-for AMD images too. This module still handles GPU=AMD exactly like bash (Docker
-without the container toolkit), so it is ready if the gate is fixed later.
+Like install.sh, build_plan runs this step for every vendor. On AMD images it
+installs Docker without the NVIDIA container toolkit, exactly as bash does.
 
 Deliberate differences from bash
 --------------------------------

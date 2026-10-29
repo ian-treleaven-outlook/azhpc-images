@@ -135,6 +135,12 @@ class GatingTests(unittest.TestCase):
         self.assertNotIn("install_nccl.sh", plan)
         self.assertNotIn("install_nvidiagpudriver.sh", plan)
 
+    def test_docker_runs_for_every_vendor(self):
+        # install.sh runs install_docker.sh unconditionally, on every distro.
+        for vendor, gpu in (("NVidia", "A100"), ("NVidia", "NCv6"), ("AMD", "MI300")):
+            with self.subTest(gpu=gpu):
+                self.assertIn("install_docker.sh", _plan_scripts(_cfg(vendor, gpu)))
+
     def test_gb200_branch(self):
         plan = _plan_scripts(_cfg("NVidia", "GB200"))
         self.assertIn("install_nvidiagpudriver_gb200.sh", plan)

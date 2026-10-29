@@ -208,8 +208,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
     (System prep / install_utils.sh runs separately via ImageBuilder._bootstrap
     before this plan executes. Inline shell in install.sh that isn't a component
-    script — the non-IB rdma-core install + mana_ib blacklist, the AMD moby
-    docker setup, and the tarball cleanup — is not represented here yet.)
+    script — the non-IB rdma-core install + mana_ib blacklist and the tarball
+    cleanup — is handled here only for the cleanup.)
     """
     def nvidia(c):
         return c.vendor == "NVidia"
@@ -246,10 +246,9 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
              when=lambda c: nvidia(c) and c.gpu not in {"GB200", "NCv6"}),
 
-        # NCCL, docker, DCGM (NVIDIA)
+        # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", when=nvidia),
-        Step("install-docker", "install_docker.sh", action=install_docker.install,
-             when=nvidia),
+        Step("install-docker", "install_docker.sh", action=install_docker.install),
         Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
              when=nvidia),
 
