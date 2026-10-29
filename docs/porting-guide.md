@@ -148,6 +148,8 @@ Everything you need exists. Use these rather than rolling your own.
 | Run an external command | `utils.process` | `exec_program(command: list[str], op, *, cwd=None, env=None) -> int` |
 | Run and capture stdout | `utils.process` | `run_capture(command: list[str], op, *, cwd=None, env=None) -> tuple[int, str]` |
 | Install distro packages | `utils.package_installer` | `PackageInstaller().install_package(packages) -> bool` |
+| Pin packages against dnf updates (bash `dnf_pin_packages`) | `utils.package_pinning` | `dnf_pin_packages(packages, op, env=None) -> bool` |
+| SKU network mode / IPoIB (bash `sku_network_mode`, `sku_uses_ipoib`) | `utils.sku` | `sku_network_mode(sku, node_type)`, `sku_uses_ipoib(sku, node_type)`, `sku_uses_ucx(sku)` |
 | Logging | `utils.logger` | `log_info(op, msg)` · `log_warn(op, msg)` · `log_error(op, msg)` · `log_debug(op, msg)` · `log_error_detail(op, msg, detail)` |
 
 ---
