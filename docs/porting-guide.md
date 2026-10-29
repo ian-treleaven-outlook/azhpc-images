@@ -273,6 +273,51 @@ In a pipeline it emits JSON automatically, and `run_id` is the ADO build ID — 
 a log line traces straight back to the build that produced it. Every line also
 carries vendor/GPU/OS for filtering across concurrent builds.
 
+### What the framework logs for you
+
+- **Every command** (`exec_program` / `run_capture`): `Running command: ...` at
+  INFO, its output at DEBUG, then one closing line with `exit_code` and
+  `duration_s`. On failure that line is an ERROR whose detail block holds the
+  command's **last 50 output lines**, so the real cause (e.g.
+  `E: Unable to locate package foo`) is visible at the default INFO level.
+- **Every step** (`build()`): `starting (python|bash)`, then `done in Ns` or the
+  failure, with `runner`, `exit_code` and `duration_s` fields. An unexpected
+  exception is logged with its traceback as the detail block.
+- **The run**: a first line with vendor, GPU, OS, distribution, architecture,
+  node type and planned step count; a last line with total duration and how
+  many steps ran as Python, as bash, or were skipped.
+
+### Structured fields
+
+Every log helper takes optional keyword fields:
+
+```python
+log_info(_OP, "Recorded version", component="PMIX", version=version)
+```
+
+JSON puts them under `"data"` (so a log query can filter on them); text appends
+`[component=PMIX version=4.2.9]`. Values are redacted like messages.
+
+### What a port should log
+
+The aim: from the INFO log alone, someone can tell what a step did to the
+image, and why it chose to.
+
+- **Start:** what is being installed and the resolved inputs —
+  `log_info(_OP, "Installing X", version=..., distro=..., source=url)`.
+- **Decisions:** which branch was taken and why (distro handler, vendor, a
+  skipped optional part), and any rerun/parity quirk worth a `log_warn`.
+- **Changes to the system:** each file written or edited — path, and whether it
+  was created, appended to or replaced — plus services enabled/started,
+  symlinks, packages pinned or held.
+- **Results:** every `write_component_version` value, and a closing
+  `log_info(_OP, "X installed", ...)` summary.
+- **Failures:** `log_error` with what failed and the values involved (path,
+  command, expected vs found). Don't repeat a command failure that
+  `exec_program` has already logged; add the *consequence* instead.
+- Use `log_debug` for bulky detail (parsed listings, full file contents).
+  Never log secrets; redaction is a safety net, not a licence.
+
 ---
 
 ## 8. Worked example
@@ -354,7 +399,7 @@ because *upstream* deleted it, not because we ported it.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **355 tests, ~standard library only** — `unittest` and
+The suite is **366 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest.
 
 Add coverage for at minimum:

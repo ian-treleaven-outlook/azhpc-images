@@ -157,6 +157,8 @@ class BuildFailureHandlingTests(unittest.TestCase):
 
         Everything around the step is stubbed: bootstrap (would run
         install_utils.sh) and component_env (would shell out to dpkg/rpm).
+        Returns the exit code plus the two error loggers: a failed step uses
+        log_error; an exception uses log_error_detail (message + traceback).
         """
         cfg = _cfg("NVidia", "A100")
         builder = ImageBuilder(_REPO_ROOT, cfg)
@@ -164,27 +166,55 @@ class BuildFailureHandlingTests(unittest.TestCase):
              mock.patch.object(build_config, "component_env", return_value={}), \
              mock.patch.object(build_config, "build_plan",
                                return_value=[Step("test-step", action=action)]), \
-             mock.patch.object(build_config, "log_error") as logged:
+             mock.patch.object(build_config, "log_error") as logged, \
+             mock.patch.object(build_config, "log_error_detail") as logged_detail:
             rc = builder.build()
-        return rc, logged
+        return rc, logged, logged_detail
 
     def test_step_returning_failure_gives_exit_3(self):
-        rc, logged = self._run_build_with(lambda env: 3)
+        rc, logged, _ = self._run_build_with(lambda env: 3)
         self.assertEqual(rc, 3)
         logged.assert_called_once()
+        # Telemetry: the failure records the runner and exit code as fields.
+        self.assertEqual(logged.call_args.kwargs["runner"], "python")
+        self.assertEqual(logged.call_args.kwargs["exit_code"], 3)
 
     def test_raising_step_gives_exit_3_not_a_traceback(self):
         def boom(env):
             raise FileNotFoundError("/tmp/mpifileutils-build/bin/dcp")
 
-        rc, logged = self._run_build_with(boom)   # must not propagate
+        rc, logged, logged_detail = self._run_build_with(boom)   # must not propagate
         self.assertEqual(rc, 3)
-        # the log names the exception type so the cause isn't lost
-        self.assertIn("FileNotFoundError", logged.call_args[0][1])
+        logged.assert_not_called()
+        logged_detail.assert_called_once()
+        message, detail = logged_detail.call_args[0][1], logged_detail.call_args[0][2]
+        # the log names the exception type so the cause isn't lost...
+        self.assertIn("FileNotFoundError", message)
+        # ...and the traceback is kept as the detail block, not printed raw.
+        self.assertIn("Traceback", detail)
 
     def test_successful_step_still_returns_0(self):
-        rc, _ = self._run_build_with(lambda env: 0)
+        rc, _, _ = self._run_build_with(lambda env: 0)
         self.assertEqual(rc, 0)
+
+    def test_success_logs_step_duration_and_build_summary(self):
+        cfg = _cfg("NVidia", "A100")
+        builder = ImageBuilder(_REPO_ROOT, cfg)
+        with mock.patch.object(ImageBuilder, "_bootstrap", return_value=0), \
+             mock.patch.object(build_config, "component_env", return_value={}), \
+             mock.patch.object(build_config, "build_plan",
+                               return_value=[Step("test-step", action=lambda env: 0)]), \
+             mock.patch.object(build_config, "log_info") as info:
+            self.assertEqual(builder.build(), 0)
+
+        done = [c for c in info.call_args_list if c.args[0] == "test-step"
+                and c.args[1].startswith("done")]
+        self.assertEqual(len(done), 1)
+        self.assertIn("duration_s", done[0].kwargs)
+        summary = info.call_args_list[-1]
+        self.assertEqual(summary.args[0], "build-image")
+        self.assertEqual(summary.kwargs["python_steps"], 1)
+        self.assertEqual(summary.kwargs["bash_steps"], 0)
 
 
 if __name__ == "__main__":

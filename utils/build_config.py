@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from typing import Callable
 from pathlib import Path
 import json
-from utils.logger import log_info, log_warn, log_error
+from utils.logger import log_info, log_warn, log_error, log_error_detail
 from utils.process import exec_program
 import os
 import platform
 import subprocess
+import time
+import traceback
 
 from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks
 from utils.sku import sku_has_infiniband
@@ -345,28 +347,49 @@ class ImageBuilder:
         components = self.repo_root / "components"
         env = component_env(self.repo_root, cfg)
 
-        log_info("build-image", f"Building {cfg.os} for {cfg.gpu}")
+        plan = build_plan(cfg)
+        build_started = time.monotonic()
+        # Fields on this line describe the whole run, so a log query can find
+        # every build of, say, NCv6 on azurelinux3.0.
+        log_info("build-image", f"Building {cfg.os} for {cfg.gpu}",
+                 vendor=cfg.vendor, gpu=cfg.gpu, os=cfg.os,
+                 distribution=env.get("DISTRIBUTION", ""),
+                 architecture=env.get("ARCHITECTURE", ""),
+                 node_type=env.get("TARGET_NODE_TYPE", ""),
+                 planned_steps=len(plan))
 
         # --- Phase 2: bootstrap (system prep) ---
         # Runs install_utils.sh first; abort the build if it fails.
+        bootstrap_started = time.monotonic()
         rc = self._bootstrap(build_dir, env)
+        elapsed = time.monotonic() - bootstrap_started
         if rc != 0:
-            log_error("bootstrap", f"system prep failed with exit code {rc}")
+            log_error("bootstrap", f"system prep failed with exit code {rc} after {elapsed:.1f}s",
+                      exit_code=rc, duration_s=round(elapsed, 1))
             return 3
+        log_info("bootstrap", f"done in {elapsed:.1f}s", duration_s=round(elapsed, 1))
 
         # --- Phase 3: run each step of the plan, in order ---
-        for step in build_plan(cfg):
+        # Counts for the summary line at the end.
+        counts = {"python": 0, "bash": 0, "skipped": 0}
+        for step in plan:
             # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA)
             if not step.when(cfg):
-                log_info(step.op, "skipped")
+                counts["skipped"] += 1
+                log_info(step.op, "skipped: not applicable to this target")
                 continue
 
-            log_info(step.op, "starting")
+            # Record whether this step ran as Python or bash, so a failure in a
+            # real build can be traced to the right implementation.
+            runner = "python" if step.action is not None else "bash"
+            log_info(step.op, f"starting ({runner})", runner=runner, script=step.script)
+            step_started = time.monotonic()
 
             # (b) run it: a python action, or the bash script via exec_program.
             # A python action that raises (bad tarball, missing file, ...) is
             # turned into a normal rc=3 failure here, so an unexpected exception
             # can't escape as a traceback and break the documented exit codes.
+            # The traceback is still logged, as the error's detail block.
             try:
                 if step.action is not None:
                     rc = step.action(env)
@@ -376,17 +399,30 @@ class ImageBuilder:
                     rc = exec_program([str(base_dir / step.script), *step.args],
                                       step.op, cwd=str(build_dir), env=env)
             except Exception as exc:
-                log_error(step.op, f"unhandled error: {exc.__class__.__name__}: {exc}")
+                elapsed = time.monotonic() - step_started
+                log_error_detail(
+                    step.op,
+                    f"unhandled error after {elapsed:.1f}s: "
+                    f"{exc.__class__.__name__}: {exc}",
+                    traceback.format_exc(),
+                    runner=runner, duration_s=round(elapsed, 1))
                 return 3
 
             # (c) stop the whole build on the first failure
+            elapsed = time.monotonic() - step_started
             if rc != 0:
-                log_error(step.op, f"failed with exit code {rc}")
+                log_error(step.op, f"failed with exit code {rc} after {elapsed:.1f}s",
+                          runner=runner, exit_code=rc, duration_s=round(elapsed, 1))
                 return 3
-            log_info(step.op, "done")
+            counts[runner] += 1
+            log_info(step.op, f"done in {elapsed:.1f}s",
+                     runner=runner, duration_s=round(elapsed, 1))
 
         # --- Phase 4: every step passed ---
-        log_info("build-image", "Image built successfully")
+        total = time.monotonic() - build_started
+        log_info("build-image", f"Image built successfully in {total:.1f}s",
+                 duration_s=round(total, 1), python_steps=counts["python"],
+                 bash_steps=counts["bash"], skipped_steps=counts["skipped"])
         return 0
 
         
