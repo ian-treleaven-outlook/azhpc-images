@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_auto_upgrade, disable_predictive_interface_renaming
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -297,7 +297,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("disable-auto-upgrade", "disable_auto_upgrade.sh", base="distro",
              action=disable_auto_upgrade.install),
         Step("disable-predictive-interface-renaming",
-             "disable_predictive_interface_renaming.sh", base="distro"),
+             "disable_predictive_interface_renaming.sh", base="distro",
+             action=disable_predictive_interface_renaming.install),
     ]
 
 class ImageBuilder:
