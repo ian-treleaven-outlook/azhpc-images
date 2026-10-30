@@ -118,7 +118,7 @@ The original bash, for comparison (abridged; see components/install_mpis.sh):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-mpis" Step. Deleting `action=` from that Step makes the build run the
 bash script again, which is why the .sh file is kept.
 
@@ -227,7 +227,7 @@ from utils.package_pinning import dnf_pin_packages
 from utils.process import exec_program, run_capture
 from utils.sku import NETWORK_MODE_NO_RDMA, sku_network_mode, sku_uses_ucx
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-mpis"
 
 _AZURE_LINUX = "azurelinux3.0"

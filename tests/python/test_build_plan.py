@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from utils import build_config
+from utils.plans import steps
 from utils.build_config import BuildConfig, ImageBuilder, Step, build_plan, resolve_config
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -223,6 +224,7 @@ class GatingTests(unittest.TestCase):
         for folder, os_name in mapping.items():
             with self.subTest(folder=folder):
                 self.assertEqual(build_config.DISTRO_DIRS[os_name], f"distros/{folder}")
+                self.assertIn(os_name, build_config.PLANS)   # Packer only offers planned OSes
                 self.assertTrue((_REPO_ROOT / "distros" / folder / "install.sh").is_file())
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))
@@ -255,30 +257,15 @@ class GatingTests(unittest.TestCase):
             with self.subTest(gpu=gpu):
                 self.assertIn("install_docker.sh", _plan_scripts(_cfg(vendor, gpu)))
 
-    def test_steps_a_distros_install_sh_never_runs_are_skipped(self):
-        # Azure Linux's install.sh has no disable_cloudinit.sh; only the Ubuntu
-        # install.sh scripts run the distro-local disable script.
-        ubuntu_only = {"disable_predictive_interface_renaming.sh"}
-        cases = {
-            "Ubuntu24": (True, True),   # (runs disable_cloudinit, runs ubuntu-only)
-            "Ubuntu22": (True, True),
-            "Azure3":   (False, False),
-            "Alma9":    (True, False),
-            "Rocky8":   (True, False),
-        }
-        for os_name, (cloudinit, ubuntu) in cases.items():
-            with self.subTest(os=os_name):
-                plan = set(_plan_scripts(_cfg("NVidia", "A100", os=os_name)))
-                self.assertEqual("disable_cloudinit.sh" in plan, cloudinit)
-                self.assertEqual(ubuntu_only <= plan, ubuntu)
-                self.assertFalse(ubuntu_only & plan and not ubuntu)
-
-    def test_those_skips_carry_a_warning_reason(self):
-        steps = {s.op: s for s in build_plan(_cfg("NVidia", "A100"))}
-        for op in ("disable-cloudinit", "disable-predictive-interface-renaming"):
-            with self.subTest(op=op):
-                self.assertTrue(steps[op].skip_warning)
-        self.assertEqual(steps["install-rocm"].skip_warning, "")   # normal gating
+    def test_ubuntu24_runs_cloudinit_and_renaming_unconditionally(self):
+        # distros/ubuntu24.04/install.sh runs both for every SKU. (Other distros
+        # have their own plans: Azure Linux's install.sh has no
+        # disable_cloudinit.sh, for example; see utils/plans/.)
+        for vendor, gpu in (("NVidia", "A100"), ("NVidia", "GB200"), ("AMD", "MI300X")):
+            with self.subTest(gpu=gpu):
+                plan = _plan_scripts(_cfg(vendor, gpu))
+                self.assertIn("disable_cloudinit.sh", plan)
+                self.assertIn("disable_predictive_interface_renaming.sh", plan)
 
     def test_gb200_branch(self):
         plan = _plan_scripts(_cfg("NVidia", "GB200"))
@@ -339,15 +326,15 @@ class ComponentEnvTests(unittest.TestCase):
 # The inline cleanup in install.sh, run word for word from the distro folder.
 class CleanupTests(unittest.TestCase):
     def test_script_is_install_sh_text_word_for_word(self):
-        self.assertIn(build_config._CLEANUP_SCRIPT, _INSTALL_SH.read_text(encoding="utf-8"))
+        self.assertIn(steps.CLEANUP_SCRIPT, _INSTALL_SH.read_text(encoding="utf-8"))
 
     def test_runs_with_set_e_in_the_distro_folder(self):
         cfg = _cfg("NVidia", "A100")
         step = {s.op: s for s in build_plan(cfg)}["cleanup-downloads"]
-        with mock.patch.object(build_config, "exec_program", return_value=0) as run, \
-             mock.patch.object(build_config, "log_info"):
+        with mock.patch.object(steps, "exec_program", return_value=0) as run, \
+             mock.patch.object(steps, "log_info"):
             self.assertEqual(step.action({"TOP_DIR": "/repo"}), 0)
-        self.assertEqual(run.call_args.args[0], ["bash", "-ec", build_config._CLEANUP_SCRIPT])
+        self.assertEqual(run.call_args.args[0], ["bash", "-ec", steps.CLEANUP_SCRIPT])
         self.assertEqual(run.call_args.kwargs["cwd"], "/repo/distros/ubuntu24.04")
 
     def test_dotglob_and_nullglob_behave_as_in_bash(self):
@@ -356,7 +343,7 @@ class CleanupTests(unittest.TestCase):
         import shutil, subprocess, tempfile
         if not shutil.which("bash"):
             self.skipTest("needs bash")
-        subshell = build_config._CLEANUP_SCRIPT.split("(\n", 1)[1].rsplit(")", 1)[0]
+        subshell = steps.CLEANUP_SCRIPT.split("(\n", 1)[1].rsplit(")", 1)[0]
         subshell = subshell.replace("rm -rf -- /var/cache/* || true\n", "")
         with tempfile.TemporaryDirectory() as tmp:
             for name in ("visible", ".hidden"):

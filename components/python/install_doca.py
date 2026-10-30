@@ -88,7 +88,7 @@ tests compare them with install_doca.sh):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-doca" Step (InfiniBand SKUs only). Deleting `action=` makes the
 build run the bash script again, which is why the .sh file is kept.
 install() returns 0 for success or 3 for failure; it logs problems and never
@@ -150,7 +150,7 @@ from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 from utils.sku import sku_uses_ipoib
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-doca"
 
 _AZURE_LINUX = "azurelinux3.0"

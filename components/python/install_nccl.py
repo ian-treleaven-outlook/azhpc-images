@@ -83,7 +83,7 @@ The original bash, for comparison (abridged; see components/install_nccl.sh):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-nccl" Step (NVIDIA images only). Deleting `action=` from that Step
 makes the build run the bash script again, which is why the .sh file is kept.
 
@@ -184,7 +184,7 @@ from utils.process import exec_program, run_capture
 from utils.repo_source import write_repo_source_info
 from utils.sku import NETWORK_MODE_STANDARD_IB, sku_network_mode
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-nccl"
 
 _AZURE_LINUX = "azurelinux3.0"

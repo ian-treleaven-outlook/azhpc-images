@@ -81,7 +81,7 @@ compare against those renders (tests/python/fixtures/setup_sku_customizations).
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "setup-sku-customizations" Step. The build then calls install(env) instead of
 running the bash script. Deleting `action=` runs the bash script again, which
 is why the .sh file is kept. The vendor comes from env["GPU"] ("NVIDIA" or
@@ -131,7 +131,7 @@ import stat
 from utils.logger import log_debug, log_error, log_info, log_warn
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line uses it.
+# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "setup-sku-customizations"
 
 # Every path the step reads or writes. They are module-level "constants"

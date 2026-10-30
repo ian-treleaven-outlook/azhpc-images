@@ -48,7 +48,7 @@ second time, again exactly like bash.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "disable-predictive-interface-renaming" Step. When a Step has an action, the
 build calls the Python function instead of running the bash script. Deleting
 `action=` from that Step makes the build run the bash script again. That is why
@@ -87,7 +87,7 @@ from __future__ import annotations
 from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line from this module uses it.
+# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "disable-predictive-interface-renaming"
 
 # The GRUB settings file that Ubuntu cloud images ship, edited by bash's sed.

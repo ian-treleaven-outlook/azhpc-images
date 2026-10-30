@@ -81,7 +81,7 @@ the two units were compared byte for byte with the files real bash writes.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-persistent-rdma-naming" Step. The build then calls install(env)
 instead of running the bash script. Deleting `action=` runs the bash script
 again, which is why the .sh file is kept.
@@ -132,7 +132,7 @@ from utils.download import ChecksumError, download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line uses it.
+# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "install-persistent-rdma-naming"
 
 # Where things go. They are module-level "constants" (capital names that the

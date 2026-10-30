@@ -132,7 +132,7 @@ The original bash, for comparison (abridged; see components/install_rccl.sh):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-rccl" Step (AMD images only, after install-rocm). Deleting `action=`
 from that Step makes the build run the bash script again, which is why the .sh
 file is kept.
@@ -230,7 +230,7 @@ from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 from utils.repo_source import write_repo_source_info
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-rccl"
 
 # Bash's exact-match distro branches.

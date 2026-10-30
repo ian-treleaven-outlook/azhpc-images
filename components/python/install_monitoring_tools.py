@@ -73,7 +73,7 @@ Bash details mirrored
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-monitoring-tools" Step. Deleting `action=` makes the build run the
 bash script again, which is why the .sh file is kept. install() returns 0 for
 success or 3 for failure; it logs problems and never lets an exception escape.
@@ -101,7 +101,7 @@ from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-monitoring-tools"
 
 # Paths. Module-level so tests can point them at a temporary directory.

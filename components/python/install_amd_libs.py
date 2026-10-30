@@ -70,7 +70,7 @@ The original bash, for comparison (comments and blank lines trimmed):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-amd-libs" Step (x86_64 only). The build then calls install(env)
 instead of running the bash script. Deleting `action=` runs the bash script
 again, which is why the .sh file is kept.
@@ -129,7 +129,7 @@ from utils.download import ChecksumError, download_and_verify
 from utils.logger import log_error, log_info, log_warn
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line uses it.
+# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "install-amd-libs"
 
 # Where both packages are installed (bash's INSTALL_PREFIX).
