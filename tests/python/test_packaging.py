@@ -432,12 +432,14 @@ class IntelLibsInstallTests(unittest.TestCase):
         self.assertEqual(
             component_config.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
 
-    def _install(self, env, *, rc=0):
+    def _install(self, env, *, rc=0, write_error=None):
         """install() with the download, commands and cleanup faked."""
         with mock.patch.object(download_module, "download_and_verify",
                                return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
              mock.patch.object(process, "exec_program", return_value=rc) as ex, \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv, \
+             mock.patch.object(component_config, "write_component_version",
+                               return_value="/versions", side_effect=write_error) as wcv, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_intel_libs, "remove_paths") as rm, \
              mock.patch.object(component_config, "log_error") as config_error:
             result = install_intel_libs.install(env)
@@ -471,6 +473,16 @@ class IntelLibsInstallTests(unittest.TestCase):
         ex.assert_not_called()
         wcv.assert_not_called()
         config_error.assert_called_once()   # missing version is reported as an error
+
+    def test_install_fails_when_version_cannot_be_recorded(self):
+        rc, _, ex, wcv, rm, config_error = self._install(
+            self._env(), write_error=PermissionError("denied"))
+        self.assertEqual(rc, 3)
+        ex.assert_called_once()
+        wcv.assert_called_once_with("INTEL_ONE_MKL", "2025.3.1.11")
+        config_error.assert_called_once()   # record_version logs the failure
+        rm.assert_not_called()
+
 
 class HpcdiagTests(unittest.TestCase):
     def test_latest_tarball_url_parses(self):

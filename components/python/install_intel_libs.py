@@ -13,7 +13,7 @@ succeeds, where bash records it both before downloading and at the end.
 
 from __future__ import annotations
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.download import fetch_verified
 from utils.files import remove_paths
 from utils.logger import log_info
@@ -37,7 +37,8 @@ def install(env: dict[str, str]) -> int:
     if not run(["sh", str(installer), "-s", "-a", "-s", "--eula", "accept"],
                _OP, env=env):
         return 3
-    write_component_version("INTEL_ONE_MKL", version)
+    if not record_version("INTEL_ONE_MKL", version, _OP):
+        return 3
     remove_paths(installer, op=_OP)
 
     log_info(_OP, "Intel oneAPI MKL installed", version=version)
