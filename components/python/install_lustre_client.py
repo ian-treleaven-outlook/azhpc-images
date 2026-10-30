@@ -6,113 +6,55 @@ Installs the Azure Managed Lustre (AMLFS) client: the Lustre userspace tools
 and a DKMS kernel module built for the image's kernel, from Microsoft's AMLFS
 package repo. Azure VMs reach Lustre servers over TCP, not InfiniBand, so DKMS
 is configured to build Lustre without o2ib (the InfiniBand LNet driver) and to
-skip that driver's artifact. Afterwards DKMS must report the module installed
-for the running kernel (utils/dkms.py, a port of bash check_dkms_status), and
-the version is recorded as LUSTRE in the component-versions file.
+skip that driver's artifact. DKMS must then report the module installed for
+the running kernel (utils/dkms.py), and the version is recorded as LUSTRE.
 
 This step must stay immediately before install-mpifileutils, which builds
 against the Lustre client.
 
-Kernel 7.0 is skipped (#598, which enabled linux-azure-7.0 on Ubuntu 24.04):
-when the kernel version (KERNEL_VERSION if set and not empty, as Packer passes
-it, e.g. "7.0"; else `uname -r`) is "7.0", "7.0.*" or "7.0-*", nothing is
-installed or recorded and the step succeeds. The check comes after the
-version lookup, as in bash, but before the version is required, so a distro
-without a "lustre" entry in versions.json (Ubuntu 26.04 today) still skips
-cleanly on a 7.0 kernel.
+Kernel 7.0 is skipped (#598): when KERNEL_VERSION (if set and not empty, as
+Packer passes it) or else `uname -r` is "7.0", "7.0.*" or "7.0-*", nothing is
+installed or recorded and the step succeeds, even on a distro without a
+"lustre" entry in versions.json (Ubuntu 26.04 today).
 
-Per distro family (bash tests `$DISTRIBUTION == *"ubuntu"*`, else RHEL family):
+Per distro family (bash: `$DISTRIBUTION == *"ubuntu"*`, else RHEL family):
 
-  * Ubuntu  Read DISTRIB_CODENAME from /etc/lsb-release and the Ubuntu version
-            (VERSION_ID) from /etc/os-release, as bash does. Write the AMLFS
-            apt source (signed-by key per version), `apt-get update`, install
-            lustre-client-<v> first (it owns /etc/sysconfig/dkms-lustre; a
-            pre-created conffile makes noninteractive dpkg stop at a prompt),
-            then the DKMS configuration:
-              22.04  write the legacy /etc/dkms/lustre-client-modules-<v>.conf
-                     (a MAKE= line configuring --with-o2ib=no) and skip
-                     artifact record 11.
-              other  write /etc/sysconfig/dkms-lustre (LUSTRE_DKMS_CONFIGURE_EXTRA).
-            Then install amlfs-lustre-client-dkms-<v> and check the DKMS module
-            lustre-client-modules.
-  * RHEL    (AlmaLinux, Rocky, RHEL) The version's "-" become "_". Import the
-            Microsoft key, write /etc/yum.repos.d/amlfs.repo for el<major>
-            (major from VERSION_ID in /etc/os-release, as bash does), write
-            /etc/sysconfig/lustre (`echo --with-o2ib=no`) and append the
-            record-3 skip to /etc/dkms/lustre-client-<v>.conf. Then
-            `dnf install` lustre-client-dkms and -devel and check the DKMS
-            module lustre-client. The underscore version is recorded.
+  * Ubuntu  Write the AMLFS apt source (codename from /etc/lsb-release,
+            signed-by key per Ubuntu version from /etc/os-release, as bash
+            reads them), `apt-get update`, install lustre-client-<v> first
+            (it owns /etc/sysconfig/dkms-lustre; a pre-created conffile makes
+            noninteractive dpkg stop at a prompt), then configure DKMS:
+              22.04  the legacy /etc/dkms/lustre-client-modules-<v>.conf
+                     (a MAKE= line with --with-o2ib=no), skipping record 11;
+              other  /etc/sysconfig/dkms-lustre (LUSTRE_DKMS_CONFIGURE_EXTRA).
+            Then install amlfs-lustre-client-dkms-<v> and check the DKMS
+            module lustre-client-modules.
+  * RHEL    (AlmaLinux, Rocky, RHEL) The version's "-" become "_" (and that
+            is what gets recorded). Import the Microsoft key, write
+            /etc/yum.repos.d/amlfs.repo for el<major>, write
+            /etc/sysconfig/lustre (`echo --with-o2ib=no`), append the record-3
+            skip to /etc/dkms/lustre-client-<v>.conf, `dnf install`
+            lustre-client-dkms and -devel, and check the DKMS module
+            lustre-client.
 
-Upstream removed two things this port used to do: the LU-20071 timer patch for
-RHEL 9.8 kernels and its patch file (#610, with the 2.15.8-39 packages), and
-the Ubuntu 22.04 AMD dkms 3.4.1 upgrade (#633/#643; Ubuntu now gets dkms from
-the shared CUDA repository setup).
+The configure_* functions below are bash's helper functions of the same
+names. Every generated file was rendered by the real bash in WSL and is
+compared byte for byte (tests/python/fixtures/install_lustre_client/).
 
-The original bash (helper functions are mirrored one-to-one below, each with
-its bash body in its docstring):
-
-    lustre_metadata=$(get_component_config "lustre")
-    LUSTRE_VERSION=$(jq -r '.version' <<< $lustre_metadata)
-    CURRENT_KERNEL_VERSION=${KERNEL_VERSION:-$(uname -r)}
-    if [[ "${CURRENT_KERNEL_VERSION}" == "7.0" || "${CURRENT_KERNEL_VERSION}" == 7.0.* || "${CURRENT_KERNEL_VERSION}" == 7.0-* ]]; then
-        echo "Skipping Lustre client installation for kernel version ${CURRENT_KERNEL_VERSION}"
-        exit 0
-    fi
-    if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
-        source /etc/lsb-release
-        UBUNTU_VERSION=$(cat /etc/os-release | grep VERSION_ID | cut -d= -f2 | cut -d\\" -f2)
-        if [ $UBUNTU_VERSION == 24.04 ]; then
-            SIGNED_BY="/usr/share/keyrings/microsoft-prod.gpg"
-        elif [ $UBUNTU_VERSION == 22.04 ]; then
-            SIGNED_BY="/etc/apt/trusted.gpg.d/microsoft-prod.gpg"
-        fi
-        echo "deb [arch=$ARCHITECTURE_DISTRO signed-by=$SIGNED_BY] https://packages.microsoft.com/repos/amlfs-${DISTRIB_CODENAME}/ ${DISTRIB_CODENAME} main" | tee /etc/apt/sources.list.d/amlfs.list
-        apt-get update
-        LUSTRE_CLIENT_PACKAGE="lustre-client-${LUSTRE_VERSION}"
-        LUSTRE_PACKAGE="amlfs-lustre-client-dkms-${LUSTRE_VERSION}"
-        apt-get install -y "${LUSTRE_CLIENT_PACKAGE}"
-        if [[ $UBUNTU_VERSION == 22.04 ]]; then
-            configure_legacy_lustre_dkms_no_o2ib "${LUSTRE_VERSION}"
-        else
-            configure_lustre_dkms_no_o2ib_with_tr_workaround /etc/sysconfig/dkms-lustre
-        fi
-        apt-get install -y "${LUSTRE_PACKAGE}"
-        check_dkms_status lustre-client-modules
-    else
-        LUSTRE_VERSION_UNDERSCORE=${LUSTRE_VERSION//-/_}
-        OS_MAJOR_VERSION=$(sed -n 's/^VERSION_ID="\\([0-9]\\+\\).*/\\1/p' /etc/os-release)
-        REPO_PATH=/etc/yum.repos.d/amlfs.repo
-        rpm --import https://packages.microsoft.com/keys/microsoft.asc
-        echo -e "[amlfs]" > ${REPO_PATH}
-        echo -e "name=Azure Lustre Packages" >> ${REPO_PATH}
-        ... (baseurl, enabled, gpgcheck, gpgkey; see amlfs_yum_repo())
-        LUSTRE_PACKAGES=("lustre-client-dkms-${LUSTRE_VERSION_UNDERSCORE}"
-                         "lustre-client-${LUSTRE_VERSION_UNDERSCORE}-devel")
-        configure_lustre_dkms_no_o2ib /etc/sysconfig/lustre
-        configure_lustre_dkms_skip_artifact lustre-client "${LUSTRE_VERSION_UNDERSCORE}" 3 \\
-            "EL ko2iblnd is record 3; --with-o2ib=no intentionally skips it."
-        dnf install -y --disableexcludes=main --refresh "${LUSTRE_PACKAGES[@]}"
-        check_dkms_status lustre-client
-        LUSTRE_VERSION=${LUSTRE_VERSION_UNDERSCORE}
-    fi
-    write_component_version "LUSTRE" ${LUSTRE_VERSION}
-
-Every generated file was rendered with the real bash functions/commands in WSL
-and compared byte for byte (fixtures in tests/python/fixtures/install_lustre_client/).
+Upstream removed the LU-20071 timer patch for RHEL 9.8 kernels (#610) and
+the Ubuntu 22.04 AMD dkms 3.4.1 upgrade (#633/#643); this port has neither.
 
 How it fits into the Python build
 ---------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-lustre" Step. Deleting `action=` makes the build run the bash script
-again, which is why the .sh file is kept. install() returns 0 for success or 3
-for failure; it logs problems and never lets an exception escape.
+utils/plans/steps.py sets install() as the "install-lustre" Step's
+`action=`; deleting `action=` runs the bash script again, which is why it is
+kept.
 
-Bash issues, kept and warned about (log_warn when they apply)
--------------------------------------------------------------
+Bash issues, kept and warned about
+----------------------------------
   * configure_lustre_dkms_skip_artifact APPENDS to
-    /etc/dkms/<module>-<version>.conf and nothing empties it first (on Ubuntu
-    22.04 the legacy config rewrites it just before, on the RHEL family
-    nothing does). A rerun on the same machine appends the same lines again.
+    /etc/dkms/<module>-<version>.conf and nothing empties it first on the RHEL
+    family, so a rerun on the same machine appends the same lines again.
     Warned when the file already holds the text being appended.
   * distros/azurelinux3.0/install.sh never runs install_lustre_client.sh, but
     the build plan's install-lustre Step has no distro gate, so on Azure Linux
@@ -123,21 +65,22 @@ Bash issues, kept and warned about (log_warn when they apply)
 Deliberate differences from bash
 --------------------------------
   * A missing "lustre" version fails before changing anything (after the
-    kernel 7.0 skip); bash would install "lustre-client-null".
+    kernel 7.0 skip); bash would install "lustre-client-null". Bash looks the
+    version up before the kernel check; this port after it, which changes
+    nothing else (the lookup has no side effects).
   * Missing ARCHITECTURE_DISTRO, an empty DISTRIB_CODENAME, or an Ubuntu
-    version other than 22.04/24.04 (no SIGNED_BY; e.g. 26.04 on a kernel that
-    isn't 7.0) fails before the apt source is written; bash would write a
-    source line with blank values. An empty OS major version on the RHEL
-    family fails before the repo is written; bash would write
-    "baseurl=.../amlfs-el".
-  * The DISTRIB_CODENAME assignment in /etc/lsb-release is read by a small
-    parser (plain, "double"- or 'single'-quoted values; the last assignment
-    wins) instead of `source`-ing the file. That covers how Ubuntu writes it.
+    version other than 22.04/24.04 (no SIGNED_BY) fails before the apt source
+    is written; bash would write a source line with blank values. An empty
+    OS major version on the RHEL family fails before the repo is written;
+    bash would write "baseurl=.../amlfs-el".
+  * DISTRIB_CODENAME is read by a small parser (plain, "double"- or
+    'single'-quoted values; the last assignment wins) instead of `source`-ing
+    /etc/lsb-release. That covers how Ubuntu writes it.
   * Package installs go through install_packages() (one call per bash
-    command, options kept), which writes `apt-get install -y -o
-    Dpkg::Use-Pty=0 ...` / `dnf install -y ...`, the documented
-    normalisation. On a distribution it doesn't know, bash's else branch would
-    try dnf; install_packages() logs an error and the step returns 3.
+    command, options kept): `apt-get install -y -o Dpkg::Use-Pty=0 ...` /
+    `dnf install -y ...`. On a distribution it doesn't know, bash's else
+    branch would try dnf; install_packages() logs an error and the step
+    returns 3.
 """
 
 from __future__ import annotations
@@ -146,18 +89,17 @@ import os
 import platform
 import re
 
-from utils.component_config import config_for, write_component_version
+from utils.component_config import require_config, write_component_version
+from utils.distro import Distro
 from utils.dkms import check_dkms_status
-from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.files import write_file
+from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
-from utils.process import exec_program
+from utils.process import run
 
-# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-lustre"
 
-# --------------------------------------------------------------------------- #
 # System paths. Module constants so tests can point them at temporary dirs.
-# --------------------------------------------------------------------------- #
 _LSB_RELEASE = "/etc/lsb-release"
 _OS_RELEASE = "/etc/os-release"
 _APT_SOURCE = "/etc/apt/sources.list.d/amlfs.list"
@@ -171,6 +113,8 @@ _SIGNED_BY = {
     "24.04": "/usr/share/keyrings/microsoft-prod.gpg",
     "22.04": "/etc/apt/trusted.gpg.d/microsoft-prod.gpg",
 }
+# The Ubuntu version that gets the legacy DKMS config.
+_LEGACY_DKMS_UBUNTU = "22.04"
 
 _MICROSOFT_KEY_URL = "https://packages.microsoft.com/keys/microsoft.asc"
 
@@ -237,20 +181,14 @@ def _lines(text: str) -> list[str]:
 
 
 def _cut_field2(line: str, delimiter: str) -> str:
-    """`cut -d<delimiter> -f2` on one line.
-
-    A line without the delimiter is printed whole (cut has no -s here).
-    """
+    """`cut -d<delimiter> -f2` on one line (a line without it is printed whole)."""
     parts = line.split(delimiter)
     return parts[1] if len(parts) > 1 else line
 
 
 def ubuntu_version_from_os_release(text: str) -> str:
-    """UBUNTU_VERSION as bash computes it from /etc/os-release's text.
-
-    Mirrors  $(cat /etc/os-release | grep VERSION_ID | cut -d= -f2 | cut -d\\" -f2):
-    every line CONTAINING "VERSION_ID", then field 2 split on "=", then field 2
-    split on '"'; $(...) drops trailing newlines.
+    """UBUNTU_VERSION from /etc/os-release's text, as bash computes it:
+    $(cat /etc/os-release | grep VERSION_ID | cut -d= -f2 | cut -d\\" -f2).
 
         'VERSION_ID="22.04"\\n' -> "22.04"
     """
@@ -260,10 +198,8 @@ def ubuntu_version_from_os_release(text: str) -> str:
 
 
 def os_major_from_os_release(text: str) -> str:
-    """OS_MAJOR_VERSION as bash computes it from /etc/os-release's text.
-
-    Mirrors  $(sed -n 's/^VERSION_ID="\\([0-9]\\+\\).*/\\1/p' /etc/os-release):
-    the leading digits of each quoted VERSION_ID line.
+    """OS_MAJOR_VERSION from /etc/os-release's text, as bash computes it:
+    $(sed -n 's/^VERSION_ID="\\([0-9]\\+\\).*/\\1/p' /etc/os-release).
 
         'VERSION_ID="9.8"\\n' -> "9"      'VERSION_ID=9.8' -> ""
     """
@@ -276,11 +212,10 @@ def os_major_from_os_release(text: str) -> str:
 
 
 def lsb_codename(text: str) -> str:
-    """DISTRIB_CODENAME as `source /etc/lsb-release` would set it.
+    """DISTRIB_CODENAME as `source /etc/lsb-release` would set it, or "".
 
-    Handles the assignments Ubuntu writes: DISTRIB_CODENAME=jammy, with or
-    without "double" or 'single' quotes. The last assignment wins, as when
-    sourcing. "" when there is none.
+    Handles plain, "double"- or 'single'-quoted values; the last assignment
+    wins, as when sourcing.
     """
     codename = ""
     for line in _lines(text):
@@ -294,6 +229,18 @@ def lsb_codename(text: str) -> str:
     return codename
 
 
+def apt_source_problem(codename: str, ubuntu_version: str, arch: str) -> str | None:
+    """Why the apt source line can't be written (bash would write blanks), or None."""
+    if not codename:
+        return f"no DISTRIB_CODENAME in {_LSB_RELEASE}"
+    if ubuntu_version not in _SIGNED_BY:
+        return (f"no apt signing key known for Ubuntu {ubuntu_version!r} "
+                "(bash sets SIGNED_BY only for 22.04 and 24.04)")
+    if not arch:
+        return "ARCHITECTURE_DISTRO is not set"
+    return None
+
+
 def underscore_version(version: str) -> str:
     """${LUSTRE_VERSION//-/_}: every "-" becomes "_"."""
     return version.replace("-", "_")
@@ -302,8 +249,7 @@ def underscore_version(version: str) -> str:
 def skips_kernel(kernel: str) -> bool:
     """True for a kernel version that gets no Lustre client.
 
-    Mirrors  [[ "$k" == "7.0" || "$k" == 7.0.* || "$k" == 7.0-* ]]  (checked
-    against bash in WSL):
+    bash: [[ "$k" == "7.0" || "$k" == 7.0.* || "$k" == 7.0-* ]]
 
         "7.0", "7.0.0-1004-azure", "7.0-rc1" -> True
         "7.00", "17.0", "7.1.0", " 7.0", ""  -> False
@@ -362,25 +308,41 @@ def current_kernel_version(env: dict[str, str]) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# File writing (raises OSError; install() turns that into a failure).
+# bash's DKMS configuration functions. Each returns True, or False if a file
+# couldn't be written (logged by write_file).
 # --------------------------------------------------------------------------- #
-def _write_file(path: str, content: str, *, append: bool = False) -> str:
-    """Write (`cat >`, `tee`) or append (`cat >>`) `content`; log what happened.
+def configure_lustre_dkms_no_o2ib(config_file: str) -> bool:
+    """The RHEL-family LNet-over-TCP DKMS config (_NO_O2IB_CONF)."""
+    return write_file(config_file, _NO_O2IB_CONF, _OP)
 
-    Creates the parent directory first (bash's `mkdir -p "$(dirname ...)"`).
-    Returns "created", "replaced" or "appended".
-    """
-    existed = os.path.exists(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a" if append else "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(content)
-    if not existed:
-        action = "created"
-    else:
-        action = "appended" if append else "replaced"
-    log_info(_OP, f"{action.capitalize()} {path}", path=path, action=action)
-    log_debug(_OP, f"Wrote to {path}:\n{content}", path=path)
-    return action
+
+def configure_lustre_dkms_no_o2ib_with_tr_workaround(config_file: str) -> bool:
+    """The Ubuntu 24.04 LUSTRE_DKMS_CONFIGURE_EXTRA config (_NO_O2IB_TR_CONF)."""
+    return write_file(config_file, _NO_O2IB_TR_CONF, _OP)
+
+
+def configure_lustre_dkms_skip_artifact(module: str, module_version: str, slot: int,
+                                        description: str) -> bool:
+    """Append a BUILD_EXCLUSIVE_KERNEL[<slot>]="^$" record skip to
+    /etc/dkms/<module>-<version>.conf (bash `cat >>`)."""
+    path = dkms_conf_path(module, module_version)
+    block = skip_artifact_block(slot, description)
+    _warn_if_rerun_append(path, block)
+    if not write_file(path, block, _OP, append=True):
+        return False
+    log_info(_OP, f"DKMS will skip artifact record {slot} of {module} "
+                  "(the o2ib/ko2iblnd module, not built without o2ib)",
+             module=module, slot=slot, path=path)
+    return True
+
+
+def configure_legacy_lustre_dkms_no_o2ib(module_version: str) -> bool:
+    """The Ubuntu 22.04 legacy DKMS override (_LEGACY_DKMS_CONF), then the
+    record-11 skip appended to the same file."""
+    module = _UBUNTU_DKMS_MODULE
+    return (write_file(dkms_conf_path(module, module_version), _LEGACY_DKMS_CONF, _OP)
+            and configure_lustre_dkms_skip_artifact(
+                module, module_version, _UBUNTU_SKIP_SLOT, _UBUNTU_SKIP_DESCRIPTION))
 
 
 def _warn_if_rerun_append(path: str, text: str) -> None:
@@ -388,230 +350,159 @@ def _warn_if_rerun_append(path: str, text: str) -> None:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             already = text in handle.read()
-    except FileNotFoundError:
+    except OSError:
         return
     if already:
-        # BASH ISSUE (kept): the lines are appended on every run, never replaced.
+        # Kept bash issue: the lines are appended on every run, never replaced.
         log_warn(_OP, f"{path} already contains these lines; appending them again, "
                       "as bash does on a rerun (DKMS then sees them twice)",
                  path=path, appended=" | ".join(text.strip().split("\n")))
 
 
 # --------------------------------------------------------------------------- #
-# The bash helper functions, one to one.
+# The steps.
 # --------------------------------------------------------------------------- #
-def configure_lustre_dkms_no_o2ib(config_file: str) -> None:
-    """Write the RHEL-family LNet-over-TCP DKMS config.
-
-        mkdir -p "$(dirname "${config_file}")"
-        cat > "${config_file}" <<'EOF'
-        ...  (_NO_O2IB_CONF)
-        EOF
-    """
-    _write_file(config_file, _NO_O2IB_CONF)
-
-
-def configure_lustre_dkms_skip_artifact(module: str, module_version: str, slot: int,
-                                        description: str) -> None:
-    """Append a BUILD_EXCLUSIVE_KERNEL[<slot>]="^$" record skip.
-
-        local dkms_conf=/etc/dkms/${module}-${module_version}.conf
-        mkdir -p "$(dirname "${dkms_conf}")"
-        cat >> "${dkms_conf}" <<EOF
-        # ${description}
-        BUILD_EXCLUSIVE_KERNEL[${slot}]="^$"
-        EOF
-    """
-    path = dkms_conf_path(module, module_version)
-    block = skip_artifact_block(slot, description)
-    _warn_if_rerun_append(path, block)
-    _write_file(path, block, append=True)
-    log_info(_OP, f"DKMS will skip artifact record {slot} of {module} "
-                  "(the o2ib/ko2iblnd module, not built without o2ib)",
-             module=module, slot=slot, path=path)
+def _read_system_file(path: str) -> str | None:
+    """The text of /etc/lsb-release or /etc/os-release, or None (logged)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError as exc:
+        log_error(_OP, f"could not read {path}: {exc}", path=path)
+        return None
 
 
-def configure_lustre_dkms_no_o2ib_with_tr_workaround(config_file: str) -> None:
-    """Write the Ubuntu 24.04 LUSTRE_DKMS_CONFIGURE_EXTRA config.
-
-        mkdir -p "$(dirname "${config_file}")"
-        cat > "${config_file}" <<'EOF'
-        ...  (_NO_O2IB_TR_CONF)
-        EOF
-    """
-    _write_file(config_file, _NO_O2IB_TR_CONF)
-
-
-def configure_legacy_lustre_dkms_no_o2ib(module_version: str) -> None:
-    """Write the Ubuntu 22.04 legacy DKMS override, then skip record 11.
-
-        mkdir -p /etc/dkms
-        cat > "${dkms_conf}" <<'EOF'
-        ...  (_LEGACY_DKMS_CONF)
-        EOF
-        configure_lustre_dkms_skip_artifact "${module}" "${module_version}" 11 \\
-            "Ubuntu 22.04 ko2iblnd is record 11; --with-o2ib=no intentionally skips it."
-    """
-    module = _UBUNTU_DKMS_MODULE
-    _write_file(dkms_conf_path(module, module_version), _LEGACY_DKMS_CONF)
-    configure_lustre_dkms_skip_artifact(module, module_version, _UBUNTU_SKIP_SLOT,
-                                        _UBUNTU_SKIP_DESCRIPTION)
+def _skips_this_kernel(env: dict[str, str], distro: Distro) -> bool:
+    """Whether this build's kernel is a 7.0 kernel, which gets no Lustre client (logged)."""
+    kernel, source = current_kernel_version(env)
+    skipped = skips_kernel(kernel)
+    if skipped:
+        log_info(_OP, f"Skipping Lustre client installation for kernel version {kernel}",
+                 kernel_version=kernel, kernel_source=source, distro=distro.name,
+                 skipped=True)
+    else:
+        log_info(_OP, f"Kernel version {kernel} is not {_SKIPPED_KERNEL}; installing "
+                      "the Lustre client", kernel_version=kernel, kernel_source=source,
+                 skipped=False)
+    return skipped
 
 
-# --------------------------------------------------------------------------- #
-# Per-distro handlers. Each returns the version to record, or None on failure
-# (already logged). File errors raise OSError, handled in install().
-# --------------------------------------------------------------------------- #
-def _read(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        return handle.read()
-
-
-def _run(command: list[str], env: dict[str, str]) -> bool:
-    """Run one command; True if it succeeded (exec_program logs a failure)."""
-    return exec_program(command, _OP, env=env) == 0
-
-
-def _install_ubuntu(env: dict[str, str], version: str, kernel: str) -> str | None:
-    codename = lsb_codename(_read(_LSB_RELEASE))       # bash: source /etc/lsb-release
-    ubuntu_version = ubuntu_version_from_os_release(_read(_OS_RELEASE))
+def _write_amlfs_apt_source(env: dict[str, str]) -> str | None:
+    """Write the AMLFS apt source; the Ubuntu version (e.g. "22.04"), or None (logged)."""
+    lsb_release = _read_system_file(_LSB_RELEASE)     # bash: source /etc/lsb-release
+    if lsb_release is None:
+        return None
+    os_release = _read_system_file(_OS_RELEASE)
+    if os_release is None:
+        return None
+    codename = lsb_codename(lsb_release)
+    ubuntu_version = ubuntu_version_from_os_release(os_release)
     arch = env.get("ARCHITECTURE_DISTRO", "")
     signed_by = _SIGNED_BY.get(ubuntu_version, "")
     log_info(_OP, f"Ubuntu {ubuntu_version} ({codename})", distro=env.get("DISTRIBUTION", ""),
              codename=codename, ubuntu_version=ubuntu_version, arch=arch,
              signed_by=signed_by)
-    # Deliberate differences: bash would write blanks into the apt source line.
-    if not codename:
-        log_error(_OP, f"no DISTRIB_CODENAME in {_LSB_RELEASE}", path=_LSB_RELEASE)
+    problem = apt_source_problem(codename, ubuntu_version, arch)
+    if problem:
+        log_error(_OP, problem, ubuntu_version=ubuntu_version)
         return None
-    if not signed_by:
-        log_error(_OP, f"no apt signing key known for Ubuntu {ubuntu_version!r} "
-                       "(bash sets SIGNED_BY only for 22.04 and 24.04)",
-                  ubuntu_version=ubuntu_version)
+    if not write_file(_APT_SOURCE, amlfs_apt_source(arch, signed_by, codename), _OP):
         return None
-    if not arch:
-        log_error(_OP, "ARCHITECTURE_DISTRO is not set")
-        return None
+    return ubuntu_version
 
-    _write_file(_APT_SOURCE, amlfs_apt_source(arch, signed_by, codename))
-    if not _run(["apt-get", "update"], env):
-        return None
 
-    client_package = f"lustre-client-{version}"
-    dkms_package = f"amlfs-lustre-client-dkms-{version}"
-    # Install the userspace package first because it owns /etc/sysconfig/dkms-lustre.
-    # Pre-creating that conffile makes noninteractive dpkg stop at a prompt.
-    if not install_packages([client_package], env, _OP):
-        return None
-
-    if ubuntu_version == "22.04":
+def _configure_ubuntu_dkms(ubuntu_version: str, version: str) -> bool:
+    """22.04: the legacy DKMS config; any other Ubuntu: /etc/sysconfig/dkms-lustre."""
+    if ubuntu_version == _LEGACY_DKMS_UBUNTU:
         log_info(_OP, "Ubuntu 22.04: legacy DKMS config (--with-o2ib=no, skip record 11)")
-        configure_legacy_lustre_dkms_no_o2ib(version)
-    else:
-        log_info(_OP, "Using LUSTRE_DKMS_CONFIGURE_EXTRA=--with-o2ib=no "
-                      f"in {_UBUNTU_DKMS_SYSCONFIG}")
-        configure_lustre_dkms_no_o2ib_with_tr_workaround(_UBUNTU_DKMS_SYSCONFIG)
+        return configure_legacy_lustre_dkms_no_o2ib(version)
+    log_info(_OP, "Using LUSTRE_DKMS_CONFIGURE_EXTRA=--with-o2ib=no "
+                  f"in {_UBUNTU_DKMS_SYSCONFIG}")
+    return configure_lustre_dkms_no_o2ib_with_tr_workaround(_UBUNTU_DKMS_SYSCONFIG)
 
-    if not install_packages([dkms_package], env, _OP):
-        return None
 
-    if not check_dkms_status([_UBUNTU_DKMS_MODULE], _OP, env, kernel=kernel):
+def _install_ubuntu(env: dict[str, str], version: str, kernel: str) -> str | None:
+    """The Ubuntu branch; the version to record, or None (logged)."""
+    ubuntu_version = _write_amlfs_apt_source(env)
+    if ubuntu_version is None:
         return None
-    return version
+    # The userspace package goes before the DKMS config: it owns
+    # /etc/sysconfig/dkms-lustre, and a pre-created conffile makes
+    # noninteractive dpkg stop at a prompt.
+    installed = (run(["apt-get", "update"], _OP, env=env)
+                 and install_packages([f"lustre-client-{version}"], env, _OP)
+                 and _configure_ubuntu_dkms(ubuntu_version, version)
+                 and install_packages([f"amlfs-lustre-client-dkms-{version}"], env, _OP)
+                 and check_dkms_status([_UBUNTU_DKMS_MODULE], _OP, env, kernel=kernel))
+    return version if installed else None
 
 
 def _install_rhel(env: dict[str, str], version: str, kernel: str) -> str | None:
+    """The RHEL-family branch; the underscore version to record, or None (logged)."""
     version_us = underscore_version(version)
-    os_major = os_major_from_os_release(_read(_OS_RELEASE))
+    os_release = _read_system_file(_OS_RELEASE)
+    if os_release is None:
+        return None
+    os_major = os_major_from_os_release(os_release)
     log_info(_OP, f"RHEL family: el{os_major}, Lustre version {version_us}",
-             distro=env.get("DISTRIBUTION", ""), os_major=os_major,
-             version=version_us)
+             distro=env.get("DISTRIBUTION", ""), os_major=os_major, version=version_us)
     if not os_major:
-        # Deliberate difference: bash would write "baseurl=.../amlfs-el".
         log_error(_OP, f"could not read a numeric VERSION_ID from {_OS_RELEASE}",
                   path=_OS_RELEASE)
         return None
-
-    if not _run(["rpm", "--import", _MICROSOFT_KEY_URL], env):
-        return None
-    _write_file(_YUM_REPO, amlfs_yum_repo(os_major))
-
     packages = [f"lustre-client-dkms-{version_us}", f"lustre-client-{version_us}-devel"]
-    configure_lustre_dkms_no_o2ib(_EL_SYSCONFIG)
-    configure_lustre_dkms_skip_artifact(_EL_DKMS_MODULE, version_us, _EL_SKIP_SLOT,
-                                        _EL_SKIP_DESCRIPTION)
-
-    if not install_packages(packages, env, _OP, options=_EL_DNF_OPTIONS):
-        return None
-
-    if not check_dkms_status([_EL_DKMS_MODULE], _OP, env, kernel=kernel):
-        return None
-    return version_us
+    installed = (run(["rpm", "--import", _MICROSOFT_KEY_URL], _OP, env=env)
+                 and write_file(_YUM_REPO, amlfs_yum_repo(os_major), _OP)
+                 and configure_lustre_dkms_no_o2ib(_EL_SYSCONFIG)
+                 and configure_lustre_dkms_skip_artifact(
+                     _EL_DKMS_MODULE, version_us, _EL_SKIP_SLOT, _EL_SKIP_DESCRIPTION)
+                 and install_packages(packages, env, _OP, options=_EL_DNF_OPTIONS)
+                 and check_dkms_status([_EL_DKMS_MODULE], _OP, env, kernel=kernel))
+    return version_us if installed else None
 
 
-# --------------------------------------------------------------------------- #
-# Orchestrator.
-# --------------------------------------------------------------------------- #
+# Keyed by Distro.family; anything else takes bash's `else` (RHEL family).
+_INSTALLERS = {"ubuntu": _install_ubuntu}
+
+
+def _record_version(version: str) -> bool:
+    """write_component_version("LUSTRE", ...), logging a file error."""
+    try:
+        write_component_version("LUSTRE", version)
+    except OSError as exc:
+        log_error(_OP, f"could not record LUSTRE={version}: {exc}",
+                  component="LUSTRE", version=version)
+        return False
+    log_info(_OP, f"Recorded LUSTRE version {version}", component="LUSTRE",
+             version=version)
+    return True
+
+
 def install(env: dict[str, str]) -> int:
     """Install the AMLFS Lustre client and record its version. Returns 0 or 3."""
-    distribution = env.get("DISTRIBUTION", "")
-    kernel = _kernel_release()
-    is_ubuntu = "ubuntu" in distribution
-
-    if "azurelinux" in distribution:
-        # BASH ISSUE (kept): see the module docstring.
+    distro = Distro.from_env(env)
+    if distro.is_azurelinux:
         log_warn(_OP, "distros/azurelinux3.0/install.sh does not run "
                       "install_lustre_client.sh, but the build plan runs this step "
                       "on every distro; continuing with bash's RHEL-family branch",
-                 distro=distribution)
-
-    cfg = config_for("lustre", env)
-
-    # Bash checks the kernel after the version lookup but before using the
-    # version, so a 7.0 kernel skips even when there is no "lustre" entry.
-    current_kernel, kernel_source = current_kernel_version(env)
-    if skips_kernel(current_kernel):
-        log_info(_OP, f"Skipping Lustre client installation for kernel version "
-                      f"{current_kernel}", kernel_version=current_kernel,
-                 kernel_source=kernel_source, distro=distribution, skipped=True)
+                 distro=distro.name)
+    if _skips_this_kernel(env, distro):
         return 0
-    log_info(_OP, f"Kernel version {current_kernel} is not {_SKIPPED_KERNEL}; "
-                  "installing the Lustre client", kernel_version=current_kernel,
-             kernel_source=kernel_source, skipped=False)
 
-    if not isinstance(cfg, dict) or not cfg.get("version"):
-        log_error(_OP, "could not resolve lustre version from versions.json",
-                  distro=distribution, arch=env.get("ARCHITECTURE", ""))
+    cfg = require_config("lustre", env, _OP, "version")
+    if cfg is None:
         return 3
     version = str(cfg["version"])
-
+    kernel = _kernel_release()          # the DKMS check uses the running kernel
     log_info(_OP, f"Installing the Lustre client {version}", version=version,
-             distro=distribution, arch=env.get("ARCHITECTURE", ""),
+             distro=distro.name, arch=env.get("ARCHITECTURE", ""),
              gpu=env.get("GPU", ""), kernel=kernel,
-             family="ubuntu" if is_ubuntu else "rhel")
+             family="ubuntu" if distro.is_ubuntu else "rhel")
 
-    handler = _install_ubuntu if is_ubuntu else _install_rhel
-    try:
-        recorded = handler(env, version, kernel)
-    except OSError as exc:
-        log_error(_OP, f"file operation failed: {exc}",
-                  path=getattr(exc, "filename", None) or "")
+    installer = _INSTALLERS.get(distro.family, _install_rhel)
+    recorded = installer(env, version, kernel)
+    if recorded is None or not _record_version(recorded):
         return 3
-    if recorded is None:
-        log_error(_OP, "Lustre client installation failed", distro=distribution,
-                  version=version)
-        return 3
-
-    try:
-        write_component_version("LUSTRE", recorded)
-    except OSError as exc:
-        log_error(_OP, f"could not record LUSTRE={recorded}: {exc}",
-                  component="LUSTRE", version=recorded)
-        return 3
-    log_info(_OP, f"Recorded LUSTRE version {recorded}", component="LUSTRE",
-             version=recorded)
-
-    log_info(_OP, "Lustre client installed", version=recorded, distro=distribution,
-             kernel=kernel,
-             dkms_module=_UBUNTU_DKMS_MODULE if is_ubuntu else _EL_DKMS_MODULE)
+    log_info(_OP, "Lustre client installed", version=recorded, distro=distro.name,
+             kernel=kernel)
     return 0

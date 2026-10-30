@@ -7,9 +7,9 @@
   * The text helpers mirroring grep/cut/sed pipelines, and the kernel 7.0
     skip pattern, were compared against real bash in WSL on representative
     input.
-  * install() runs with exec_program (one mock for this module's and
-    utils.package_installer's, so all commands are recorded in order),
-    config_for, check_dkms_status and write_component_version mocked, `uname -r` replaced, and every /etc path
+  * install() runs with exec_program (one mock wherever the toolkit calls it,
+    so all commands are recorded in order), config_for, check_dkms_status and
+    write_component_version mocked, `uname -r` replaced, and every /etc path
     redirected into a temporary directory.
 
 Run from the repo root:
@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_lustre_client as lustre
-from utils import package_installer
+from utils import component_config, files, package_installer, process
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-lustre"
@@ -234,25 +234,30 @@ class InstallTests(unittest.TestCase):
         cfg = None if version is None else {"version": version}
 
         exec_program = mock.Mock(side_effect=lambda c, op, **kw: 1 if c == fail_on else 0)
-        with mock.patch.object(lustre, "config_for", return_value=cfg) as config_for, \
-             mock.patch.object(lustre, "exec_program", exec_program), \
+        log_error = mock.Mock()
+        with mock.patch.object(component_config, "config_for",
+                               return_value=cfg) as config_for, \
+             mock.patch.object(component_config, "log_error", log_error), \
+             mock.patch.object(process, "exec_program", exec_program), \
              mock.patch.object(package_installer, "exec_program", exec_program), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
+             mock.patch.object(files, "log_info") as files_info, \
+             mock.patch.object(files, "log_error", log_error), \
              mock.patch.object(lustre, "check_dkms_status",
                                return_value=dkms_ok) as check, \
              mock.patch.object(lustre, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(lustre, "log_info") as log_info, \
              mock.patch.object(lustre, "log_warn") as log_warn, \
-             mock.patch.object(lustre, "log_error") as log_error:
+             mock.patch.object(lustre, "log_error", log_error):
             rc = lustre.install(env)
         for call in exec_program.call_args_list:
             self.assertEqual(call.args[1], _OP)
             self.assertIs(call.kwargs["env"], env)
         return rc, {"config_for": config_for, "exec": exec_program, "check": check,
                     "record": record, "info": log_info, "warn": log_warn,
-                    "error": log_error}
+                    "error": log_error, "files_info": files_info}
 
     @staticmethod
     def _commands(m):
@@ -267,6 +272,14 @@ class InstallTests(unittest.TestCase):
             if call.args[1] == message:
                 return call.kwargs
         self.fail(f"no log_info {message!r}; got {self._messages(m['info'])}")
+
+    def _written(self, m, path):
+        """How write_file reported its first write to `path`: created/replaced/appended."""
+        for call in m["files_info"].call_args_list:
+            if call.kwargs.get("path") == path:
+                self.assertEqual(call.args[1], f"Wrote {path} ({call.kwargs['action']})")
+                return call.kwargs["action"]
+        self.fail(f"no write_file log for {path}")
 
     def _assert_no_side_effects(self, m):
         m["exec"].assert_not_called()
@@ -309,13 +322,11 @@ class InstallTests(unittest.TestCase):
                           "gpu": "NVIDIA", "kernel": _KERNEL, "family": "ubuntu"})
         self.assertEqual(self._info_fields(m, "Ubuntu 24.04 (noble)")["codename"], "noble")
         apt_source = self.p("etc/apt/sources.list.d/amlfs.list")
-        self.assertEqual(self._info_fields(m, f"Created {apt_source}"),
-                         {"path": apt_source, "action": "created"})
+        self.assertEqual(self._written(m, apt_source), "created")
         self.assertEqual(self._info_fields(m, f"Recorded LUSTRE version {_NOBLE_V}"),
                          {"component": "LUSTRE", "version": _NOBLE_V})
         self.assertEqual(self._info_fields(m, "Lustre client installed"),
-                         {"version": _NOBLE_V, "distro": "ubuntu24.04", "kernel": _KERNEL,
-                          "dkms_module": "lustre-client-modules"})
+                         {"version": _NOBLE_V, "distro": "ubuntu24.04", "kernel": _KERNEL})
 
     def test_ubuntu_rerun_replaces_apt_source_and_sysconfig(self):
         self._system("ubuntu24.04", "noble")
@@ -330,7 +341,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read("etc/sysconfig/dkms-lustre"),
                          _fixture("sysconfig-dkms-lustre.conf"))
         sysconfig = self.p("etc/sysconfig/dkms-lustre")
-        self.assertEqual(self._info_fields(m, f"Replaced {sysconfig}")["action"], "replaced")
+        self.assertEqual(self._written(m, sysconfig), "replaced")
 
     def test_ubuntu_2204_same_for_every_gpu(self):
         # The Jammy AMD dkms 3.4.1 upgrade is gone (#633/#643): AMD and NVIDIA
@@ -377,11 +388,9 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._commands(m), commands[:index + 1])
                 m["check"].assert_not_called()
                 m["record"].assert_not_called()
-                self.assertIn("Lustre client installation failed",
-                              self._messages(m["error"]))
                 # A command failure is logged by exec_program (and
                 # install_packages), not repeated here.
-                self.assertEqual(len(m["error"].call_args_list), 1)
+                m["error"].assert_not_called()
 
     def test_ubuntu_dkms_check_failure(self):
         self._system("ubuntu24.04", "noble")
@@ -417,7 +426,7 @@ class InstallTests(unittest.TestCase):
         rc, m = self._install(self._env("ubuntu22.04"))
         self.assertEqual(rc, 3)
         self._assert_no_side_effects(m)
-        self.assertIn("file operation failed", m["error"].call_args.args[1])
+        self.assertIn("could not read", m["error"].call_args.args[1])
 
     def test_apt_source_write_error(self):
         self._system("ubuntu22.04", "jammy")
@@ -454,8 +463,6 @@ class InstallTests(unittest.TestCase):
         m["error"].assert_not_called()
         self.assertEqual(self._info_fields(m, f"RHEL family: el9, Lustre version {_EL_V}"),
                          {"distro": "almalinux9.8", "os_major": "9", "version": _EL_V})
-        self.assertEqual(self._info_fields(m, "Lustre client installed")["dkms_module"],
-                         "lustre-client")
 
     def test_rhel8(self):
         self._system("rocky8.10")
@@ -483,10 +490,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(second["warn"].call_args.kwargs["appended"],
                          '# EL ko2iblnd is record 3; --with-o2ib=no intentionally '
                          'skips it. | BUILD_EXCLUSIVE_KERNEL[3]="^$"')
-        self.assertEqual(self._info_fields(second, f"Appended {conf}"),
-                         {"path": conf, "action": "appended"})
-        self.assertEqual(self._info_fields(second, f"Replaced {self.p('etc/yum.repos.d/amlfs.repo')}")
-                         ["action"], "replaced")
+        self.assertEqual(self._written(second, conf), "appended")
+        self.assertEqual(self._written(second, self.p("etc/yum.repos.d/amlfs.repo")),
+                         "replaced")
 
     def test_rhel_command_failures_stop(self):
         for index, failing in enumerate(self._EL_COMMANDS):
@@ -498,7 +504,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._commands(m), self._EL_COMMANDS[:index + 1])
                 m["check"].assert_not_called()
                 m["record"].assert_not_called()
-                self.assertEqual(len(m["error"].call_args_list), 1)
+                m["error"].assert_not_called()      # logged by the command runners
 
     def test_rhel_rpm_import_failure_writes_nothing(self):
         self._system("almalinux9.8")
@@ -545,8 +551,8 @@ class InstallTests(unittest.TestCase):
                 rc, m = self._install(self._env("ubuntu24.04"), version=cfg_version)
                 self.assertEqual(rc, 3)
                 self._assert_no_side_effects(m)
-                self.assertIn("could not resolve lustre version from versions.json",
-                              self._messages(m["error"]))
+                self.assertTrue(any("no usable 'lustre' config" in message
+                                    for message in self._messages(m["error"])))
                 m["warn"].assert_not_called()
 
     # ---- kernel 7.0 skip ---------------------------------------------------------
@@ -569,7 +575,8 @@ class InstallTests(unittest.TestCase):
                     rc, m = self._install(env, version=version)
 
                 self.assertEqual(rc, 0)
-                m["config_for"].assert_called_once_with("lustre", env)   # looked up first
+                # The 7.0 skip doesn't need the version, so it isn't looked up.
+                m["config_for"].assert_not_called()
                 self._assert_no_side_effects(m)
                 m["check"].assert_not_called()
                 m["error"].assert_not_called()
@@ -600,8 +607,7 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu_2604_without_a_7_0_kernel_fails_before_writing(self):
         # Bash would write "signed-by=" (no SIGNED_BY for 26.04); with no
         # "lustre" entry for 26.04 it would also install "lustre-client-null".
-        for version, message in [(None, "could not resolve lustre version from "
-                                        "versions.json"),
+        for version, message in [(None, "versions.json has no usable 'lustre' config"),
                                  (_NOBLE_V, "no apt signing key known for Ubuntu "
                                             "'26.04' (bash sets SIGNED_BY only for "
                                             "22.04 and 24.04)")]:
