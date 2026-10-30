@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, install_azsecpack_prereqs
 from utils.sku import sku_has_infiniband
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -373,7 +373,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # New upstream (every distro): on 64 KB-page kernels, install nmap
         # from the distro, since the one shipped with AzSecPack doesn't work
         # there. Bash only until ADO 990 ports it.
-        Step("install-azsecpack-prereqs", "install_azsecpack_prereqs.sh"),
+        Step("install-azsecpack-prereqs", "install_azsecpack_prereqs.sh",
+             action=install_azsecpack_prereqs.install),
 
         # final configuration steps
         Step("add-udev-rules", "add-udev-rules.sh",

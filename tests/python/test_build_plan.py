@@ -158,9 +158,11 @@ class ResyncTests(unittest.TestCase):
                     self.assertIsNotNone(step.action)
                     self.assertTrue((_REPO_ROOT / "components" / step.script).is_file())
 
-    def test_new_upstream_step_runs_as_bash(self):
+    def test_new_upstream_step_runs_its_python_port(self):
+        from components.python import install_azsecpack_prereqs
         steps = {s.op: s for s in self._steps()}
-        self.assertIsNone(steps["install-azsecpack-prereqs"].action)   # ADO 990
+        self.assertIs(steps["install-azsecpack-prereqs"].action,
+                      install_azsecpack_prereqs.install)   # ADO 990
 
 
 # Same plan, different targets: check the SKU/vendor/arch gates pull in the right
