@@ -10,8 +10,9 @@
     components/install_dcgm.sh.
   * install() is tested with exec_program (wherever the toolkit calls it),
     run_capture, config_for, write_component_version and the `screen` lookup
-    mocked. Temporary directories (probe, marker rpmbuild), the unit file and
-    the drop-in directory live inside a test-owned temporary directory.
+    mocked. Temporary directories (probe, marker rpmbuild: tempfile.tempdir
+    is pointed there), the unit file and the drop-in directory live inside a
+    test-owned temporary directory.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_dcgm -v
@@ -104,8 +105,9 @@ def _patch_toolkit(stack, exec_program, *, config=None, error=None):
         stack.enter_context(mock.patch.object(module, "exec_program", exec_program))
     stack.enter_context(mock.patch.object(package_installer, "log_info"))
     stack.enter_context(mock.patch.object(files, "log_info"))
+    stack.enter_context(mock.patch.object(component_config, "log_info"))
     error = error or mock.Mock()
-    for module in (package_installer, component_config, install_dcgm):
+    for module in (package_installer, component_config, files, install_dcgm):
         stack.enter_context(mock.patch.object(module, "log_error", error))
     if config is not None:
         for module in (component_config, install_dcgm):
@@ -208,9 +210,9 @@ class InstallTests(unittest.TestCase):
         self.scratch.mkdir()
         self.dropin_dir = root / "nvidia-dcgm.service.d"
         self.unit = root / "nvidia-dcgm.service"
-        for name, value in (("_TEMP_PARENT_DIR", str(self.scratch)),
-                            ("_DROPIN_DIR", str(self.dropin_dir))):
-            patcher = mock.patch.object(install_dcgm, name, value)
+        for target, name, value in ((tempfile, "tempdir", str(self.scratch)),
+                                    (install_dcgm, "_DROPIN_DIR", str(self.dropin_dir))):
+            patcher = mock.patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -277,24 +279,27 @@ class InstallTests(unittest.TestCase):
         config_for = mock.Mock(side_effect=fake_config)
         with contextlib.ExitStack() as stack:
             log_error = _patch_toolkit(stack, exec_program, config=config_for)
-            run_capture = stack.enter_context(mock.patch.object(
-                install_dcgm, "run_capture", side_effect=fake_capture))
+            # installed_package_version() runs dpkg-query in package_installer.
+            run_capture = mock.Mock(side_effect=fake_capture)
+            for module in (install_dcgm, package_installer):
+                stack.enter_context(mock.patch.object(module, "run_capture", run_capture))
             stack.enter_context(mock.patch.object(
                 install_dcgm, "command_exists",
                 side_effect=lambda name, env: seen["screen"]))
             stack.enter_context(mock.patch.object(
-                install_dcgm, "_command_path",
+                install_dcgm, "command_path",
                 side_effect=lambda name, env: _SCREEN if seen["screen"] else None))
             record = stack.enter_context(mock.patch.object(
-                install_dcgm, "write_component_version", side_effect=write_error))
+                component_config, "write_component_version", side_effect=write_error))
             log_info = stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
             log_warn = stack.enter_context(mock.patch.object(install_dcgm, "log_warn"))
             files_info = files.log_info          # patched by _patch_toolkit
+            config_info = component_config.log_info
             rc = install_dcgm.install(env)
         return rc, {"exec": exec_program, "capture": run_capture,
                     "config_for": config_for, "record": record, "info": log_info,
                     "warn": log_warn, "error": log_error, "files_info": files_info,
-                    **seen}
+                    "config_info": config_info, **seen}
 
     @staticmethod
     def _commands(mocks):
@@ -377,7 +382,7 @@ class InstallTests(unittest.TestCase):
             *_TAIL])
         self.assertEqual(self._captures(m, "apt-cache"), [])
         self.assertEqual(self._captures(m, "dpkg-query"), [
-            ["dpkg-query", "-W", "-f=${Version}", f"{_DCGM}-core"]])
+            ["dpkg-query", "-W", "-f", "${Version}", f"{_DCGM}-core"]])
         m["record"].assert_called_once_with("DCGM", "1:4.8.0-1")
         self.assertNotIn("dcgm", [c.args[0] for c in m["config_for"].call_args_list])
 
@@ -525,8 +530,10 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(ubuntu[0].kwargs["pinned"])
         resolved = by_message[f"Resolved 8 DCGM packages pinned to {_UBUNTU_DCGM}"]
         self.assertEqual(resolved["packages"], _ubuntu13()[len(_APT):])
-        self.assertEqual(by_message[f"Recorded DCGM version {_UBUNTU_DCGM}"],
-                         {"component": "DCGM", "version": _UBUNTU_DCGM})
+        recorded = m["config_info"].call_args
+        self.assertEqual(recorded.args[1], f"Recorded DCGM {_UBUNTU_DCGM}")
+        self.assertEqual((recorded.kwargs["component"], recorded.kwargs["version"]),
+                         ("DCGM", _UBUNTU_DCGM))
         self.assertEqual(by_message[f"nv-hostengine command: {_HOSTENGINE}"]
                          ["screen"], _SCREEN)
         self.assertIn("nvidia-dcgm service is active", by_message)
@@ -560,7 +567,7 @@ class InstallTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             log_error = _patch_toolkit(stack, exec_program)
             stack.enter_context(mock.patch.object(
-                install_dcgm.tempfile, "mkdtemp", side_effect=PermissionError("no tmp")))
+                files.tempfile, "mkdtemp", side_effect=PermissionError("no tmp")))
             stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
             rc = install_dcgm.install(_env())
         self.assertEqual(rc, 3)
@@ -638,7 +645,7 @@ class InstallTests(unittest.TestCase):
                     stack.enter_context(mock.patch.object(
                         install_dcgm, "run_capture", return_value=(0, "13000\n")))
                     record = stack.enter_context(mock.patch.object(
-                        install_dcgm, "write_component_version"))
+                        component_config, "write_component_version"))
                     stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
                     rc = install_dcgm.install(_env("azurelinux3.0"))
                 self.assertEqual(rc, 3)

@@ -67,9 +67,11 @@ Deliberate differences from bash
   * RHEL family: a failing `dcgmi --version` or an empty parsed version fails
     the step; bash (no pipefail) would record "". Likewise an empty
     dpkg-query result on Ubuntu 26.04.
-  * The probe's and the marker's temporary directories come from
-    tempfile.mkdtemp() (like `mktemp -d`) and are removed in all cases; bash
-    leaves the marker's behind when rpmbuild fails.
+  * The probe's and the marker's temporary directories (make_temp_dir, bash
+    `mktemp -d`) are removed in all cases; bash leaves the marker's behind
+    when rpmbuild fails.
+  * Ubuntu 26.04 reads the version with installed_package_version(), which
+    spells it `dpkg-query -W -f ${Version} <package>` (bash: -f='${Version}').
   * resolve_exact_version_deps sorts each package's dependencies in plain
     character order (bash: `sort -u`, locale order). That only changes the
     order of the packages in the apt install.
@@ -82,22 +84,17 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
-import tempfile
 
-from utils.component_config import config_for, require_config, write_component_version
+from utils.component_config import config_for, record_version, require_config
 from utils.distro import Distro
-from utils.files import remove_paths, write_file
+from utils.files import make_dirs, make_temp_dir, remove_paths, write_file
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.package_installer import install_packages
-from utils.process import command_exists, exec_program, run, run_capture
+from utils.package_installer import install_packages, installed_package_version
+from utils.process import command_exists, command_path, exec_program, run, run_capture
 from utils.services import service_is_active, systemctl
 
 _OP = "install-dcgm"
 
-# Parent of the probe's and the marker's temporary directories. None is
-# Python's default temp location, like `mktemp -d`; tests use their own.
-_TEMP_PARENT_DIR: str | None = None
 _PROBE_SOURCE_NAME = "cuda_driver_api_version.c"
 _PROBE_BINARY_NAME = "cuda_driver_api_version"
 
@@ -151,8 +148,8 @@ _AZURE_LINUX_CUDA_MAJOR = 13
 _UNPINNED_UBUNTU = "ubuntu26.04"
 # The extra dnf option bash passes when installing cuda<N> on the RHEL family.
 _RHEL_CUDA_OPTIONS = ["--setopt=install_weak_deps=True"]
-# bash: DCGM_VERSION=$(dpkg-query -W -f='${Version}' datacenter-gpu-manager-4-core)
-_DPKG_QUERY_DCGM = ["dpkg-query", "-W", "-f=${Version}", "datacenter-gpu-manager-4-core"]
+# Ubuntu 26.04 records this package's version (bash: dpkg-query -W -f='${Version}').
+_DCGM_CORE = "datacenter-gpu-manager-4-core"
 
 _AZURE_LINUX_MARKER = "hpcx-provides-openmpi"
 _RPMBUILD_DIRS = ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS")
@@ -334,41 +331,12 @@ def hostengine_dropin(screen: str, hostengine_cmd: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Small jobs the toolkit doesn't cover yet.
-# --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: make_temp_dir(op, *, prefix="tmp",
-# subdirs=(), parent=None) -> Path | None (bash `mktemp -d`, then `mkdir -p`
-# inside it; logs failures).
-def _make_temp_dir(prefix: str, subdirs=()) -> str | None:
-    """bash `mktemp -d` (plus `mkdir -p` of `subdirs` inside it), or None (logged)."""
-    path = None
-    try:
-        path = tempfile.mkdtemp(prefix=prefix, dir=_TEMP_PARENT_DIR)
-        for sub in subdirs:
-            os.makedirs(os.path.join(path, sub), exist_ok=True)
-        return path
-    except OSError as exc:
-        log_error(_OP, f"could not create a temporary directory: {exc}",
-                  path=getattr(exc, "filename", None))
-        if path:
-            remove_paths(path, op=_OP)
-        return None
-
-
-# TODO(ADO 1001): toolkit candidate: command_path(name, env) -> str | None
-# (bash `$(command -v name)`; command_exists() only answers yes/no).
-def _command_path(name: str, env: dict[str, str]) -> str | None:
-    """bash `command -v <name>`: its path on the build env's PATH, or None."""
-    return shutil.which(name, path=env.get("PATH"))
-
-
-# --------------------------------------------------------------------------- #
 # 1. Which CUDA major the installed driver supports.
 # --------------------------------------------------------------------------- #
 def _driver_cuda_major(env) -> int | None:
     """Compile and run the C probe in a temporary directory; its CUDA major,
     or None (logged)."""
-    probe_dir = _make_temp_dir("cuda_probe.")
+    probe_dir = make_temp_dir(_OP, prefix="cuda_probe.")
     if probe_dir is None:
         return None
     try:
@@ -473,21 +441,6 @@ def _apt_install_dcgm(env, packages: list[str], dcgm: str | None) -> bool:
     return install_packages(packages, env, _OP)
 
 
-# TODO(ADO 1001): toolkit candidate: installed_package_version(package, env,
-# op) -> str | None (dpkg-query -W -f='${Version}' / rpm -q --qf '%{VERSION}').
-def _dpkg_dcgm_version(env) -> str | None:
-    """The installed datacenter-gpu-manager-4-core version, or None (logged)."""
-    rc, output = run_capture(_DPKG_QUERY_DCGM, _OP, env=env)
-    dcgm = output.rstrip("\n") if rc == 0 else ""
-    if not dcgm:
-        log_error(_OP, "could not read the installed datacenter-gpu-manager-4-core "
-                       "version with dpkg-query", exit_code=rc)
-        return None
-    log_info(_OP, f"Installed DCGM version is {dcgm}", dcgm_version=dcgm,
-             version_source="dpkg-query")
-    return dcgm
-
-
 def _dcgmi_reported_version(env) -> str | None:
     """The version `dcgmi --version` reports, or None (logged)."""
     rc, output = run_capture(["dcgmi", "--version"], _OP, env=env)
@@ -517,7 +470,7 @@ def _install_ubuntu(env, distro: Distro, cuda: int, sku_cuda: int | None) -> str
     if (_needs_sku_packages(cuda, sku_cuda)
             and not _apt_install_dcgm(env, ubuntu_extra_packages(sku_cuda), dcgm)):
         return None
-    return dcgm if pinned else _dpkg_dcgm_version(env)
+    return dcgm if pinned else installed_package_version(_DCGM_CORE, env, _OP)
 
 
 def _install_azurelinux(env, distro: Distro, cuda: int,
@@ -547,11 +500,11 @@ def _install_azure_linux_marker(env) -> bool:
         log_info(_OP, f"Marker rpm {_AZURE_LINUX_MARKER} is already installed",
                  package=_AZURE_LINUX_MARKER)
         return True
-    topdir = _make_temp_dir("tmp", subdirs=_RPMBUILD_DIRS)
+    topdir = make_temp_dir(_OP)
     if topdir is None:
         return False
     try:
-        marker_rpm = _build_marker_rpm(topdir, env)
+        marker_rpm = _build_marker_rpm(str(topdir), env)
         return marker_rpm is not None and run(
             ["rpm", "-Uvh", "--replacepkgs", marker_rpm], _OP, env=env)
     finally:
@@ -560,6 +513,8 @@ def _install_azure_linux_marker(env) -> bool:
 
 def _build_marker_rpm(topdir: str, env) -> str | None:
     """rpmbuild the marker spec under `topdir`; the rpm's path, or None (logged)."""
+    if not make_dirs(*(os.path.join(topdir, sub) for sub in _RPMBUILD_DIRS), op=_OP):
+        return None
     spec_file = os.path.join(topdir, f"{_AZURE_LINUX_MARKER}.spec")
     if not write_file(spec_file, _AZURE_LINUX_MARKER_SPEC, _OP):
         return None
@@ -601,18 +556,6 @@ def _install_rhel(env, distro: Distro, cuda: int, sku_cuda: int | None) -> str |
 _INSTALLERS = {"ubuntu": _install_ubuntu, "azurelinux": _install_azurelinux}
 
 
-def _record_version(dcgm: str) -> bool:
-    """write_component_version("DCGM", ...), logging a file error."""
-    try:
-        write_component_version("DCGM", dcgm)
-    except OSError as exc:
-        log_error(_OP, f"could not record the DCGM version: {exc}",
-                  path=getattr(exc, "filename", None))
-        return False
-    log_info(_OP, f"Recorded DCGM version {dcgm}", component="DCGM", version=dcgm)
-    return True
-
-
 # --------------------------------------------------------------------------- #
 # 3. nv-hostengine under screen with HPC-X, then the service.
 # --------------------------------------------------------------------------- #
@@ -645,7 +588,7 @@ def _ensure_screen(env) -> str | None:
         log_info(_OP, "screen not found: installing it", package="screen")
         if not install_packages(["screen"], env, _OP):
             return None
-    screen = _command_path("screen", env)
+    screen = command_path("screen", env)
     if screen is None:
         log_error(_OP, "screen is still not on PATH after installing it; the drop-in "
                        "needs its path", path=env.get("PATH"))
@@ -701,7 +644,7 @@ def install(env: dict[str, str]) -> int:
 
     installer = _INSTALLERS.get(distro.family, _install_rhel)
     dcgm = installer(env, distro, cuda, sku_cuda)
-    if dcgm is None or not _record_version(dcgm):
+    if dcgm is None or not record_version("DCGM", dcgm, _OP):
         return 3
     if not _configure_hostengine(env) or not _restart_service(env):
         return 3
