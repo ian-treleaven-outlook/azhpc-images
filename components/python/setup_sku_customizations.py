@@ -34,8 +34,8 @@ Deliberate differences from bash
     copied; bash copies first, then exits 1 for an unknown vendor.
   * The service file is written once, from the same three parts in the same
     order, instead of one `>` and two `>>`. The content is identical.
-  * `cp` is shutil.copy(), which also copies the mode: for an existing file
-    in the destination, `cp` would keep the old mode.
+  * `cp` is copy_file() (shutil.copy), which also copies the mode: for an
+    existing file in the destination, `cp` would keep the old mode.
   * The GB200 commands run without bash's `sudo`: the build runs as root.
   * Bash's `$DISTRIBUTION == "azurelinux3.0"` is Distro.is_azurelinux (the
     only Azure Linux built).
@@ -55,11 +55,10 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
 
 from utils.distro import Distro
-from utils.files import write_file
-from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.files import copy_file, edit_file, make_dirs, write_file
+from utils.logger import log_error, log_info, log_warn
 from utils.services import systemctl
 
 _OP = "setup-sku-customizations"
@@ -277,58 +276,29 @@ def replace_first_per_line(text: str, old: str, new: str) -> tuple[str, int]:
 
 
 # ---- Steps: each returns True, or False after the failure was logged -------
-# TODO(ADO 1001): toolkit candidate: copy_files(src_dir, dest_dir, op) -> bool —
-# bash `mkdir -p dest && cp src/* dest` (shell glob order, no dot files, no -r).
 def _copy_all(src_dir: str, dest_dir: str) -> bool:
     """bash: `mkdir -p <dest_dir>` then `cp <src_dir>/* <dest_dir>`."""
+    # Not copy_files(): `cp` without -r copies every file and only then fails
+    # on folders, where copy_files() would stop at the first folder.
     # Like the shell's `*`: no dot files, alphabetical order.
     entries = sorted(glob.glob(os.path.join(src_dir, "*")))
     if not entries:
         # The shell would pass a literal "*" to cp, which then fails.
         log_error(_OP, f"no files to copy in {src_dir}", source=src_dir)
         return False
-    # cp without -r copies the files (following symlinks), refuses folders,
-    # then exits non-zero, which stops bash (set -e).
     files = [entry for entry in entries if not os.path.isdir(entry)]
     folders = [entry for entry in entries if os.path.isdir(entry)]
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-        for entry in files:
-            shutil.copy(entry, dest_dir)
-    except OSError as exc:
-        log_error(_OP, f"could not copy {src_dir}/* to {dest_dir}: {exc}",
-                  source=src_dir, dest=dest_dir)
+    if not (make_dirs(dest_dir, op=_OP)
+            and all(copy_file(entry, dest_dir, _OP) for entry in files)):
         return False
     log_info(_OP, f"Copied {len(files)} files from {src_dir} to {dest_dir}",
              source=src_dir, dest=dest_dir, count=len(files))
-    log_debug(_OP, f"Copied to {dest_dir}: {', '.join(map(os.path.basename, files))}")
     if folders:
         log_error(_OP, f"{src_dir} contains folders, which `cp` (no -r) refuses "
                        "to copy, failing the bash step too",
                   source=src_dir, folders=", ".join(folders))
         return False
     return True
-
-
-# TODO(ADO 1001): toolkit candidate: edit_file(path, edit, op) -> bool — `sed -i`
-# style read/modify/write that fails on a missing file.
-def _edit_in_place(path: str, edit) -> int | None:
-    """Apply `edit` (text -> (new text, lines changed)) to a file, like `sed -i`.
-
-    Returns the number of lines changed, or None after logging a failure
-    (sed -i fails on a missing file, so this does too).
-    """
-    try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-        new_text, changed = edit(text)
-        # sed -i rewrites the file even when nothing matched.
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(new_text)
-    except OSError as exc:
-        log_error(_OP, f"could not edit {path}: {exc}", path=path)
-        return None
-    return changed
 
 
 def _copy_repo_files(env: dict[str, str]) -> bool:
@@ -356,36 +326,31 @@ def _setup_nvidia_extras() -> bool:
         log_info(_OP, f"{_FABRICMANAGER_UNIT} not found; no fabric manager "
                       "ordering fix needed", path=_FABRICMANAGER_UNIT)
         return True
-    removed = _edit_in_place(
-        _FABRICMANAGER_UNIT, lambda text: delete_matching_lines(text, _FM_AFTER_PATTERN))
-    if removed is None:
-        return False
-    log_info(_OP, f"Edited {_FABRICMANAGER_UNIT} in place: removed "
-                  "After=multi-user.target", path=_FABRICMANAGER_UNIT,
-             lines_removed=removed)
-    return True
+    def edit(text: str) -> str:
+        new_text, removed = delete_matching_lines(text, _FM_AFTER_PATTERN)
+        log_info(_OP, f"Removing After=multi-user.target from {_FABRICMANAGER_UNIT}",
+                 path=_FABRICMANAGER_UNIT, lines_removed=removed)
+        return new_text
+    return edit_file(_FABRICMANAGER_UNIT, edit, _OP)
 
 
 def _add_gb200_options(path: str) -> bool:
     """bash's GB200 sed on one GRUB file, warning on a rerun or no match."""
-    def edit(text: str) -> tuple[str, int]:
+    def edit(text: str) -> str:
         # The options start with "lockdown=integrity", so a rerun adds them again.
         if _GB200_CMDLINE in text:
             log_warn(_OP, f"GB200 kernel options are already in {path}; adding "
                           "them again, as bash's sed does on a rerun", path=path)
-        return replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE)
-
-    changed = _edit_in_place(path, edit)
-    if changed is None:
-        return False
-    if changed == 0:
-        log_warn(_OP, f"{_LOCKDOWN} not found in {path}; GB200 kernel "
-                      "options were not added there", path=path)
-    else:
-        log_info(_OP, f"Edited {path} in place: added GB200 kernel options "
-                      f"after {_LOCKDOWN}", path=path, lines_changed=changed,
-                 options=_GB200_CMDLINE)
-    return True
+        new_text, changed = replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE)
+        if changed == 0:
+            log_warn(_OP, f"{_LOCKDOWN} not found in {path}; GB200 kernel "
+                          "options were not added there", path=path)
+        else:
+            log_info(_OP, f"Adding GB200 kernel options after {_LOCKDOWN} in {path}",
+                     path=path, lines_changed=changed, options=_GB200_CMDLINE)
+        return new_text
+    # A missing file fails here, as bash's sed -i does.
+    return edit_file(path, edit, _OP)
 
 
 def _setup_gb200(env: dict[str, str]) -> bool:

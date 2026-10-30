@@ -320,7 +320,8 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertIn("could not edit", logs.at("error")[-1].message)
+        self.assertIn(f"could not read {self.paths['_GRUB_DEFAULT']}",
+                      logs.at("error")[-1].message)
 
     # ---- logging -----------------------------------------------------------
     def test_logs_start_decision_files_enable_and_summary(self):
@@ -333,7 +334,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(start.fields["sku"], "H100")
         messages = [r.message for r in info]
         self.assertIn("Using the NVIDIA setup/remove scripts", messages)
-        copied = [r for r in info if r.message.startswith("Copied ")]
+        copied = [r for r in info if r.message.startswith("Copied ") and "count" in r.fields]
         self.assertEqual([r.fields["count"] for r in copied], [2, 2])
         wrote = [r for r in info if r.fields.get("path") == self.paths["_SETUP_SCRIPT"]]
         self.assertEqual(wrote[0].fields["action"], "created")
