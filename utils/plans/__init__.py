@@ -66,6 +66,10 @@ def _no_steps(cfg: BuildConfig) -> list[Step]:
     return []
 
 
+def _accept_every_sku(sku: str) -> str:
+    return ""
+
+
 @dataclass(frozen=True)
 class DistroPlan:
     """How to build one distro, mirroring its install.sh."""
@@ -79,13 +83,18 @@ class DistroPlan:
     vendors: frozenset[str] = field(default_factory=lambda: frozenset({"NVidia", "AMD"}))
     # install.sh's message for a vendor it rejects.
     vendor_error: str = ""
+    # SKUs install.sh builds as another SKU, e.g. Ubuntu 24.04's
+    #     export SKU=$([[ $2 == "VR200" ]] && echo "GB200" || echo "$2")
+    sku_aliases: dict[str, str] = field(default_factory=dict)
+    # install.sh's message for a SKU it refuses outright, or "" to build it.
+    reject_sku: Callable[[str], str] = _accept_every_sku
 
 
 # The --os values with a Python build plan.
 PLANS: dict[str, DistroPlan] = {
     "Ubuntu22": DistroPlan(build=ubuntu22_04.build, pre_bootstrap=ubuntu22_04.pre_bootstrap),
-    "Ubuntu24": DistroPlan(build=ubuntu24_04.build),
-    "Ubuntu26": DistroPlan(build=ubuntu26_04.build, pre_bootstrap=ubuntu26_04.pre_bootstrap),
+    "Ubuntu24": DistroPlan(build=ubuntu24_04.build, sku_aliases={"VR200": "GB200"}),
+    "Ubuntu26": DistroPlan(build=ubuntu26_04.build, reject_sku=ubuntu26_04.reject_sku),
     "Azure3": DistroPlan(build=azurelinux3_0.build),
 }
 

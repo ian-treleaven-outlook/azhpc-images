@@ -29,7 +29,7 @@ from utils import build_config
 from utils.build_config import (DISTRIBUTIONS, DISTRO_DIRS, BuildConfig, ConfigError,
                                 ImageBuilder, build_plan, pre_bootstrap_plan,
                                 resolve_config)
-from utils.plans import OS_TARGETS, PENDING, PLANS, DistroPlan, steps, ubuntu26_04
+from utils.plans import OS_TARGETS, PENDING, PLANS, DistroPlan, steps
 from utils.plans.step import Step
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -58,12 +58,11 @@ def _cfg(os_name, vendor, gpu):
 
 def _targets(os_name):
     plan = PLANS[os_name]
-    # Ubuntu 26.04's install.sh refuses V100, GB200, VR200 and NCv6 before
-    # doing anything (its plan's pre-bootstrap step fails them), so only the
-    # SKUs it builds are checked against it.
-    rejected = ubuntu26_04.UNSUPPORTED_SKUS if os_name == "Ubuntu26" else frozenset()
+    # Some install.sh scripts refuse SKUs before doing anything (Ubuntu 26.04:
+    # V100, GB200, VR200, NCv6); resolve_config fails those, so only the SKUs
+    # a distro builds are checked against its install.sh.
     return [(vendor, gpu) for vendor in sorted(plan.vendors) for gpu in _SKUS[vendor]
-            if gpu not in rejected]
+            if not plan.reject_sku(gpu)]
 
 
 def _planned(cfg):

@@ -13,10 +13,11 @@ set-up, ...). The image is generic; the VM size is only known at boot.
   4. NVIDIA: an openibd.service drop-in that loads nvidia-peermem, and, if
      the fabric manager unit exists, delete its "After=multi-user.target"
      lines so it can start automatically.
-  5. Azure Linux 3.0 on GB200 (VR200 is built as GB200, see SKU_ALIASES in
-     utils/build_config.py): add kernel options after "lockdown=integrity" in
+  5. Azure Linux 3.0 on GB200: add kernel options after "lockdown=integrity" in
      /etc/default/grub and /boot/grub2/grub.cfg, and stop and disable
-     irqbalance.
+     irqbalance. (Azure Linux's install.sh does not build VR200 as GB200 —
+     only Ubuntu 24.04's does, see DistroPlan.sku_aliases — so a VR200 image
+     skips this, as in bash.)
   6. `systemctl enable sku-customizations` — not started during the build
      (pointless before the reboot, and it may fail on general-purpose sizes).
 

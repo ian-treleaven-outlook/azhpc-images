@@ -12,9 +12,8 @@ import re
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest import mock
 
-from utils.build_config import (BuildConfig, ImageBuilder, build_plan, pre_bootstrap_plan,
+from utils.build_config import (BuildConfig, ConfigError, build_plan, pre_bootstrap_plan,
                                 resolve_config)
 from utils.plans import ubuntu26_04
 
@@ -36,57 +35,44 @@ class UnsupportedSkuTests(unittest.TestCase):
 
     def test_install_sh_rejects_exactly_these_skus(self):
         text = _INSTALL_SH.read_text(encoding="utf-8")
-        rejected = set(re.findall(r'"\$SKU" == "(\w+)"', text))
-        self.assertEqual(rejected, set(ubuntu26_04.UNSUPPORTED_SKUS))
+        in_bash = set(re.findall(r'"\$SKU" == "(\w+)"', text))
+        self.assertEqual(in_bash, {"V100", "GB200", "VR200", "NCv6"})
+        for sku in in_bash:
+            with self.subTest(sku=sku):
+                self.assertTrue(ubuntu26_04.reject_sku(sku))
 
     def test_messages_are_install_sh_text(self):
         text = _INSTALL_SH.read_text(encoding="utf-8")
-        self.assertIn(f'echo "##[error]{ubuntu26_04.unsupported_sku_error("V100")}"', text)
+        self.assertIn(f'echo "##[error]{ubuntu26_04.reject_sku("V100")}"', text)
         # The other three share one message, with $SKU in it.
         self.assertIn('echo "##[error]$SKU is not supported on Ubuntu 26.04 yet."', text)
         for sku in ("GB200", "VR200", "NCv6"):
             with self.subTest(sku=sku):
-                self.assertEqual(ubuntu26_04.unsupported_sku_error(sku),
+                self.assertEqual(ubuntu26_04.reject_sku(sku),
                                  f"{sku} is not supported on Ubuntu 26.04 yet.")
         for sku in ("A100", "H100", "H200", "GB300", "MI300X"):
             with self.subTest(sku=sku):
-                self.assertIsNone(ubuntu26_04.unsupported_sku_error(sku))
+                self.assertEqual(ubuntu26_04.reject_sku(sku), "")
 
-    def test_rejected_skus_get_only_the_rejection(self):
-        # install.sh exits before install_utils.sh, so nothing else is planned.
-        for gpu in ("V100", "GB200", "NCv6"):
-            with self.subTest(gpu=gpu):
-                self.assertEqual(_ops("NVidia", gpu), ["reject-unsupported-sku"])
-        for vendor, gpu in (("NVidia", "A100"), ("NVidia", "GB300"), ("AMD", "MI300X")):
-            with self.subTest(gpu=gpu):
-                self.assertNotIn("reject-unsupported-sku", _ops(vendor, gpu))
+    def test_resolve_config_refuses_them_before_anything_runs(self):
+        # Ubuntu 26.04 has no VR200 alias, so VR200 is named in its own message.
+        for sku in ("V100", "GB200", "VR200", "NCv6"):
+            with self.subTest(sku=sku):
+                with self.assertRaises(ConfigError) as caught:
+                    resolve_config(Namespace(vendor="NVidia", gpu=sku, os="Ubuntu26",
+                                             spec=None, fips=False))
+                self.assertEqual(str(caught.exception), ubuntu26_04.reject_sku(sku))
+                self.assertEqual(caught.exception.code, 1)
 
-    def test_vr200_is_rejected_too(self):
-        # resolve_config builds VR200 as GB200 (SKU_ALIASES), which is rejected.
-        with mock.patch("utils.build_config.log_warn"):
-            cfg = resolve_config(Namespace(vendor="NVidia", gpu="VR200", os="Ubuntu26",
-                                           spec=None, fips=False))
-        step = pre_bootstrap_plan(cfg)[0]
-        self.assertTrue(step.when(cfg))
+    def test_supported_skus_resolve(self):
+        for vendor, sku in (("NVidia", "A100"), ("NVidia", "GB300"), ("AMD", "MI300X")):
+            with self.subTest(sku=sku):
+                cfg = resolve_config(Namespace(vendor=vendor, gpu=sku, os="Ubuntu26",
+                                               spec=None, fips=False))
+                self.assertEqual(cfg.gpu, sku)
 
-    def test_the_step_logs_install_sh_message_and_fails(self):
-        step = pre_bootstrap_plan(_cfg("NVidia", "V100"))[0]
-        self.assertEqual(step.runner, "python")
-        with mock.patch.object(ubuntu26_04, "log_error") as log_error:
-            self.assertEqual(step.action({"SKU": "V100"}), 3)
-        log_error.assert_called_once_with(
-            "reject-unsupported-sku", ubuntu26_04.unsupported_sku_error("V100"), sku="V100")
-
-    def test_a_rejected_sku_stops_before_install_utils(self):
-        builder = ImageBuilder(_REPO, _cfg("NVidia", "NCv6"))
-        with mock.patch("utils.build_config.prepare_system", return_value=0), \
-             mock.patch("utils.build_config.exec_program") as exec_program, \
-             mock.patch("utils.build_config.log_info"), \
-             mock.patch("utils.build_config.log_error"), \
-             mock.patch.object(ubuntu26_04, "log_error"):
-            rc = builder._bootstrap(_REPO / ubuntu26_04.DISTRO_DIR, {"SKU": "NCv6"})
-        self.assertEqual(rc, 3)
-        exec_program.assert_not_called()
+    def test_no_pre_bootstrap_steps(self):
+        self.assertEqual(pre_bootstrap_plan(_cfg("NVidia", "A100")), [])
 
 
 class GatingTests(unittest.TestCase):
