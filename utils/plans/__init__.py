@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from utils.plans import almalinux, azurelinux3_0, ubuntu22_04, ubuntu24_04, ubuntu26_04
+from utils.plans import almalinux, azurelinux3_0, rocky, ubuntu22_04, ubuntu24_04, ubuntu26_04
 
 if TYPE_CHECKING:
     from utils.build_config import BuildConfig
@@ -100,12 +100,12 @@ PLANS: dict[str, DistroPlan] = {
                         vendor_error=almalinux.VENDOR_ERROR),
     "Alma9": DistroPlan(build=almalinux.build, vendors=frozenset({"NVidia"}),
                         vendor_error=almalinux.VENDOR_ERROR),
+    "Rocky8": DistroPlan(build=rocky.build),
+    "Rocky9": DistroPlan(build=rocky.build),
 }
 
 # The --os values still waiting for one, and the ticket adding it.
 PENDING: dict[str, str] = {
-    "Rocky8": "ADO 996",
-    "Rocky9": "ADO 996",
     "RHEL8": "ADO 997",
     "RHEL9": "ADO 997",
 }
