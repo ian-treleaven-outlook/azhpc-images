@@ -14,7 +14,7 @@ import time
 import traceback
 
 from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, no_rdma_network, install_azsecpack_prereqs
-from utils.sku import sku_has_infiniband
+from utils.sku import sku_family, sku_has_infiniband
 from utils.system_prep import prepare_system
 from utils.component_config import DEFAULT_NODE_TYPE
 
@@ -104,8 +104,10 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     env["ARCHITECTURE_DISTRO"] = _detect_arch_distro(distribution)
 
     env["GPU"]        = cfg.gpu_arg                              # NVIDIA / AMD
-    env["SKU"]        = cfg.gpu                                  # H100, MI300, ...
-    env["SKU_FAMILY"] = "gb-family" if cfg.gpu in {"GB200", "GB300"} else cfg.gpu
+    env["SKU"]        = cfg.gpu                                  # H100, MI300X, ...
+    # As set_properties.sh: keep a SKU_FAMILY the caller already exported
+    # (`if [[ -z "${SKU_FAMILY:-}" ]]`), otherwise derive it from the SKU.
+    env["SKU_FAMILY"] = os.environ.get("SKU_FAMILY") or sku_family(cfg.gpu)
     # The deployment target, under the same name and default bash uses (see
     # utils/set_properties.sh). versions.json overrides are keyed on it, and the
     # bash steps that still run read it directly. An empty value gets the

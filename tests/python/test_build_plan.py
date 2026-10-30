@@ -284,6 +284,28 @@ class GatingTests(unittest.TestCase):
                                     f"{base / step.script} does not exist")
 
 
+# component_env() provides what set_properties.sh exports.
+class ComponentEnvTests(unittest.TestCase):
+    def _env(self, gpu, sku_family=None):
+        import os
+        with mock.patch.object(build_config, "_detect_distribution", return_value="ubuntu24.04"), \
+             mock.patch.object(build_config, "_detect_arch_distro", return_value="amd64"), \
+             mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKU_FAMILY", None)
+            if sku_family is not None:
+                os.environ["SKU_FAMILY"] = sku_family
+            return build_config.component_env(_REPO_ROOT, _cfg("NVidia", gpu))
+
+    def test_sku_family_is_derived_like_set_properties(self):
+        for gpu, family in (("A100", "A100plus"), ("H100", "A100plus"),
+                            ("GB200", "gb-family"), ("NCv6", "NCv6")):
+            with self.subTest(gpu=gpu):
+                self.assertEqual(self._env(gpu)["SKU_FAMILY"], family)
+
+    def test_a_caller_provided_sku_family_is_kept(self):
+        self.assertEqual(self._env("A100", sku_family="custom")["SKU_FAMILY"], "custom")
+
+
 # The inline cleanup in install.sh, run word for word from the distro folder.
 class CleanupTests(unittest.TestCase):
     def test_script_is_install_sh_text_word_for_word(self):

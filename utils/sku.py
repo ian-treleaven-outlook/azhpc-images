@@ -38,6 +38,25 @@ def sku_uses_ucx(sku):
     return not is_ncv6_sku(sku)
 
 
+def sku_family(sku):
+    """The GPU-family name for a SKU, as utils/set_properties.sh derives it.
+
+        case "${SKU:-}" in
+            GB200|GB300) export SKU_FAMILY="gb-family" ;;
+            A100|H100|H200) export SKU_FAMILY="A100plus" ;;
+            *)           export SKU_FAMILY="${SKU:-}" ;;
+        esac
+
+    Bash only does this when SKU_FAMILY isn't already set; component_env()
+    keeps a caller-provided value the same way.
+    """
+    if sku in ("GB200", "GB300"):
+        return "gb-family"
+    if sku in ("A100", "H100", "H200"):
+        return "A100plus"
+    return sku or ""
+
+
 def sku_network_mode(sku, node_type=DEFAULT_NODE_TYPE):
     """The network mode for this build target, as bash's sku_network_mode.
 
