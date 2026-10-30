@@ -21,9 +21,10 @@ Kept bash quirks
   * `./configure_service.sh` is run directly, so it needs its exec bit (the
     release tarball has it, and tar keeps it). If it can't run, the error
     says whether it exists and is executable.
-  * `grep -qxF` compares whole lines byte for byte, split only on "\\n" (a
-    "\\r\\n" line doesn't match); a missing or unreadable bashrc counts as
-    "not there", and `echo ... >>` then appends (creating the file).
+  * ensure_line is `grep -qxF` + `echo >>`: whole lines byte for byte, split
+    only on "\\n" (a "\\r\\n" line doesn't match); a missing or unreadable
+    bashrc counts as "not there", and the line is then appended (creating
+    the file).
 
 Deliberate differences
 ----------------------
@@ -39,10 +40,10 @@ from __future__ import annotations
 
 import os
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, write_file
+from utils.files import ensure_line, extract_tarball
 from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import run
@@ -82,32 +83,7 @@ def pip_package_options(distribution: str) -> list[str] | None:
     return None if options is None else list(options)
 
 
-def has_line(path: str, line: str) -> bool:
-    """bash `grep -qxF "<line>" <path>`: True if a whole line equals `line`."""
-    try:
-        with open(path, "rb") as handle:
-            return line.encode("utf-8") in handle.read().split(b"\n")
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        # grep exits 2 and `if !` treats that as "not there".
-        log_warn(_OP, f"could not read {path} ({exc}); appending the line, as "
-                      "bash does when grep fails", path=path)
-        return False
-
-
 # ---- Steps ----------------------------------------------------------------------
-# TODO(ADO 1001): toolkit candidate: ensure_line(path, line, op) -> bool
-# (bash `grep -qxF line file || echo line >> file`).
-def add_line_once(path: str, line: str) -> bool:
-    """`if ! grep -qxF "<line>" <path>; then echo "<line>" >> <path>; fi`."""
-    if has_line(path, line):
-        log_info(_OP, f"{path} already has the line", path=path, action="unchanged",
-                 line=line)
-        return True
-    return write_file(path, line + "\n", _OP, append=True)
-
-
 def install_deps(env: dict[str, str]) -> bool:
     """Step 1: make sure pip is usable."""
     distro = Distro.from_env(env)
@@ -166,17 +142,6 @@ def _configure_service(env: dict[str, str]) -> bool:
     return False
 
 
-def _record_version(version: str) -> bool:
-    try:
-        write_component_version("MONEO", version)
-    except OSError as exc:
-        log_error(_OP, f"could not record MONEO={version}: {exc}")
-        return False
-    log_info(_OP, f"Recorded MONEO version {version}", component="MONEO",
-             version=version)
-    return True
-
-
 def install(env: dict[str, str]) -> int:
     """Install Moneo and record its version. Returns 0 or 3."""
     cfg = require_config("moneo", env, _OP, "version", "sha256")
@@ -196,9 +161,9 @@ def install(env: dict[str, str]) -> int:
         return 3
     if not _configure_service(env):
         return 3
-    if not add_line_once(_BASHRC, _ALIAS):
+    if not ensure_line(_BASHRC, _ALIAS, _OP):
         return 3
-    if not _record_version(version):
+    if not record_version("MONEO", version, _OP):
         return 3
 
     log_info(_OP, f"Moneo {version} installed", version=version, path=moneo_dir,

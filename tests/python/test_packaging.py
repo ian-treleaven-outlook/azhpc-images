@@ -622,7 +622,8 @@ class MonitoringToolsTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(files, "log_info") as files_info, \
-             mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
+             mock.patch.object(component_config, "write_component_version") as wcv, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_monitoring_tools, "log_info") as info, \
              mock.patch.object(install_monitoring_tools, "log_warn") as warn, \
              mock.patch.object(install_monitoring_tools, "log_error") as error:
@@ -652,32 +653,6 @@ class MonitoringToolsTests(unittest.TestCase):
             with self.subTest(distro=distro):
                 self.assertEqual(install_monitoring_tools.pip_package_options(distro),
                                  options)
-
-    def test_add_line_once_matches_grep_qxF(self):
-        line = "alias x='y'"
-        cases = [
-            # (existing content, appended?, final content)
-            (None, True, b"alias x='y'\n"),
-            (b"alias x='y'\n", False, b"alias x='y'\n"),
-            (b"a\nalias x='y'", False, b"a\nalias x='y'"),              # no final newline
-            (b"alias x='y'\r\n", True, b"alias x='y'\r\nalias x='y'\n"),   # grep: \r is part of the line
-            (b"  alias x='y'\n", True, b"  alias x='y'\nalias x='y'\n"),   # -x: whole line
-            (b"last", True, b"lastalias x='y'\n"),                       # echo >> joins, like bash
-        ]
-        for before, appended, after in cases:
-            with self.subTest(before=before):
-                if os.path.exists(self.bashrc):
-                    os.remove(self.bashrc)
-                if before is not None:
-                    with open(self.bashrc, "wb") as handle:
-                        handle.write(before)
-                self.assertIs(install_monitoring_tools.has_line(self.bashrc, line),
-                              not appended)
-                with mock.patch("utils.files.log_info"), \
-                     mock.patch.object(install_monitoring_tools, "log_info"):
-                    self.assertTrue(install_monitoring_tools.add_line_once(self.bashrc, line))
-                with open(self.bashrc, "rb") as handle:
-                    self.assertEqual(handle.read(), after)
 
     # ---- install() -------------------------------------------------------------
     def test_install_commands_per_distro(self):
@@ -712,10 +687,9 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tools, "v0.3.5.tar.gz")))  # left, as bash
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")
-        messages = [c.args[1] for c in m["info"].call_args_list]
         self.assertEqual(m["files_info"].call_args.kwargs,
                          {"path": self.bashrc, "action": "created"})
-        self.assertIn("Recorded MONEO version 0.3.5", messages)
+        m["record"].assert_called_once_with("MONEO", "0.3.5")
         self.assertEqual(m["info"].call_args_list[-1].args[1], "Moneo 0.3.5 installed")
 
     def test_rerun_keeps_existing_moneo_dir_without_extracting(self):
@@ -729,9 +703,9 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertEqual(m["warn"].call_args.kwargs, {"path": self.moneo})
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")      # not appended twice
-        self.assertIn(f"{self.bashrc} already has the line",
-                      [c.args[1] for c in m["info"].call_args_list])
-        m["files_info"].assert_not_called()
+        # ensure_line logs that the line is there and writes nothing.
+        self.assertEqual([c.args[1] for c in m["files_info"].call_args_list],
+                         [f"{self.bashrc} already has the line"])
 
     @unittest.skipUnless(os.name == "posix", "runs a real script")
     def test_configure_service_runs_from_its_folder_with_the_exec_bit(self):
