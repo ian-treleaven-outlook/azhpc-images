@@ -5,9 +5,10 @@ Two kinds of test:
   * The pure helpers (version parsing, the apt source line, and the
     `dnf list installed | grep | sed` port) are tested directly with real inputs.
   * install() is tested per distro with its external effects mocked:
-    exec_program / run_capture (apt, dnf, curl, rpm; the apt-get/dnf installs
-    run through utils.package_installer, whose exec_program shares the mock)
-    and write_component_version. The /etc paths and the scratch work directory are
+    utils.process.exec_program (apt, dnf, curl, rpm via run/run_all) and
+    utils.package_installer.exec_program (the apt-get/dnf installs) share one
+    mock, plus run_capture and write_component_version. The /etc paths and
+    the scratch work directory are
     module-level constants, which the tests point at a temporary directory, so
     the real repo/pin files are genuinely copied but nothing under /etc is touched.
 
@@ -26,8 +27,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_pmix
-from utils import package_installer
+from utils import component_config, files, package_installer, process
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 _OP = "install-pmix"
 # The real components/ directory, so the shipped slurm-repo files are used.
@@ -65,19 +67,6 @@ def _env(distribution="ubuntu24.04", architecture="x86_64", arch_distro="amd64",
 # Pure helpers: real inputs, no mocks.
 # --------------------------------------------------------------------------- #
 class VersionHelperTests(unittest.TestCase):
-    def test_ubuntu_version_strips_the_prefix(self):
-        self.assertEqual(install_pmix.ubuntu_version("ubuntu24.04"), "24.04")
-        self.assertEqual(install_pmix.ubuntu_version("ubuntu22.04"), "22.04")
-
-    def test_rhel_major_version_keeps_the_leading_digits(self):
-        self.assertEqual(install_pmix.rhel_major_version("almalinux9.8"), "9")
-        self.assertEqual(install_pmix.rhel_major_version("rocky8.10"), "8")
-        self.assertEqual(install_pmix.rhel_major_version("rhel10.0"), "10")
-
-    def test_rhel_major_version_without_digits_returns_none(self):
-        self.assertIsNone(install_pmix.rhel_major_version("almalinux"))
-        self.assertIsNone(install_pmix.rhel_major_version(""))
-
     def test_apt_source_line_is_exactly_what_bash_echoes(self):
         self.assertEqual(
             install_pmix.apt_source_line("amd64", "slurm-ubuntu-noble",
@@ -86,17 +75,18 @@ class VersionHelperTests(unittest.TestCase):
             "https://packages.microsoft.com/repos/slurm-ubuntu-noble/ insiders main\n")
 
     def test_rhel_extra_repo_matches_the_bash_if_elif(self):
-        self.assertEqual(install_pmix.rhel_extra_repo("rhel9.6", "9", "x86_64"),
-                         "codeready-builder-for-rhel-9-x86_64-rhui-rpms")
-        self.assertEqual(install_pmix.rhel_extra_repo("rhel8.10", "8", "aarch64"),
+        def extra_repo(distribution, architecture="x86_64"):
+            return install_pmix.rhel_extra_repo(Distro(distribution), architecture)
+
+        self.assertEqual(extra_repo("rhel9.6"), "codeready-builder-for-rhel-9-x86_64-rhui-rpms")
+        self.assertEqual(extra_repo("rhel8.10", "aarch64"),
                          "codeready-builder-for-rhel-8-aarch64-rhui-rpms")
         # rhel* wins over the major-version branches, for any major.
-        self.assertEqual(install_pmix.rhel_extra_repo("rhel10.0", "10", "x86_64"),
-                         "codeready-builder-for-rhel-10-x86_64-rhui-rpms")
-        self.assertEqual(install_pmix.rhel_extra_repo("almalinux9.8", "9", "x86_64"), "crb")
-        self.assertEqual(install_pmix.rhel_extra_repo("rocky9.6", "9", "x86_64"), "crb")
-        self.assertEqual(install_pmix.rhel_extra_repo("rocky8.10", "8", "x86_64"), "powertools")
-        self.assertIsNone(install_pmix.rhel_extra_repo("almalinux10.0", "10", "x86_64"))
+        self.assertEqual(extra_repo("rhel10.0"), "codeready-builder-for-rhel-10-x86_64-rhui-rpms")
+        self.assertEqual(extra_repo("almalinux9.8"), "crb")
+        self.assertEqual(extra_repo("rocky9.6"), "crb")
+        self.assertEqual(extra_repo("rocky8.10"), "powertools")
+        self.assertIsNone(extra_repo("almalinux10.0"))
 
 
 class BashPackageListTests(unittest.TestCase):
@@ -209,15 +199,18 @@ class _InstallTestBase(unittest.TestCase):
                 Path(cwd, command[-1].rsplit("/", 1)[-1]).write_text("pkg", encoding="utf-8")
             return 0
 
-        # Installs run in utils.package_installer; patching its exec_program
-        # with the same mock keeps one ordered record of every command.
-        with mock.patch.object(install_pmix, "exec_program", side_effect=fake_exec) as ex, \
+        # Commands run in utils.process (run, run_all) and utils.package_installer
+        # (installs); one mock at both keeps one ordered record of every command.
+        with mock.patch.object(process, "exec_program", side_effect=fake_exec) as ex, \
              mock.patch.object(package_installer, "exec_program", new=ex), \
              mock.patch.object(install_pmix, "run_capture", return_value=capture) as cap, \
              mock.patch.object(install_pmix, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_pmix, "log_warn") as log_warn, \
              mock.patch.object(install_pmix, "log_error"), \
+             mock.patch.object(component_config, "log_error"), \
+             mock.patch.object(files, "log_info"), \
+             mock.patch.object(files, "log_error"), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"):
             rc = install_pmix.install(env)
@@ -558,13 +551,24 @@ class ConfigAndWriteTests(_InstallTestBase):
         record.assert_called_once()
 
     def test_unwritable_slurm_list_returns_3(self):
-        # Point the list at a path whose parent doesn't exist: open() raises.
+        # Point the list into a "directory" that is a file: the write fails.
+        Path(self.root, "not-a-dir").write_text("", encoding="utf-8")
         with mock.patch.object(install_pmix, "_SLURM_APT_LIST",
-                               os.path.join(self.root, "missing", "slurm.list")):
+                               os.path.join(self.root, "not-a-dir", "slurm.list")):
             rc, commands, _, _, _ = self._install(_env("ubuntu24.04"))
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
+
+    def test_missing_sources_list_dir_is_created(self):
+        # write_file creates the parent directory (bash's `>` would fail).
+        self._touch("_MS_PROD_APT_LIST")
+        slurm_list = os.path.join(self.root, "sources.list.d", "slurm.list")
+        with mock.patch.object(install_pmix, "_SLURM_APT_LIST", slurm_list):
+            rc, _, _, _, _ = self._install(_env("ubuntu24.04"))
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(Path(slurm_list).read_text(encoding="utf-8").startswith("deb [arch="))
 
 
 # --------------------------------------------------------------------------- #
