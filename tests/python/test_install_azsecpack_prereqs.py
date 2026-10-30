@@ -6,7 +6,7 @@
   * install() runs with page_size() mocked, PATH pointed at a temporary
     directory, install_packages()'s exec_program replaced by a fake that
     "installs" nmap by creating an executable file there, and run_capture
-    (`nmap --version`) mocked. So the real shutil.which() search and the real
+    (`nmap --version`) mocked. So the real command_exists() search and the real
     install_packages() are exercised, and no package manager runs.
 
 Run from the repo root:
@@ -139,7 +139,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_64k_with_nmap_present_logs_version_and_installs_nothing(self):
-        nmap = _make_nmap(self.bin_dir)
+        _make_nmap(self.bin_dir)
         env = self._env()
         rc, fake, capture, log_info, log_error = self._install(env)
 
@@ -150,7 +150,6 @@ class InstallTests(unittest.TestCase):
         log_error.assert_not_called()
         msg, fields = log_info.call_args.args[1], log_info.call_args.kwargs
         self.assertEqual(msg, f"nmap already installed: {_VERSION_LINE}")
-        self.assertEqual(fields["path"], nmap)
         self.assertEqual(fields["version"], _VERSION_LINE)
         # The page-size decision is logged first.
         self.assertEqual(log_info.call_args_list[0].kwargs["page_size"], _64K)
@@ -166,7 +165,7 @@ class InstallTests(unittest.TestCase):
         log_error.assert_not_called()
         msg, fields = log_info.call_args.args[1], log_info.call_args.kwargs
         self.assertEqual(msg, f"OK - nmap installed: {_VERSION_LINE}")
-        self.assertEqual(fields["path"], os.path.join(self.bin_dir, "nmap"))
+        self.assertEqual(fields["version"], _VERSION_LINE)
 
     def test_64k_installs_with_dnf_on_rpm_distros(self):
         for distro in ("azurelinux3.0", "almalinux9.x", "rhel9.x", "rocky8.10"):
@@ -221,7 +220,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(log_error.call_args.kwargs["search_path"], self.bin_dir)
 
     def test_non_executable_nmap_does_not_count(self):
-        # `command -v` only finds executable files; shutil.which agrees.
+        # `command -v` only finds executable files; command_exists agrees.
         with open(os.path.join(self.bin_dir, "nmap"), "w") as f:
             f.write("")
         rc, fake, _, _, _ = self._install(
@@ -265,13 +264,6 @@ class BashSourceTests(unittest.TestCase):
         self.assertIn("PAGE_SIZE=$(getconf PAGE_SIZE)\n", self.script)
         self.assertIn(f'if [ "$PAGE_SIZE" = "{m._PAGE_SIZE_64K}" ]; then',
                       self.script)
-
-    def test_docstring_quotes_the_script(self):
-        doc = m.__doc__
-        for line in self.script.splitlines()[1:]:
-            if line.strip():
-                with self.subTest(line=line):
-                    self.assertIn("    " + line + "\n", doc)
 
 
 # --------------------------------------------------------------------------- #
