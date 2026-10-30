@@ -8,11 +8,10 @@ a finished HPC image) can hold the apt/dpkg lock or change pinned packages:
          sed -i 's/APT::Periodic::Unattended-Upgrade ".*/APT::Periodic::Unattended-Upgrade "0";/' /etc/apt/apt.conf.d/20auto-upgrades
   2. `systemctl stop`, `disable`, then `mask` unattended-upgrades.service.
 
-Not in any build plan today: upstream #623 deleted the ubuntu22.04/24.04
-copies (Packer's prerequisites.sh now turns background apt off earlier). Only
-distros/ubuntu26.04/install.sh still runs the script; the module is kept for
-the Ubuntu 26.04 plan (ADO 993). On a distro without the apt file it fails
-before running systemctl.
+Only distros/ubuntu26.04/install.sh still runs the script (upstream #623
+deleted the ubuntu22.04/24.04 copies; Packer's prerequisites.sh now turns
+background apt off earlier), so only the Ubuntu 26.04 build plan runs this
+port. On a distro without the apt file it fails before running systemctl.
 
 Kept sed behaviour: `.*` runs to the end of the line, so everything after the
 opening quote (comments, a "\\r", a second setting) is replaced; text before

@@ -190,9 +190,8 @@ class BashSourceTests(unittest.TestCase):
 
 # --------------------------------------------------------------------------- #
 # Wiring: upstream removed disable_auto_upgrade.sh from Ubuntu 22.04 and 24.04
-# (#623; Packer handles it now), so the build plan no longer runs this module.
-# Only Ubuntu 26.04 still runs the script; the module is kept for the future
-# Ubuntu 26.04 build plan (ADO 993).
+# (#623; Packer handles it now). Only Ubuntu 26.04's install.sh still runs it,
+# so only the Ubuntu 26.04 plan does.
 # --------------------------------------------------------------------------- #
 class BuildPlanWiringTests(unittest.TestCase):
     def test_step_is_no_longer_in_the_build_plan(self):
@@ -204,6 +203,13 @@ class BuildPlanWiringTests(unittest.TestCase):
                                   fips=False, spec_path=None)
                 ops = [s.op for s in build_plan(cfg)]
                 self.assertNotIn("disable-auto-upgrade", ops)
+
+    def test_ubuntu2604_plan_runs_this_port(self):
+        cfg = BuildConfig(vendor="NVidia", gpu="A100", os="Ubuntu26",
+                          fips=False, spec_path=None)
+        step = {s.op: s for s in build_plan(cfg)}["disable-auto-upgrade"]
+        self.assertIs(step.action, disable_auto_upgrade.install)
+        self.assertEqual((step.script, step.base), ("disable_auto_upgrade.sh", "distro"))
 
 
 if __name__ == "__main__":

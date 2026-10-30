@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from utils.plans import ubuntu22_04, ubuntu24_04
+from utils.plans import ubuntu22_04, ubuntu24_04, ubuntu26_04
 
 if TYPE_CHECKING:
     from utils.build_config import BuildConfig
@@ -85,11 +85,11 @@ class DistroPlan:
 PLANS: dict[str, DistroPlan] = {
     "Ubuntu22": DistroPlan(build=ubuntu22_04.build, pre_bootstrap=ubuntu22_04.pre_bootstrap),
     "Ubuntu24": DistroPlan(build=ubuntu24_04.build),
+    "Ubuntu26": DistroPlan(build=ubuntu26_04.build, pre_bootstrap=ubuntu26_04.pre_bootstrap),
 }
 
 # The --os values still waiting for one, and the ticket adding it.
 PENDING: dict[str, str] = {
-    "Ubuntu26": "ADO 993",
     "Azure3": "ADO 994",
     "Alma8": "ADO 995",
     "Alma9": "ADO 995",

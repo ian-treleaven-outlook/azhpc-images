@@ -737,6 +737,7 @@ locals {
   python_cli_os_by_folder = {
     "ubuntu22.04" = "Ubuntu22"
     "ubuntu24.04" = "Ubuntu24"
+    "ubuntu26.04" = "Ubuntu26"
   }
   python_cli_os     = lookup(local.python_cli_os_by_folder, local.os_script_folder_name, "")
   python_cli_vendor = local.gpu_platform == "AMD" ? "AMD" : "NVidia"
