@@ -77,36 +77,42 @@ without building, and shows which steps run as Python and which as bash.
 Build a pair from the **same commit** (so `versions.json` is the same), with
 the same variables, as close together in time as possible (both builds run
 `apt upgrade`, and package mirrors move). The only difference should be
-`USE_PYTHON_CLI`.
+`USE_PYTHON_CLI`. Set `CAPTURE_IMAGE_FINGERPRINT=true` for **both** builds.
+
+```bash
+cd packer
+export CAPTURE_IMAGE_FINGERPRINT=true
+packer build ... .                                   # bash build
+cp -r /tmp/image_manifests ~/compare/bash-a100
+USE_PYTHON_CLI=true packer build ... .               # Python build
+cp -r /tmp/image_manifests ~/compare/python-a100
+python3 tools/compare_images.py ~/compare/bash-a100 ~/compare/python-a100
+```
 
 1. **Validation.** Packer runs `/opt/azurehpc/test/run-tests.sh` and, where
    the SKU supports it, the health checks, on both. Both must pass.
-2. **Component versions.** Packer downloads
-   `/opt/azurehpc/component_versions.txt` to
-   `/tmp/image_manifests/component-versions.json`. Save it from each build and
-   compare:
+2. **What the images contain.** `tools/compare_images.py` compares everything
+   the two manifest folders hold and prints, section by section, what is only
+   in one build or differs between them:
+   - from `build-evidence.tgz` (every build): installed packages and versions,
+     package holds, repositories, service states, `dkms status`;
+   - `component-versions.json` (every build; `ImageVersion` is ignored);
+   - `trivy-report-rootfs.json` (every build): vulnerabilities found;
+   - `image-fingerprint.json` (with `CAPTURE_IMAGE_FINGERPRINT`): every config
+     file the build writes (modprobe, udev, sysctl, limits, profile.d, systemd
+     units and drop-ins, ld.so.conf.d, apt/dnf config, waagent, netplan...)
+     with its mode and SHA256, the layout of `/opt` and `/usr/local`, the
+     modulefiles, enabled unit files and pip packages.
 
-   ```bash
-   diff <(jq -S . bash/component-versions.json) <(jq -S . python/component-versions.json)
-   ```
+   Exit status 0 means no differences. `--ignore REGEX` skips items you have
+   already explained; `--labels` renames the two builds in the report.
+3. **Explain every difference.** A package version can differ when the two
+   builds pulled from a mirror at different times; anything else is a parity
+   bug to report against the step that writes it (the report names the path or
+   package; the build log's `starting (python)` lines name the step).
 
-   Expect only `ImageVersion` to differ.
-3. **Vulnerability scan.** Compare the two `trivy-report-rootfs.json` reports
-   from the same folder.
-4. **The image itself.** Build with `RETAIN_VM_ALWAYS=true` and no artifacts,
-   then run the same commands on both VMs and diff the output:
-
-   ```bash
-   dpkg-query -W -f '${Package} ${Version}\n' | sort         # packages
-   apt-mark showhold                                          # held packages
-   systemctl list-unit-files --state=enabled --no-pager       # enabled services
-   ls -la /etc/modprobe.d /etc/udev/rules.d /etc/sysctl.d /etc/security/limits.d
-   find /opt /usr/share/modules/modulefiles -maxdepth 2 | sort
-   cat /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null
-   ```
-
-   Differences in timestamps, build folders and log files are expected; any
-   other difference is a parity bug to report against the step that writes it.
-
-Known, deliberate differences are listed in each Python module's docstring
-("Deliberate differences") and in the porting guide.
+The fingerprint step runs `tools/image_fingerprint.py` on the build VM after
+validation (stdlib only, works with any `python3` the VM has, even Python 3.6),
+downloads it next to the other manifests, and removes it from the VM, so the
+image itself is unchanged. Known, deliberate differences are listed in each
+Python module's docstring ("Deliberate differences") and in the porting guide.
