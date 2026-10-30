@@ -344,7 +344,7 @@ class InstallTests(unittest.TestCase):
         self.calls, self.events, self.fail_on, self.fail_rc = [], [], fail_on, fail_rc
         self.repo_dirs_existed = {}
 
-        def fake_capture(command, op, *, cwd=None, env=None):
+        def fake_capture(command, op, *, cwd=None, env=None, failure_is_error=True):
             if command[:2] == ["git", "-C"]:
                 self.events.append(("capture", "rev-parse"))
                 return rev_parse
@@ -528,7 +528,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(), self._azl_all())
         self.capture.assert_any_call(
             ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", "rccl"],
-            "install-rccl", env=mock.ANY)
+            "install-rccl", env=mock.ANY, failure_is_error=True)
         self.record.assert_called_once_with("RCCL", "2.22.3-1.azl3")
         self.assertEqual(self.sysctl_conf.read_text(),     # appended, not replaced
                          "existing=1\nkernel.numa_balancing=0\nvm.max_map_count=1048576\n")

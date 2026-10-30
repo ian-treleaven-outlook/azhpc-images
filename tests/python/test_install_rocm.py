@@ -302,7 +302,7 @@ class InstallTests(unittest.TestCase):
         versions = {"amdgpu-dkms": (0, _AMDGPU_DPKG), "amdrocm10-rvs": (0, _RVS_DPKG)}
         versions.update(dpkg or {})
 
-        def fake_capture(command, op, *, cwd=None, env=None):
+        def fake_capture(command, op, *, cwd=None, env=None, failure_is_error=True):
             return versions[command[-1]]
 
         env = {"DISTRIBUTION": distro, "COMPONENT_DIR": str(self.component_dir)}

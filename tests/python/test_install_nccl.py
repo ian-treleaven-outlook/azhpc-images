@@ -276,7 +276,7 @@ class InstallTests(unittest.TestCase):
         path.write_bytes(b"tgz")
         return path
 
-    def _fake_capture(self, command, op, *, env=None):
+    def _fake_capture(self, command, op, *, env=None, failure_is_error=True):
         self.captures.append(command)
         return self.dpkg_query
 

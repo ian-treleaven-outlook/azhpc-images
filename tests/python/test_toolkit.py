@@ -357,6 +357,17 @@ class MorePackageHelperTests(unittest.TestCase):
         self.assertIsNone(version)
         error.assert_called_once()
 
+    def test_installed_package_version_missing_ok_is_not_an_error(self):
+        # bash `if ! rpm -q pkg`: "not installed" is an answer, not a failure.
+        version, _, cap, error = self._run(package_installer.installed_package_version,
+                                           "python3-setools", distribution="rocky9.8",
+                                           capture=(1, "package python3-setools is not "
+                                                       "installed\n"),
+                                           missing_ok=True)
+        self.assertIsNone(version)
+        error.assert_not_called()
+        self.assertFalse(cap.call_args.kwargs["failure_is_error"])
+
     def test_unknown_distribution(self):
         ok, run, _, error = self._run(package_installer.remove_packages, ["x"], distribution="sles15")
         self.assertFalse(ok)

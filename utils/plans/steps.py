@@ -31,6 +31,7 @@ from components.python import (
     trivy_scan, write_kernel_os_version,
 )
 from components.python import azurelinux_network_config as azl_network_config
+from components.python import fix_setools_cyclecloud
 from utils.logger import log_info
 from utils.plans.step import Step
 from utils.process import exec_program
@@ -238,3 +239,10 @@ def azurelinux_network_config(**kw):
     """./network-config.sh in distros/azurelinux3.0 (the RHEL family's differs)."""
     return Step("network-config", "network-config.sh", base="distro",
                 action=azl_network_config.install, **kw)
+
+
+# --- AlmaLinux, Rocky Linux and RHEL -------------------------------------------
+def setools_cyclecloud(**kw):
+    """fix_setools_cyclecloud.sh, right after install_utils.sh."""
+    return Step("fix-setools-cyclecloud", "fix_setools_cyclecloud.sh",
+                action=fix_setools_cyclecloud.install, **kw)
