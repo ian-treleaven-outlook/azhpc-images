@@ -135,13 +135,13 @@ class InstallShParityTests(unittest.TestCase):
         self.assertEqual(_plan_scripts(_cfg("NVidia", "A100")), expected)
 
 
-# Since the upstream sync (ADO 983), some ports are behind their bash script and
-# run bash until a resync ticket updates them (Step.resync). This list is pinned
+# When upstream changes a ported script, the port is marked resync="ADO <id>"
+# and runs bash until the ticket updates it (Step.resync). This list is pinned
 # on purpose: re-enabling a port, or marking another one stale, should be a
-# deliberate change that also updates this test.
+# deliberate change that also updates this test. After the October 2026 sync,
+# ADO 984-988 resynced all 16 marked ports, so the list is empty.
 class ResyncTests(unittest.TestCase):
-    EXPECTED = {
-    }
+    EXPECTED: dict[str, str] = {}
 
     def _steps(self):
         return build_plan(_cfg("NVidia", "A100"))
@@ -157,6 +157,14 @@ class ResyncTests(unittest.TestCase):
                     self.assertTrue(step.script)
                     self.assertIsNotNone(step.action)
                     self.assertTrue((_REPO_ROOT / "components" / step.script).is_file())
+
+    def test_every_step_runs_its_python_port(self):
+        # Every step in the Ubuntu 24.04 plan has a current Python port.
+        for cfg in (_cfg("NVidia", "A100"), _cfg("NVidia", "GB200"),
+                    _cfg("NVidia", "NCv6"), _cfg("AMD", "MI300")):
+            for step in build_plan(cfg):
+                with self.subTest(gpu=cfg.gpu, op=step.op):
+                    self.assertEqual(step.runner, "python")
 
     def test_new_upstream_step_runs_its_python_port(self):
         from components.python import install_azsecpack_prereqs

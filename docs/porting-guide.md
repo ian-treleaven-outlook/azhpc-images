@@ -5,9 +5,8 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 34 steps. **17 run in Python. 16 have a
-Python port that is behind its bash script since the October 2026 upstream sync
-and run bash until resynced, and 1 new upstream step is bash only** (see §12).
+[`azhpc.py`](../azhpc.py#L192), has 34 steps; **all 34 run natively in Python**,
+matching upstream `Azure/azhpc-images@0c2b8f9` (October 2026; see §12).
 Each bash script is kept as that step's fallback and parity reference: delete a
 Step's `action=`, or mark it `resync=`, and it runs the bash script again. The
 plan mirrors `distros/ubuntu24.04/install.sh`; the other distros' `install.sh`
@@ -430,10 +429,9 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **865 tests, ~standard library only** — `unittest` and
-`unittest.mock`, no pytest. Six are skipped on purpose: they compare the Lustre
-and CUDA samples ports with bash that upstream has since changed, and each
-skip names the resync ticket that will update them.
+The suite is **1066 tests, ~standard library only** — `unittest` and
+`unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
+the test environment and skip themselves when those tools are missing.
 
 Add coverage for at minimum:
 
@@ -482,21 +480,22 @@ stale. If your component has interesting resolution (SKU-nested or
 
 ---
 
-## 12. Status — every step ported; 16 waiting for a resync
+## 12. Status — every step ported, in line with upstream `0c2b8f9`
 
-Every step that existed before the October 2026 upstream sync has a Python
-`action=`. The sync (ADO 983; upstream `f58ab80` → `0c2b8f9`) changed the plan:
+The October 2026 sync (ADO 983; upstream `f58ab80` → `0c2b8f9`) changed the
+plan:
 
 - the NVIDIA driver (GRID on NCv6) now runs **before** PMIx/MPI, so HPC-X can
   rebuild Open MPI with CUDA support;
 - `install_dynolog_drl.sh` and the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`
-  were removed upstream, so their steps are gone (the modules are retired in
-  ADO 989);
-- `install_azsecpack_prereqs.sh` is new, after `write_kernel_os_version.sh`, and
-  runs as bash until ADO 990 ports it.
+  were removed upstream, so their steps are gone. The dynolog port was deleted
+  (ADO 989); `disable_auto_upgrade.py` is kept for Ubuntu 26.04, which still
+  runs that script;
+- `install_azsecpack_prereqs.sh` is new, after `write_kernel_os_version.sh`
+  (ported in ADO 990).
 
-Upstream also changed 16 ported scripts. Those steps are marked `resync=` and
-run bash until their ticket updates the port:
+Upstream also changed 16 ported scripts. They were marked `resync=` during the
+sync, and resynced with the new bash in:
 
 | Ticket | Steps |
 |---|---|
@@ -506,9 +505,13 @@ run bash until their ticket updates the port:
 | ADO 987 | `install-doca`, `install-nccl`, `install-dcgm` |
 | ADO 988 | `install-lustre`, `hpc-tuning`, `install-persistent-rdma-naming`, `install-aznfs` |
 
-Ports kept enabled had no upstream change, or a change only for Ubuntu 26.04
-(not yet a CLI target: `install_docker.sh`, `install_monitoring_tools.sh`) or in
-whitespace (`install_health_checks.sh`).
+The resync also brought the smaller Ubuntu 26.04 changes into the docker and
+monitoring-tools ports, and fixed parity gaps found on the way (nvbandwidth,
+Moneo, mpifileutils, AZNFS). Each port mirrors every distro branch of its bash,
+including Ubuntu 26.04 and RHEL, ready for the per-distro plans.
+
+The bash tree matches upstream exactly; the only differences are Python test
+fixtures.
 
 Nested component scripts that a ported step calls (e.g. `install_gdrcopy.sh`,
 `install_nvidia_fabric_manager.sh`, `configure_nvidia_persistence.sh`,

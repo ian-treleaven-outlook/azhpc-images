@@ -263,9 +263,9 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     script — the non-IB rdma-core install + mana_ib blacklist and the tarball
     cleanup — is handled here only for the cleanup.)
 
-    Steps marked resync="ADO <id>" have a Python port that is behind its bash
-    script since the upstream sync (ADO 983); they run bash until that ticket
-    updates the port. See Step.resync.
+    Any step marked resync="ADO <id>" has a Python port that is behind its bash
+    script and runs bash until that ticket updates the port (see Step.resync).
+    None are marked today: every port matches upstream 0c2b8f9.
     """
     def nvidia(c):
         return c.vendor == "NVidia"
@@ -341,7 +341,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=install_intel_libs.install,
              when=lambda c: c.architecture == "x86_64"),
 
-        # (install_dynolog_drl.sh was removed upstream in #627; ADO 989.)
+        # (install_dynolog_drl.sh was removed upstream in #627.)
 
         # free space: remove downloaded tarballs/installers (inline rm in install.sh)
         Step("cleanup-downloads", action=_cleanup_downloads),
@@ -372,7 +372,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # New upstream (every distro): on 64 KB-page kernels, install nmap
         # from the distro, since the one shipped with AzSecPack doesn't work
-        # there. Bash only until ADO 990 ports it.
+        # there.
         Step("install-azsecpack-prereqs", "install_azsecpack_prereqs.sh",
              action=install_azsecpack_prereqs.install),
 
@@ -392,7 +392,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              action=setup_sku_customizations.install),
         Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install),
         # (disable_auto_upgrade.sh was removed upstream from Ubuntu 22.04 and
-        # 24.04 in #623; Packer handles it now. Only 26.04 runs it; ADO 989.)
+        # 24.04 in #623; Packer handles it now. Only Ubuntu 26.04 still runs
+        # it: components/python/disable_auto_upgrade.py is kept for that plan.)
         # Ubuntu only: this script exists only in the Ubuntu distro folders,
         # and only their install.sh scripts run it.
         Step("disable-predictive-interface-renaming",
