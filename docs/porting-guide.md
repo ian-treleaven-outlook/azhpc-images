@@ -10,6 +10,9 @@ natively in Python**, matching upstream `Azure/azhpc-images@0c2b8f9` (October
 2026; see §12). Other distros get their plans in ADO 992–997.
 Before them, the bootstrap makes `utils/set_properties.sh`'s system changes
 (`utils/system_prep.py`: apt upgrade, jq, ...) and runs `install_utils.sh`.
+The October 2026 clarity pass (ADO 1001) moved every port onto the shared
+toolkit (§4): 28% less code, no function over 40 lines, and no port
+re-implementing a toolkit job.
 Each bash script is kept as that step's fallback and parity reference: delete a
 Step's `action=`, or mark it `resync=`, and it runs the bash script again.
 
@@ -427,37 +430,33 @@ read it first.
 
 ```python
 def install(env: dict[str, str]) -> int:
-    # 1. resolve config; bail cleanly if the component isn't in versions.json
-    cfg = config_for("intel_one_mkl", env)
-    if not cfg or not cfg.get("version"):
-        log_error("install-intel-libs",
-                  "could not resolve intel_one_mkl version from versions.json")
+    """Download and run the Intel oneAPI MKL offline installer. Returns 0 or 3."""
+    cfg = require_config("intel_one_mkl", env, _OP, "version", "url", "sha256")
+    if cfg is None:
         return 3
     version = cfg["version"]
+    log_info(_OP, "Installing Intel oneAPI MKL", version=version, source=cfg["url"])
 
-    log_info("install-intel-libs", f"Installing Intel oneAPI MKL {version}")
-
-    # 2. download + verify — always guarded
-    try:
-        installer = download_and_verify(cfg.get("url", ""), cfg.get("sha256", ""),
-                                        dest_dir="/tmp")
-    except Exception as exc:
-        log_error("install-intel-libs", f"download/verify failed: {exc}")
+    installer = fetch_verified(cfg["url"], cfg["sha256"], _OP, _WORK_DIR)
+    if installer is None:
         return 3
-
-    # 3. run the vendor installer; check the return code explicitly
-    rc = exec_program([...], "install-intel-libs", env=env)
-    if rc != 0:
-        log_error("install-intel-libs", f"installer failed with exit code {rc}")
+    if not run(["sh", str(installer), "-s", "-a", "-s", "--eula", "accept"],
+               _OP, env=env):
         return 3
+    if not record_version("INTEL_ONE_MKL", version, _OP):
+        return 3
+    remove_paths(installer, op=_OP)
 
-    # 4. record what we installed
-    write_component_version("INTEL_ONE_MKL", version)
+    log_info(_OP, "Intel oneAPI MKL installed", version=version)
     return 0
 ```
 
+Every line says *what* happens; the toolkit handles *how* — checking the
+config keys, downloading and verifying, running the command, writing the
+versions file — and logs any failure, so the port only returns 3.
+
 That shape — *resolve → download → execute → record → clean up* — covers most
-remaining scripts.
+components.
 
 **When yours is harder, study these:**
 
@@ -503,7 +502,7 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **1089 tests, ~standard library only** — `unittest` and
+The suite is **1166 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
 the test environment and skip themselves when those tools are missing.
 
