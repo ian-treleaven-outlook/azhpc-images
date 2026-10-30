@@ -130,13 +130,15 @@ class PackageInstallerTests(unittest.TestCase):
         logged.assert_called_once()   # "no package manager detected" is reported as an error
 
 
-# install_mpifileutils.install_deps runs install_mpifileutils.sh's exact apt-get/dnf
-# command (upstream 0c2b8f9), chosen by DISTRIBUTION like bash's if/elif/else.
+# install_mpifileutils.install_deps installs install_mpifileutils.sh's package
+# list (upstream 0c2b8f9), chosen by DISTRIBUTION like bash's if/elif/else, in
+# one install_packages() call.
 class MpifileutilsDepsTests(unittest.TestCase):
     def _deps(self, distro, rc=0):
-        with mock.patch.object(install_mpifileutils, "exec_program", return_value=rc) as run, \
-             mock.patch.object(install_mpifileutils, "log_info") as info, \
-             mock.patch.object(install_mpifileutils, "log_error") as error:
+        with mock.patch.object(package_installer, "exec_program", return_value=rc) as run, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as error, \
+             mock.patch.object(install_mpifileutils, "log_info") as info:
             result = install_mpifileutils.install_deps(env={"DISTRIBUTION": distro})
         self.info, self.error = info, error
         return result, [c.args[0] for c in run.call_args_list]
@@ -147,14 +149,13 @@ class MpifileutilsDepsTests(unittest.TestCase):
                 rc, commands = self._deps(distro)
                 self.assertEqual(rc, 0)
                 self.assertEqual(commands, [
-                    ["apt-get", "install", "-y", "libbz2-dev", "libattr1-dev",
-                     "libarchive-dev", "libssl-dev", "libcap-dev"]])
+                    ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "libbz2-dev",
+                     "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"]])
                 self.assertEqual(self.info.call_args.kwargs["branch"], "ubuntu")
 
     def test_azure_linux_and_rhel_family_command(self):
         for distro, branch in (("azurelinux3.0", "azurelinux"), ("almalinux9.8", "rhel-family"),
-                               ("rocky8.10", "rhel-family"), ("rhel10.0", "rhel-family"),
-                               ("", "rhel-family")):
+                               ("rocky8.10", "rhel-family"), ("rhel10.0", "rhel-family")):
             with self.subTest(distro=distro):
                 rc, commands = self._deps(distro)
                 self.assertEqual(rc, 0)
@@ -162,6 +163,14 @@ class MpifileutilsDepsTests(unittest.TestCase):
                     ["dnf", "install", "-y", "bzip2-devel", "libattr-devel",
                      "libarchive-devel"]])
                 self.assertEqual(self.info.call_args.kwargs["branch"], branch)
+
+    def test_unknown_distro_returns_3_without_running_anything(self):
+        # bash's else branch would run dnf; install_packages() knows no manager.
+        rc, commands = self._deps("")
+        self.assertEqual(rc, 3)
+        self.assertEqual(commands, [])
+        self.assertEqual(self.info.call_args.kwargs["branch"], "rhel-family")
+        self.error.assert_called_once()
 
     def test_returns_3_when_install_fails(self):
         rc, commands = self._deps("ubuntu24.04", rc=100)
