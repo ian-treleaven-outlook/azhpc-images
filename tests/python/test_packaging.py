@@ -417,38 +417,47 @@ class IntelLibsInstallTests(unittest.TestCase):
 
     def test_get_config_resolves_version(self):
         self.assertEqual(
-            install_intel_libs.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
+            component_config.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
+
+    def _install(self, env, *, rc=0):
+        """install() with the download, commands and cleanup faked."""
+        with mock.patch.object(download_module, "download_and_verify",
+                               return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
+             mock.patch.object(process, "exec_program", return_value=rc) as ex, \
+             mock.patch.object(install_intel_libs, "write_component_version") as wcv, \
+             mock.patch.object(install_intel_libs, "remove_paths") as rm, \
+             mock.patch.object(component_config, "log_error") as config_error:
+            result = install_intel_libs.install(env)
+        return result, dl, ex, wcv, rm, config_error
 
     def test_install_runs_installer(self):
         env = self._env()
-        with mock.patch.object(install_intel_libs, "download_and_verify",
-                               return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
-             mock.patch.object(install_intel_libs, "exec_program", return_value=0) as ex, \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv:
-            rc = install_intel_libs.install(env)
+        rc, dl, ex, wcv, rm, _ = self._install(env)
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        ex.assert_called_once()
-        wcv.assert_called_once()
+        dl.assert_called_once_with("https://example/intel-onemkl-2025.3.1.11_offline.sh",
+                                   "s", dest_dir="/tmp")
+        ex.assert_called_once_with(
+            ["sh", "/tmp/intel-onemkl-2025.3.1.11_offline.sh", "-s", "-a", "-s",
+             "--eula", "accept"], "install-intel-libs", cwd=None, env=env)
+        wcv.assert_called_once_with("INTEL_ONE_MKL", "2025.3.1.11")
+        rm.assert_called_once_with("/tmp/intel-onemkl-2025.3.1.11_offline.sh",
+                                   op="install-intel-libs")
 
     def test_install_fails_when_installer_fails(self):
-        env = self._env()
-        with mock.patch.object(install_intel_libs, "download_and_verify",
-                               return_value="/tmp/x.sh"), \
-             mock.patch.object(install_intel_libs, "exec_program", return_value=1), \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv, \
-             mock.patch.object(install_intel_libs, "log_error") as logged:
-            rc = install_intel_libs.install(env)
+        rc, _, ex, wcv, rm, _ = self._install(self._env(), rc=1)
         self.assertEqual(rc, 3)
+        ex.assert_called_once()     # exec_program logs the failed command
         wcv.assert_not_called()
-        logged.assert_called()   # installer failure is reported as an error
+        rm.assert_not_called()
 
     def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_intel_libs, "log_error") as logged:
-            self.assertEqual(
-                install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
-
+        rc, dl, ex, wcv, _, config_error = self._install(
+            {"COMPONENT_VERSIONS": json.dumps({})})
+        self.assertEqual(rc, 3)
+        dl.assert_not_called()
+        ex.assert_not_called()
+        wcv.assert_not_called()
+        config_error.assert_called_once()   # missing version is reported as an error
 
 class HpcdiagTests(unittest.TestCase):
     def test_latest_tarball_url_parses(self):
