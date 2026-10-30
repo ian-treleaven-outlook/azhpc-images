@@ -23,9 +23,9 @@ that point and treat a non-zero result as their own failure, so keep the
 `install(env) -> int` signature. Logs use the op "install-cuda-samples" so
 the samples build can be told apart from the driver step around it.
 
-tar, cmake, nproc, make, `cmake --install .` and `mv -vT` run as programs,
-as in bash. The real `mv -T` keeps its behaviour: an existing, non-empty
-samples directory makes the move (and the step) fail.
+tar, cmake, make, `cmake --install .` and `mv -vT` run as programs, as in
+bash. The real `mv -T` keeps its behaviour: an existing, non-empty samples
+directory makes the move (and the step) fail.
 
 Deliberate differences from bash
 --------------------------------
@@ -37,6 +37,11 @@ Deliberate differences from bash
     anything is downloaded. Bash would fetch ".../vnull.tar.gz" (and install
     to /usr/local/cuda-null/samples).
   * tar runs as `tar -xf` (bash: `tar -xvf`; -v only listed the files).
+  * `mkdir build` is make_dirs (mkdir -p); the freshly extracted source has
+    no build directory, so this only matters if a release ever ships one.
+  * `make -j $(nproc)` takes the job count from cpu_count() (the CPUs this
+    process may run on, as nproc counts them; nproc would also honour
+    OMP_NUM_THREADS / OMP_THREAD_LIMIT, which the build doesn't set).
   * The InstallSamples.cmake check is made once, before cmake. Bash repeats
     it after make, but the file comes from the tarball and nothing in the
     build creates or removes it, so the answer can't change.
@@ -54,9 +59,9 @@ import os
 
 from utils.component_config import require_config
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths
+from utils.files import extract_tarball, fresh_dir, make_dirs, remove_paths
 from utils.logger import log_error, log_info, log_warn
-from utils.process import run, run_capture
+from utils.process import cpu_count, run
 
 # The log label for this nested component (it has no Step of its own).
 _OP = "install-cuda-samples"
@@ -102,34 +107,12 @@ def cmake_options(dest: str, cmake_install: bool) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Steps. Each returns a falsy value after its failure has been logged.
 # --------------------------------------------------------------------------- #
-def _fresh_work_dir() -> bool:
-    # TODO(ADO 1001): toolkit candidate: fresh_dir(path, op) -> bool
-    # (rm -rf, then mkdir -p; three driver/samples ports do this).
-    remove_paths(_WORK_DIR, op=_OP)
-    try:
-        os.makedirs(_WORK_DIR, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_WORK_DIR}: {exc}", path=_WORK_DIR)
-        return False
-    return True
-
-
 def _unpack_source(env: dict[str, str], version: str, sha256: str) -> str | None:
     """Download, verify and extract the source; return the source directory."""
     tarball = fetch_verified(samples_url(version), sha256, _OP, _WORK_DIR)
     if tarball is None or not extract_tarball(tarball.name, _OP, cwd=_WORK_DIR, env=env):
         return None
     return os.path.join(_WORK_DIR, f"cuda-samples-{version}")
-
-
-def _make_build_dir(source_dir: str) -> str | None:
-    build_dir = os.path.join(source_dir, "build")
-    try:
-        os.mkdir(build_dir)            # bash: mkdir build (no -p)
-    except OSError as exc:
-        log_error(_OP, f"could not create {build_dir}: {exc}", path=build_dir)
-        return None
-    return build_dir
 
 
 def _uses_cmake_install(source_dir: str, dest: str) -> bool:
@@ -143,23 +126,11 @@ def _uses_cmake_install(source_dir: str, dest: str) -> bool:
     return cmake_install
 
 
-def _cpu_count(env: dict[str, str]) -> str | None:
-    """$(nproc): ask nproc itself, so OMP_NUM_THREADS etc. count as in bash."""
-    rc, output = run_capture(["nproc"], _OP, env=env)
-    jobs = output.strip()
-    if rc != 0 or not jobs.isdigit():
-        log_error(_OP, f"could not read the CPU count from nproc: {jobs!r}", exit_code=rc)
-        return None
-    return jobs
-
-
 def _build(env: dict[str, str], build_dir: str, dest: str, cmake_install: bool) -> bool:
     """cmake <options> .. && make -j $(nproc)"""
-    if not run(["cmake", *cmake_options(dest, cmake_install), ".."], _OP,
-               cwd=build_dir, env=env):
-        return False
-    jobs = _cpu_count(env)
-    return jobs is not None and run(["make", "-j", jobs], _OP, cwd=build_dir, env=env)
+    return (run(["cmake", *cmake_options(dest, cmake_install), ".."], _OP,
+                cwd=build_dir, env=env)
+            and run(["make", "-j", str(cpu_count())], _OP, cwd=build_dir, env=env))
 
 
 def _install_samples(env: dict[str, str], build_dir: str, dest: str,
@@ -171,6 +142,8 @@ def _install_samples(env: dict[str, str], build_dir: str, dest: str,
         # directory, so a rerun on the same image fails here, as in bash.
         log_warn(_OP, f"{dest} already exists; `mv -vT` fails if it is not an "
                       "empty directory (bash behaviour, kept)", path=dest)
+    # The real mv, not move_file: move_file would move Samples into an
+    # existing dest directory instead of failing like `mv -T`.
     return run(["mv", "-vT", "./Samples", dest], _OP, cwd=build_dir, env=env)
 
 
@@ -179,8 +152,8 @@ def _build_and_install(env: dict[str, str], version: str, sha256: str,
     source_dir = _unpack_source(env, version, sha256)
     if source_dir is None:
         return False
-    build_dir = _make_build_dir(source_dir)
-    if build_dir is None:
+    build_dir = os.path.join(source_dir, "build")
+    if not make_dirs(build_dir, op=_OP):
         return False
     cmake_install = _uses_cmake_install(source_dir, dest)
     return (_build(env, build_dir, dest, cmake_install)
@@ -200,7 +173,7 @@ def install(env: dict[str, str]) -> int:
              samples_version=version, cuda_version=cuda_version,
              source=samples_url(version), dest=dest, work_dir=_WORK_DIR)
 
-    if not _fresh_work_dir():
+    if not fresh_dir(_WORK_DIR, _OP):
         return 3
     try:
         ok = _build_and_install(env, version, str(cfg["samples"]["sha256"]), dest)

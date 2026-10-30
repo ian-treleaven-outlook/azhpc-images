@@ -1,7 +1,7 @@
 """Unit tests for components/python/install_cuda_samples.py.
 
 install() runs with utils.download.download_and_verify, utils.process.exec_program
-(where run() and extract_tarball() end up) and run_capture mocked. The work dir
+(where run() and extract_tarball() end up) and cpu_count mocked. The work dir
 and the /usr/local prefix are redirected to a temporary directory.
 (These replace the CudaSamplesTests that used to live in test_packaging.py.)
 
@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_cuda_samples as m
-from utils import component_config, download, process
+from utils import component_config, download, files, process
 
 _OP = "install-cuda-samples"
 _SHA = "63cc9d5d8280c87df3c1f4e2276234a0f42cc497c52b40dd5bdda2836607db79"
@@ -84,11 +84,12 @@ class InstallTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _install(self, env, *, fail_on=None, nproc=(0, "8\n"), download_error=None,
-                 cmake_install=False):
+    def _install(self, env, *, fail_on=None, download_error=None, cmake_install=False,
+                 build_is_file=False):
         """Run install(env) with the externals mocked.
 
         cmake_install: the extracted source ships cmake/InstallSamples.cmake.
+        build_is_file: the extracted source has a file named "build".
         """
         calls = []
 
@@ -107,23 +108,22 @@ class InstallTests(unittest.TestCase):
                 os.makedirs(os.path.join(source, "cmake"))
                 if cmake_install:
                     Path(source, "cmake", "InstallSamples.cmake").write_text("")
+                if build_is_file:
+                    Path(source, "build").write_text("")
             return 1 if command == fail_on else 0
-
-        def fake_capture(command, op, **kwargs):
-            calls.append(("capture", command))
-            return nproc
 
         with mock.patch.object(download, "download_and_verify", side_effect=fake_download), \
              mock.patch.object(download, "log_error") as fetch_error, \
              mock.patch.object(process, "exec_program", side_effect=fake_exec), \
-             mock.patch.object(m, "run_capture", side_effect=fake_capture), \
+             mock.patch.object(m, "cpu_count", return_value=8), \
+             mock.patch.object(files, "log_error") as files_error, \
              mock.patch.object(component_config, "log_error") as config_error, \
              mock.patch.object(m, "log_info") as log_info, \
              mock.patch.object(m, "log_warn") as log_warn, \
              mock.patch.object(m, "log_error") as log_error:
             rc = m.install(env)
         return rc, calls, {"info": log_info, "warn": log_warn, "error": log_error,
-                           "config_error": config_error,
+                           "config_error": config_error, "files_error": files_error,
                            "download_error": fetch_error}
 
     def test_happy_path_mirrors_bash(self):
@@ -135,7 +135,6 @@ class InstallTests(unittest.TestCase):
             ("download", _URL, _SHA, self.work),
             ("exec", ["tar", "-xf", "v13.0.tar.gz"], self.work),
             ("exec", ["cmake", "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc", ".."], build),
-            ("capture", ["nproc"]),
             ("exec", ["make", "-j", "8"], build),
             ("exec", ["mv", "-vT", "./Samples", dest], build),
         ])
@@ -157,7 +156,6 @@ class InstallTests(unittest.TestCase):
             ("exec", ["tar", "-xf", "v13.0.tar.gz"], self.work),
             ("exec", ["cmake", "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
                       f"-DCUDA_SAMPLES_INSTALL_DIR={dest}", ".."], build),
-            ("capture", ["nproc"]),
             ("exec", ["make", "-j", "8"], build),
             ("exec", ["cmake", "--install", "."], build),
         ])
@@ -229,7 +227,7 @@ class InstallTests(unittest.TestCase):
     def test_each_command_failure_stops(self):
         build = ["cmake", "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc", ".."]
         for fail, count in [(["tar", "-xf", "v13.0.tar.gz"], 2), (build, 3),
-                            (["make", "-j", "8"], 5)]:
+                            (["make", "-j", "8"], 4)]:
             with self.subTest(fail=fail[0]):
                 rc, calls, logs = self._install(_env(), fail_on=fail)
                 self.assertEqual(rc, 3)
@@ -244,10 +242,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(calls[-1][1], ["mv", "-vT", "./Samples", dest])
         self.assertEqual(logs["error"].call_args.args[1], "CUDA samples installation failed")
 
-    def test_bad_nproc_output(self):
-        rc, calls, _ = self._install(_env(), nproc=(0, "\n"))
+    def test_build_dir_creation_failure_stops_before_cmake(self):
+        rc, calls, logs = self._install(_env(), build_is_file=True)
         self.assertEqual(rc, 3)
-        self.assertEqual(calls[-1], ("capture", ["nproc"]))
+        self.assertEqual(calls[-1][1], ["tar", "-xf", "v13.0.tar.gz"])
+        self.assertIn("could not create directory", logs["files_error"].call_args.args[1])
+        self.assertFalse(os.path.exists(self.work))
 
 
 if __name__ == "__main__":
