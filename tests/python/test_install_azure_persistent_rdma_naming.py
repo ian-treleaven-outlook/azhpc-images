@@ -7,9 +7,10 @@ Two kinds of test:
     were written by running the real bash heredocs (RDMA_CORE_VERSION=56.1) in
     bash, so they are byte for byte what the bash step writes.
   * install() runs with the download, tar, build.sh and systemctl faked by
-    FakeCommands below. /tmp, /usr/sbin and
-    /etc/systemd/system are pointed at a temporary folder, so the tests never
-    touch the real system or use the network.
+    FakeCommands below (patched where the toolkit runs them:
+    utils.download.download_and_verify and utils.process.exec_program).
+    /tmp, /usr/sbin and /etc/systemd/system are pointed at a temporary folder,
+    so the tests never touch the real system or use the network.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -26,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_azure_persistent_rdma_naming as rdma
+from utils import component_config, download, files, process
 from utils.build_config import BuildConfig, build_plan
 from utils.download import ChecksumError
 
@@ -100,7 +102,7 @@ class GeneratedTextTests(unittest.TestCase):
 # install(): external effects faked, file system in a temporary folder.
 # --------------------------------------------------------------------------- #
 class FakeCommands:
-    """Stands in for exec_program and download_and_verify.
+    """Stands in for exec_program and download_and_verify (via fetch_verified).
 
     Records every (command, cwd). The fake `bash build.sh` creates
     build/bin/rdma_rename in its cwd, as the real build would. fail_at=N makes
@@ -116,7 +118,7 @@ class FakeCommands:
         self.downloads.append((url, sha256, dest_dir))
         return Path(dest_dir) / os.path.basename(url)
 
-    def run(self, command, op, *, cwd=None, env=None):
+    def run(self, command, op, *, cwd=None, env=None, **_):
         self.commands.append((command, cwd))
         if len(self.commands) - 1 == self.fail_at:
             return 1
@@ -154,19 +156,24 @@ class InstallTests(unittest.TestCase):
     def _install(self, env=None, fake=None, download_error=None, naming_path=None):
         """Run install() with everything external faked.
 
-        Returns (rc, fake, logs), where logs holds the fake log_info, log_warn
-        and log_error, so tests can check what was reported.
+        Returns (rc, fake, logs), where logs holds the module's fake log_info,
+        log_warn and log_error, plus the toolkit's ("files_info",
+        "files_error", "download_error", "config_error"), so tests can check what was reported.
         """
         fake = fake or FakeCommands()
-        download = mock.Mock(side_effect=download_error or fake.download)
+        download_fake = mock.Mock(side_effect=download_error or fake.download)
         logs = {}
         with mock.patch.object(rdma, "_WORK_DIR", self.work), \
              mock.patch.object(rdma, "_SBIN_DIR", self.sbin), \
              mock.patch.object(rdma, "_NAMING_SCRIPT", naming_path or self.naming), \
              mock.patch.object(rdma, "_SERVICE_FILE", self.service), \
              mock.patch.object(rdma, "_TIMER_FILE", self.timer), \
-             mock.patch.object(rdma, "exec_program", side_effect=fake.run), \
-             mock.patch.object(rdma, "download_and_verify", download), \
+             mock.patch.object(process, "exec_program", side_effect=fake.run), \
+             mock.patch.object(download, "download_and_verify", download_fake), \
+             mock.patch.object(component_config, "log_error") as logs["config_error"], \
+             mock.patch.object(download, "log_error") as logs["download_error"], \
+             mock.patch.object(files, "log_info") as logs["files_info"], \
+             mock.patch.object(files, "log_error") as logs["files_error"], \
              mock.patch.object(rdma, "log_info") as logs["info"], \
              mock.patch.object(rdma, "log_warn") as logs["warn"], \
              mock.patch.object(rdma, "log_error") as logs["error"]:
@@ -175,7 +182,7 @@ class InstallTests(unittest.TestCase):
 
     def _expected_commands(self):
         return [
-            (["tar", "-xvf", _TARBALL, "--strip-components=1", "-C", "rdma-core"],
+            (["tar", "-xf", _TARBALL, "-C", "rdma-core", "--strip-components=1"],
              self.work),
             (["bash", "build.sh"], self.src),
             (["systemctl", "daemon-reload"], None),
@@ -221,7 +228,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(Path(self.naming).read_text(), rdma.naming_script(_VERSION))
         self.assertEqual(Path(self.service).read_text(), rdma._SERVICE_UNIT)
         self.assertEqual(Path(self.timer).read_text(), rdma._TIMER_UNIT)
-        wrote = [c for c in logs["info"].call_args_list if c.args[1] == f"Wrote {self.timer}"]
+        wrote = [c for c in logs["files_info"].call_args_list
+                 if c.kwargs["path"] == self.timer]
         self.assertEqual(wrote[0].kwargs["action"], "replaced")
 
     def test_existing_source_folder_is_reused_without_extracting(self):
@@ -245,14 +253,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(start.kwargs["rdma_core_version"], _VERSION)
         self.assertEqual(start.kwargs["source"], _URL)
 
-        wrote = [c for c in info.call_args_list if c.args[1] == f"Wrote {self.naming}"]
-        self.assertEqual(len(wrote), 1)
-        self.assertEqual(wrote[0].kwargs["mode"], "0755")
-        self.assertEqual(wrote[0].kwargs["action"], "created")
-
-        wrote = [c for c in info.call_args_list if c.args[1] == f"Wrote {self.timer}"]
-        self.assertEqual((wrote[0].kwargs["action"], wrote[0].kwargs["path"]),
-                         ("created", self.timer))
+        wrote = [(c.kwargs["path"], c.kwargs["action"])
+                 for c in logs["files_info"].call_args_list]
+        self.assertEqual(wrote, [(self.naming, "created"), (self.service, "created"),
+                                 (self.timer, "created")])
 
         enabled = [c for c in info.call_args_list if c.args[1] ==
                    "Enabled and started azure_persistent_rdma_naming.service and "
@@ -275,7 +279,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(fake.downloads, [])
                 self.assertEqual(fake.commands, [])
-                logs["error"].assert_called_once()
+                logs["config_error"].assert_called_once()
 
     def test_component_dir_is_not_needed(self):
         # Only the removed monitor installer needed it.
@@ -291,7 +295,7 @@ class InstallTests(unittest.TestCase):
                 rc, fake, logs = self._install(download_error=error)
                 self.assertEqual(rc, 3)
                 self.assertEqual(fake.commands, [])
-                self.assertIn("download/verify failed", logs["error"].call_args.args[1])
+                self.assertIn(_URL, logs["download_error"].call_args.args[1])
 
     def test_each_failing_command_returns_3_and_stops(self):
         for index in range(len(self._expected_commands())):
@@ -303,8 +307,8 @@ class InstallTests(unittest.TestCase):
                 rc, fake, logs = self._install(fake=FakeCommands(fail_at=index))
                 self.assertEqual(rc, 3)
                 self.assertEqual(fake.commands, expected[:index + 1])
-                error = logs["error"].call_args
-                self.assertEqual(error.kwargs["exit_code"], 1)
+                # exec_program logs the failed command; nothing repeats it.
+                logs["error"].assert_not_called()
 
     def test_missing_built_binary_returns_3(self):
         fake = FakeCommands()
@@ -328,15 +332,18 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertEqual(fake.commands, self._expected_commands()[:2])
-        self.assertIn(f"could not write {self.timer}", logs["error"].call_args.args[1])
+        self.assertIn(f"could not write {self.timer}",
+                      logs["files_error"].call_args.args[1])
 
     def test_unwritable_naming_script_returns_3_before_systemctl(self):
-        missing_dir = os.path.join(self._tmp.name, "no-such-dir", "naming.sh")
-        rc, fake, logs = self._install(naming_path=missing_dir)
+        # write_file creates missing folders, so make the "folder" a file.
+        not_a_dir = os.path.join(self._tmp.name, "a-file")
+        Path(not_a_dir).write_text("")
+        rc, fake, logs = self._install(naming_path=os.path.join(not_a_dir, "naming.sh"))
 
         self.assertEqual(rc, 3)
         self.assertEqual(fake.commands, self._expected_commands()[:2])
-        self.assertIn("could not write", logs["error"].call_args.args[1])
+        self.assertIn("could not write", logs["files_error"].call_args.args[1])
 
 
 # --------------------------------------------------------------------------- #
