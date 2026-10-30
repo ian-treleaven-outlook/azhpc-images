@@ -138,6 +138,7 @@ def exec_program(command: list[str], op: str, *, cwd: str | None = None, env = N
         # Covers the paths a signal handler can't: an exception mid-stream, or
         # the caller giving up on us. Never leave the child running.
         _kill_process_group(proc, op)
+        proc.stdout.close()           # release the pipe (avoids a ResourceWarning)
 
     _log_result(op, command, returncode, time.monotonic() - started, tail,
                 failure_is_error)
