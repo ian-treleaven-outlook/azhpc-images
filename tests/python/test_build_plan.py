@@ -210,6 +210,20 @@ class GatingTests(unittest.TestCase):
                 with mock.patch.object(build_config, "log_warn"):
                     cfg = resolve_config(args)
                 self.assertEqual(cfg.gpu, build_config.build_sku(sku))
+
+    def test_packer_python_cli_os_map_matches_the_cli(self):
+        # packer/variables.pkr.hcl maps each distro folder with a Python plan to
+        # an azhpc.py --os value (use_python_cli). Each must be a CLI OS whose
+        # distro folder is that same folder.
+        import re
+        hcl = (_REPO_ROOT / "packer" / "variables.pkr.hcl").read_text(encoding="utf-8")
+        block = re.search(r"python_cli_os_by_folder\s*=\s*\{(.*?)\}", hcl, re.S).group(1)
+        mapping = dict(re.findall(r'"([^"]+)"\s*=\s*"([^"]+)"', block))
+        self.assertTrue(mapping)
+        for folder, os_name in mapping.items():
+            with self.subTest(folder=folder):
+                self.assertEqual(build_config.DISTRO_DIRS[os_name], f"distros/{folder}")
+                self.assertTrue((_REPO_ROOT / "distros" / folder / "install.sh").is_file())
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))
         self.assertIn("install_doca.sh", plan)          # IB SKU -> DOCA

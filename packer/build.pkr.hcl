@@ -259,7 +259,10 @@ build {
       "KERNEL_VERSION=${local.kernel_version}",
       "REFRESH_MODE=${local.refresh_mode}",
     ]
-    inline = [
+    # use_python_cli: the same build through azhpc.py (docs/python-cli-builds.md).
+    inline = local.use_python_cli ? [
+      "cd /home/${local.ssh_username}/azhpc-images; python3 --version; python3 azhpc.py --vendor ${local.python_cli_vendor} --gpu ${local.gpu_sku} --os ${local.python_cli_os}",
+      ] : [
       "cd /home/${local.ssh_username}/azhpc-images/distros/${local.os_script_folder_name}/; if [[ \"${local.target_node_type}\" == \"baremetal_1p\" ]]; then bash ${local.install_script_name} ${local.gpu_platform} ${local.gpu_sku} \"${var.ado_access_token}\" \"${local.baremetal_1p_login_user}\" \"${var.baremetal_1p_login_passwd}\"; else bash ${local.install_script_name} ${local.gpu_platform} ${local.gpu_sku}; fi",
     ]
   }

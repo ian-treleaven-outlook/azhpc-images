@@ -554,7 +554,9 @@ original next steps:
 3. **Port where Python adds value** — component by component, one reversible
    line at a time.
 
-See `ToDo.md` in the repo root for the current open project-level items.
+See `ToDo.md` in the repo root for the current open project-level items, and
+[python-cli-builds.md](python-cli-builds.md) for building an image with the
+Python CLI through Packer and comparing it with a bash-built one.
 
 ---
 

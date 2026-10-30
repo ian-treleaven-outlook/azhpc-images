@@ -375,6 +375,7 @@ locals {
     local.buildid_tag,
     var.extra_tags,
     local.mde_exclusion_tag,
+    local.python_cli_tag,
   )
 }
 
@@ -714,6 +715,39 @@ locals {
 
 locals {
   nvlink_rackscale = startswith(local.gpu_sku, "GB") || startswith(local.gpu_sku, "VR")
+}
+
+# =============================================================================
+# Python CLI build (opt-in)
+# =============================================================================
+# Builds the HPC components with the Python CLI (azhpc.py, see
+# docs/python-cli-builds.md) instead of distros/<os>/install.sh, to compare
+# images built both ways. Unset or false: the bash build, exactly as before.
+
+variable "use_python_cli" {
+  type        = string
+  description = "Build the HPC components with the Python CLI (azhpc.py) instead of distros/<os>/install.sh. Unset or false keeps the bash build."
+  default     = env("USE_PYTHON_CLI")
+}
+locals {
+  use_python_cli = try(convert(lower(var.use_python_cli), bool), false)
+
+  # azhpc.py --os for each distro folder whose install.sh the Python build plan
+  # mirrors. Add a folder when its per-distro plan lands (ADO 991-997).
+  python_cli_os_by_folder = {
+    "ubuntu24.04" = "Ubuntu24"
+  }
+  python_cli_os     = lookup(local.python_cli_os_by_folder, local.os_script_folder_name, "")
+  python_cli_vendor = local.gpu_platform == "AMD" ? "AMD" : "NVidia"
+  # install_aks.sh (azure_vm_akshost) has no Python plan, and baremetal_1p
+  # needs the out-of-repo 1P overlay, which replaces bash files the CLI doesn't run.
+  python_cli_node_types = ["azure_vm_regular", "baremetal_3p"]
+  # Tag Python-built images so they can't be mistaken for bash-built ones.
+  python_cli_tag = local.use_python_cli ? { "AzhpcBuildCli" = "python" } : {}
+
+  # Fail before any VM is created, like _target_vm_size_node_type_check above.
+  _python_cli_os_check        = (!local.use_python_cli || local.python_cli_os != "") ? true : file("ERROR: use_python_cli is set, but the Python CLI has no build plan for ${local.os_script_folder_name} yet (python_cli_os_by_folder in packer/variables.pkr.hcl).")
+  _python_cli_node_type_check = (!local.use_python_cli || contains(local.python_cli_node_types, local.target_node_type)) ? true : file("ERROR: use_python_cli is set, but the Python CLI does not build TARGET_NODE_TYPE=${local.target_node_type} yet (python_cli_node_types in packer/variables.pkr.hcl).")
 }
 
 # =============================================================================
