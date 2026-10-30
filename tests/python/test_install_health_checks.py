@@ -166,8 +166,8 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(install_health_checks, "_DEST_TEST_DIR", self.dest), \
              mock.patch.object(process, "exec_program", side_effect=fake.run), \
              mock.patch.object(download_module, "download_and_verify", download), \
-             mock.patch.object(install_health_checks, "write_component_version",
-                               side_effect=write_error) as record, \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=write_error, return_value="/versions") as record, \
              mock.patch.object(install_health_checks, "log_error"), \
              mock.patch.object(install_health_checks, "log_warn"):
             rc = install_health_checks.install(env or self.env)

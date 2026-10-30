@@ -29,8 +29,9 @@ Deliberate differences:
     would fetch "vnull.tar.gz", or silently take the CUDA branch.
   * The tarball is downloaded straight into /opt/azurehpc/test rather than
     downloaded and then moved there.
-  * The file copy, chmod +x and sed edits are Python. tar, dos2unix and the
-    vendor's pull script still run as programs, so they behave as in bash.
+  * The file copy (copy_file, which also copies the source's mode), chmod +x
+    and sed edits (edit_file) are Python. tar, dos2unix and the vendor's pull
+    script still run as programs, so they behave as in bash.
 """
 
 from __future__ import annotations
@@ -38,12 +39,11 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
-from pathlib import Path
+from functools import partial
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.download import fetch_verified
-from utils.files import extract_tarball, write_file
+from utils.files import copy_file, edit_file, extract_tarball
 from utils.logger import log_error, log_info, log_warn
 from utils.process import run
 
@@ -123,13 +123,12 @@ def _replace_trigger_script(repo: str, env: dict[str, str]) -> bool:
     """bash `rm ./triggerGHR/triggerGHR.sh` (no -f) then `cp` ours over it."""
     trigger = os.path.join(repo, _TRIGGER_SCRIPT)
     try:
-        os.remove(trigger)
-        shutil.copyfile(os.path.join(env["COMPONENT_DIR"], "trigger_aznhc_GHR.sh"),
-                        trigger)
+        os.remove(trigger)          # not remove_paths: plain `rm` fails the step
     except OSError as exc:
-        log_error(_OP, f"could not replace {trigger}: {exc}", path=trigger)
+        log_error(_OP, f"could not remove {trigger}: {exc}", path=trigger)
         return False
-    return True
+    return copy_file(os.path.join(env["COMPONENT_DIR"], "trigger_aznhc_GHR.sh"),
+                     trigger, _OP)
 
 
 def _convert_trigger_configs(repo: str, env: dict[str, str]) -> bool:
@@ -155,25 +154,10 @@ def _make_scripts_executable(repo: str) -> bool:
 
 def _edit_nvidia_confs(repo: str) -> bool:
     """Apply the three NVIDIA threshold edits (bash's three `sed -i`)."""
-    for conf, pattern, replacement in _NVIDIA_CONF_EDITS:
-        path = os.path.join(repo, "conf", conf)
-        try:
-            text = Path(path).read_text(encoding="utf-8")
-        except OSError as exc:
-            log_error(_OP, f"could not read {path}: {exc}", path=path)
-            return False
-        if not write_file(path, sed_substitute(text, pattern, replacement), _OP):
-            return False
-    return True
-
-
-def _record_version(version: str) -> bool:
-    try:
-        write_component_version("AZ_HEALTH_CHECKS", version)
-    except OSError as exc:
-        log_error(_OP, f"could not record AZ_HEALTH_CHECKS={version}: {exc}")
-        return False
-    return True
+    return all(edit_file(os.path.join(repo, "conf", conf),
+                         partial(sed_substitute, pattern=pattern, replacement=replacement),
+                         _OP)
+               for conf, pattern, replacement in _NVIDIA_CONF_EDITS)
 
 
 def install(env: dict[str, str]) -> int:
@@ -204,7 +188,7 @@ def install(env: dict[str, str]) -> int:
         return 3
     if not run(["./" + _PULL_SCRIPT, image], _OP, cwd=repo, env=env):
         return 3
-    if not _record_version(version):
+    if not record_version("AZ_HEALTH_CHECKS", version, _OP):
         return 3
 
     log_info(_OP, "AzureHPC health checks installed", version=version, path=repo)
