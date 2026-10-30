@@ -14,6 +14,7 @@ import traceback
 
 from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, install_azsecpack_prereqs
 from utils.sku import sku_has_infiniband
+from utils.system_prep import prepare_system
 from utils.component_config import DEFAULT_NODE_TYPE
 
 MODULE_DIRS = {
@@ -82,8 +83,8 @@ def _detect_arch_distro(distribution: str) -> str:
 def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     """The env vars set_properties.sh exported that the component scripts read.
 
-    Pure environment setup only — no apt/yum side effects (those stay in the
-    bootstrap step for now).
+    Pure environment setup only; set_properties.sh's system changes (apt
+    upgrade, jq, ...) run in the bootstrap (utils/system_prep.py).
     """
     distribution = _detect_distribution()
 
@@ -412,9 +413,15 @@ class ImageBuilder:
     def _bootstrap(self, build_dir: Path, env: dict[str, str]) -> int:
         """Run system prep that must happen before any component.
 
-        Mirrors install_utils.sh (Microsoft repo, base packages, IB modules).
-        Still bash for now — it's heavily distro-specific, side-effecting work.
+        First the system changes utils/set_properties.sh makes (apt update and
+        upgrade, jq, AlmaLinux GPG keys; see utils/system_prep.py), then
+        install_utils.sh (Microsoft repo, base packages, IB modules), as every
+        distro's install.sh does. install_utils.sh is still bash: it's heavily
+        distro-specific, side-effecting work.
         """
+        rc = prepare_system(env)
+        if rc != 0:
+            return rc
         install_utils = build_dir / "install_utils.sh"
         log_info("bootstrap", "Preparing system (install_utils.sh)")
         return exec_program([str(install_utils)], "bootstrap",
