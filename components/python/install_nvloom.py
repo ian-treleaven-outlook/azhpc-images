@@ -81,6 +81,8 @@ install() returns 0 for success or 3 for failure. It logs problems and returns
 
 Deliberate differences from bash
 --------------------------------
+  * The dependency installs go through install_packages(), which normalises
+    `apt install -y` to `apt-get install -y -o Dpkg::Use-Pty=0`.
   * Patch path: bash applies the patch from /home/hpcuser/azhpc-images/...,
     which only exists when the repo is checked out in that one user's home.
     We use <TOP_DIR>/distros/azurelinux3.0/azurelinux_nvloom.patch, and fail
@@ -114,6 +116,7 @@ import shutil
 
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_error, log_info
+from utils.package_installer import install_packages
 from utils.process import exec_program
 from utils.repo_source import write_repo_source_info
 
@@ -136,29 +139,27 @@ _AZURE_LINUX = "azurelinux3.0"
 # The patch's location inside the repo checkout (joined onto TOP_DIR).
 _PATCH_IN_REPO = os.path.join("distros", "azurelinux3.0", "azurelinux_nvloom.patch")
 
-# Dependency installs, one command each, in bash's order. Bash runs with
-# `set -e`, so the first failing command stops the step. install() does the
-# same by stopping at the first non-zero exit code. (We don't use
-# PackageInstaller: it carries on after a failed package and picks the
-# package manager itself, while bash names dnf/apt explicitly.)
+# Dependency installs: one install_packages() call per bash command, in
+# bash's order. Bash runs with `set -e`, so the first failing install stops
+# the step; install() does the same.
 _AZURE_LINUX_DEPS = (
-    ["dnf", "install", "-y", "build-essential"],
-    ["dnf", "install", "-y", "boost-devel", "boost-program-options"],
-    ["dnf", "install", "-y", "cmake"],
+    ["build-essential"],
+    ["boost-devel", "boost-program-options"],
+    ["cmake"],
 )
 _UBUNTU_DEPS = (
-    ["apt", "install", "-y", "build-essential"],
-    ["apt", "install", "-y", "libboost-program-options-dev"],
-    ["apt", "install", "-y", "cmake"],
+    ["build-essential"],
+    ["libboost-program-options-dev"],
+    ["cmake"],
 )
 
 
 # --------------------------------------------------------------------------- #
 # Pure helpers: no side effects, so tests call them directly.
 # --------------------------------------------------------------------------- #
-def dependency_commands(distribution: str) -> tuple[list[str], ...] | None:
-    """Return the dependency install commands for a distro, or None if bash
-    has no branch for it.
+def dependency_packages(distribution: str) -> tuple[list[str], ...] | None:
+    """Return the dependency package lists for a distro (one per bash install
+    command), or None if bash has no branch for it.
 
     Uses bash's tests: an exact match for Azure Linux, and "contains 'ubuntu'"
     for Ubuntu.
@@ -317,7 +318,7 @@ def install(env: dict[str, str]) -> int:
     ref = configured_ref(config, version)
 
     distribution = env.get("DISTRIBUTION", "")
-    deps = dependency_commands(distribution)
+    deps = dependency_packages(distribution)
     if deps is None:
         # Bash would skip the build but still record NVLOOM.
         log_error(_OP, f"nvloom build is not supported on {distribution!r}",
@@ -348,7 +349,7 @@ def install(env: dict[str, str]) -> int:
         return 3
 
     # ---- 3. Build dependencies -------------------------------------------
-    if not _run_all(deps, env):
+    if not all(install_packages(packages, env, _OP) for packages in deps):
         return 3
 
     # ---- 4. Source, patch, build ------------------------------------------
