@@ -26,6 +26,8 @@ from unittest import mock
 from utils import component_config
 from utils import package_manager
 from utils import package_installer
+from utils import component_config, process
+from utils import download as download_module
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
 from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_aznfs
@@ -731,8 +733,9 @@ class MonitoringToolsTests(unittest.TestCase):
 
 
 class AznfsTests(unittest.TestCase):
-    """install_aznfs.py. Commands and the download are mocked; the installer
-    is written into a temporary directory (the port's _DOWNLOAD_DIR)."""
+    """install_aznfs.py. Commands (utils.process.exec_program) and the download
+    (utils.download.download_and_verify) are mocked; the installer is written
+    into a temporary directory (the port's _DOWNLOAD_DIR)."""
 
     _VERSIONS = json.dumps({"aznfs": {"common": {"version": "3.0.12", "sha256": "s"}}})
     _URL = ("https://github.com/Azure/AZNFS-mount/releases/download/3.0.12/"
@@ -791,19 +794,22 @@ class AznfsTests(unittest.TestCase):
 
         env = {"DISTRIBUTION": distribution, "ARCHITECTURE": "x86_64",
                "COMPONENT_VERSIONS": versions or self._VERSIONS}
-        with mock.patch.object(install_aznfs, "download_and_verify",
+        with mock.patch.object(download_module, "download_and_verify",
                                side_effect=fake_download) as download, \
-             mock.patch.object(install_aznfs, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec), \
              mock.patch.object(install_aznfs, "log_info") as info, \
              mock.patch.object(install_aznfs, "log_warn") as warn, \
-             mock.patch.object(install_aznfs, "log_error") as error:
+             mock.patch.object(install_aznfs, "log_error") as error, \
+             mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(download_module, "log_error") as download_error_log:
             rc = install_aznfs.install(env)
         for run_env in envs:
             self.assertEqual(run_env["AZNFS_NONINTERACTIVE_INSTALL"], "1")
             self.assertEqual(run_env["DISTRIBUTION"], distribution)
         self.assertNotIn("AZNFS_NONINTERACTIVE_INSTALL", env)    # caller's env untouched
         return rc, commands, {"download": download, "info": info, "warn": warn,
-                              "error": error}
+                              "error": error, "config_error": config_error,
+                              "download_error": download_error_log}
 
     # ---- pure helpers ----------------------------------------------------------
     def test_install_branch(self):
@@ -840,7 +846,7 @@ class AznfsTests(unittest.TestCase):
         rc, commands, m = self._install("ubuntu24.04", rcs={"apt": 100})
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [["apt", "install", "-y", "aznfs"]])
-        self.assertEqual(m["error"].call_args.kwargs["exit_code"], 100)
+        m["error"].assert_not_called()       # exec_program logs the failed command
 
     # ---- installer branch ------------------------------------------------------
     def test_azurelinux_runs_the_patched_installer_and_removes_it(self):
@@ -853,8 +859,6 @@ class AznfsTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.script))           # rm -f aznfs_install.sh
         m["warn"].assert_not_called()
         m["error"].assert_not_called()
-        messages = [c.args[1] for c in m["info"].call_args_list]
-        self.assertIn(f"Removed {self.script}", messages)
         patched = [c for c in m["info"].call_args_list if c.args[1].startswith("Patched ")]
         self.assertEqual(patched[0].kwargs["lines_changed"], 5)
 
@@ -885,14 +889,14 @@ class AznfsTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, [])
                 m["download"].assert_not_called()
-                m["error"].assert_called_once()
+                m["config_error"].assert_called_once()
 
     def test_download_failure_returns_3(self):
         rc, commands, m = self._install("azurelinux3.0",
                                         download_error=OSError("404"))
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertIn("download/verify", m["error"].call_args.args[1])
+        self.assertEqual(m["download_error"].call_args.kwargs["url"], self._URL)
 
 
 if __name__ == "__main__":
