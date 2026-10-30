@@ -1,60 +1,45 @@
 """install_intel_libs.py — Python port of components/install_intel_libs.sh.
 
-Resolve the version, download + verify the Intel oneAPI MKL offline installer,
-run it non-interactively, record the version, and clean up.
+Installs Intel oneAPI MKL: downloads the offline installer named by
+versions.json (`intel_one_mkl`: version, url, sha256; SHA256 checked) into
+/tmp, runs it non-interactively (`sh <installer> -s -a -s --eula accept`),
+records INTEL_ONE_MKL and removes the installer (bash `rm -f`).
+
+Deliberate differences: a missing version, url or sha256 fails before
+downloading; the installer is downloaded to and run from /tmp rather than the
+current directory; and the version is recorded once, after the installer
+succeeds, where bash records it both before downloading and at the end.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from utils.component_config import record_version, require_config
+from utils.download import fetch_verified
+from utils.files import remove_paths
+from utils.logger import log_info
+from utils.process import run
 
-from utils.component_config import config_for, write_component_version
-from utils.download import download_and_verify
-from utils.process import exec_program
-from utils.logger import log_info, log_error
-
+_OP = "install-intel-libs"
 _WORK_DIR = "/tmp"
 
 
 def install(env: dict[str, str]) -> int:
-    """Download and run the Intel oneAPI MKL offline installer.
-
-    Returns 0 on success, 3 on failure.
-    """
-    cfg = config_for("intel_one_mkl", env)
-    if not cfg or not cfg.get("version"):
-        log_error("install-intel-libs",
-                  "could not resolve intel_one_mkl version from versions.json")
+    """Download and run the Intel oneAPI MKL offline installer. Returns 0 or 3."""
+    cfg = require_config("intel_one_mkl", env, _OP, "version", "url", "sha256")
+    if cfg is None:
         return 3
     version = cfg["version"]
-    url = cfg.get("url", "")
-    sha256 = cfg.get("sha256", "")
+    log_info(_OP, "Installing Intel oneAPI MKL", version=version, source=cfg["url"])
 
-    log_info("install-intel-libs", f"Installing Intel oneAPI MKL {version}")
-
-    # 1. download + verify the offline installer
-    try:
-        installer = download_and_verify(url, sha256, dest_dir=_WORK_DIR)
-    except Exception as exc:
-        log_error("install-intel-libs", f"download/verify failed: {exc}")
+    installer = fetch_verified(cfg["url"], cfg["sha256"], _OP, _WORK_DIR)
+    if installer is None:
         return 3
-
-    # 2. run the vendor's self-extracting installer non-interactively
-    rc = exec_program(
-        ["sh", str(installer), "-s", "-a", "-s", "--eula", "accept"],
-        "install-intel-libs", env=env)
-    if rc != 0:
-        log_error("install-intel-libs", f"installer failed with exit code {rc}")
+    if not run(["sh", str(installer), "-s", "-a", "-s", "--eula", "accept"],
+               _OP, env=env):
         return 3
+    if not record_version("INTEL_ONE_MKL", version, _OP):
+        return 3
+    remove_paths(installer, op=_OP)
 
-    # 3. record the installed version
-    write_component_version("INTEL_ONE_MKL", version)
-
-    # 4. cleanup
-    try:
-        Path(installer).unlink()
-    except OSError:
-        pass
-
-    log_info("install-intel-libs", f"Intel oneAPI MKL {version} installed")
+    log_info(_OP, "Intel oneAPI MKL installed", version=version)
     return 0

@@ -5,12 +5,13 @@
     rdmasharpplugins ref lookup were compared with real bash/sed/jq in WSL,
     and the scripts were syntax-checked with `bash -n`.
   * install() runs with every external effect mocked: config lookup,
-    exec_program, run_capture (nproc, dpkg-query), the download,
-    dnf_pin_packages, write_repo_source_info and the versions file. A fake
-    exec_program/download creates what the real commands would (tarball,
-    source dir, rpms), so the real Python file handling (glob expansion,
-    cleanup) runs against a temporary directory. Nothing touches /tmp, /etc,
-    /opt or the network.
+    exec_program (where utils.process and install_packages() run commands,
+    recorded in one ordered list), cpu_count, run_capture (dpkg-query), the
+    download, dnf_pin_packages, write_repo_source_info and the versions file.
+    A fake exec_program/download creates what the real commands would
+    (tarball, source dir, rpms), so the real Python file handling (glob
+    expansion, cleanup) runs against a temporary directory. Nothing touches
+    /tmp, /etc, /opt or the network.
   * The dependency commands themselves are tested in test_packaging.py
     (NcclDepsTests); here we check install() runs them exactly once.
 
@@ -27,7 +28,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nccl
-from utils import package_installer
+from utils import component_config, download, files, package_installer, process, repo_source
+from utils.distro import Distro
+from utils.download import ChecksumError
 from utils.build_config import BuildConfig, build_plan
 
 _V = "2.30.4-1"
@@ -54,7 +57,7 @@ _AZL_DEPS = [[*_DNF, "rpm-build", "rpmdevtools", "autoconf", "automake", "git", 
               "patchelf"]]
 _RHEL_DEPS = [[*_DNF, "rpm-build", "rpmdevtools", "patchelf"]]
 
-_BUILD = [["tar", "-xvf", _TARBALL], ["make", "-j", "95", "src.build"]]
+_BUILD = [["tar", "-xf", _TARBALL], ["make", "-j", "95", "src.build"]]
 _APT_NCCL = [[*_APT, "libnccl2", "libnccl-dev"],
              ["apt-mark", "hold", "libnccl2"], ["apt-mark", "hold", "libnccl-dev"]]
 _TESTS_CLONE = ["git", "clone", "https://github.com/NVIDIA/nccl-tests.git"]
@@ -63,7 +66,6 @@ _PURGE = ["apt-get", "purge", "-y", "patchelf"]
 _EXPECTED_SHARP_CLONE = """set -e
 source /etc/profile.d/modules.sh
 module load mpi/hpcx
-
 if [[ -z "${HPCX_SHARP_DIR:-}" || ! -d "${HPCX_SHARP_DIR}" ]]; then
     echo "HPC-X module did not provide a valid HPCX_SHARP_DIR; cannot build NCCL RDMA SHARP plugin."
     exit 1
@@ -91,7 +93,6 @@ cat > /etc/ld.so.conf.d/nccl-rdma-sharp-plugins.conf <<EOF
 EOF
 ldconfig
 popd
-module unload mpi/hpcx
 """
 
 _EXPECTED_TESTS_SCRIPT = """set -e
@@ -101,18 +102,25 @@ pushd nccl-tests
 make -j 7 MPI=1 MPI_HOME=${HPCX_MPI_DIR} CUDA_HOME=/usr/local/cuda
 popd
 mv nccl-tests /opt/.
-module unload mpi/hpcx
 """
+
+_HPCX_HEADER = "set -e\nsource /etc/profile.d/modules.sh\nmodule load mpi/hpcx\n"
+
+
+def _script(lines):
+    """The script run_script(lines, modules=["mpi/hpcx"]) runs with bash -c."""
+    return _HPCX_HEADER + "\n".join(lines) + "\n"
 
 
 def _sharp(distro="ubuntu24.04", ref=_REF, commit=_COMMIT):
-    return [["bash", "-c", install_nccl.sharp_clone_script(ref, commit)],
-            ["bash", "-c", install_nccl.sharp_build_script(distro)]]
+    libtoolize = distro.startswith("azurelinux")
+    return [["bash", "-c", _script(install_nccl.sharp_clone_lines(ref, commit))],
+            ["bash", "-c", _script(install_nccl.sharp_build_lines(libtoolize))]]
 
 
 def _tests(jobs=95):
     # Called inside tests, so the script names the patched /opt dir.
-    return [_TESTS_CLONE, ["bash", "-c", install_nccl.nccl_tests_script(jobs)]]
+    return [_TESTS_CLONE, ["bash", "-c", _script(install_nccl.nccl_tests_lines(jobs))]]
 
 
 class PureHelperTests(unittest.TestCase):
@@ -120,16 +128,15 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(install_nccl.tarball_name(_V), _TARBALL)
         self.assertEqual(install_nccl.download_url(_V), _URL)
 
-    def test_distro_family(self):
-        for distro, family in (("ubuntu22.04", "ubuntu"), ("ubuntu24.04", "ubuntu"),
-                               ("ubuntu26.04", "ubuntu"), ("azurelinux3.0", "azurelinux"),
-                               ("almalinux9.8", "rhel"), ("rocky8.10", "rhel"), ("", "rhel")):
-            self.assertEqual(install_nccl.distro_family(distro), family)
-
-    def test_nccl_from_apt_only_on_26_04(self):
-        self.assertTrue(install_nccl.nccl_from_apt("ubuntu26.04"))
-        for distro in ("ubuntu22.04", "ubuntu24.04", "azurelinux3.0", "rhel9.8"):
-            self.assertFalse(install_nccl.nccl_from_apt(distro))
+    def test_bash_branch(self):
+        # Only Ubuntu 26.04 takes the apt branch; anything unrecognised takes
+        # bash's `else` (the RHEL family).
+        for distro, branch in (("ubuntu22.04", "ubuntu"), ("ubuntu24.04", "ubuntu"),
+                               ("ubuntu26.04", "ubuntu26.04"),
+                               ("azurelinux3.0", "azurelinux"), ("almalinux9.8", "rhel"),
+                               ("rocky8.10", "rhel"), ("rhel9.8", "rhel"), ("", "rhel")):
+            with self.subTest(distro=distro):
+                self.assertEqual(install_nccl.bash_branch(Distro(distro)), branch)
 
     def test_make_jobs_leaves_one_core_but_at_least_one(self):
         self.assertEqual(install_nccl.make_jobs(96), 95)
@@ -150,6 +157,12 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(alt(False, "b"), "b")
         self.assertEqual(alt("", "b"), "")          # "" is not null in jq
         self.assertIsNone(alt(None, None))
+
+    def test_sharp_ref(self):
+        self.assertEqual(install_nccl.sharp_ref({"ref": "r", "branch": "b"}), "r")
+        self.assertEqual(install_nccl.sharp_ref({"branch": "b"}), "b")
+        self.assertIsNone(install_nccl.sharp_ref({"ref": "", "branch": "b"}))  # "" wins
+        self.assertIsNone(install_nccl.sharp_ref({}))
 
     def test_deb_packages(self):
         self.assertEqual(install_nccl.deb_packages(_V, _CUDA, "arm64"), [
@@ -202,19 +215,20 @@ class PureHelperTests(unittest.TestCase):
                 os.path.join(root, "nccl-rdma-sharp-plugins")])
 
     def test_sharp_scripts_match_bash(self):
-        self.assertEqual(install_nccl.sharp_clone_script("v2.7.x", "b246b19c"),
+        self.assertEqual(_script(install_nccl.sharp_clone_lines("v2.7.x", "b246b19c")),
                          _EXPECTED_SHARP_CLONE)
-        self.assertEqual(install_nccl.sharp_build_script("ubuntu24.04"),
+        self.assertEqual(_script(install_nccl.sharp_build_lines(False)),
                          _EXPECTED_SHARP_BUILD.replace("LIBTOOLIZE", ""))
-        self.assertEqual(install_nccl.sharp_build_script("azurelinux3.0"),
+        self.assertEqual(_script(install_nccl.sharp_build_lines(True)),
                          _EXPECTED_SHARP_BUILD.replace("LIBTOOLIZE", "libtoolize --verbose\n"))
         # Unusual refs are shell-quoted.
-        script = install_nccl.sharp_clone_script("a b", "c d")
-        self.assertIn("git clone --branch 'a b' ", script)
-        self.assertIn("git checkout 'c d'\n", script)
+        lines = install_nccl.sharp_clone_lines("a b", "c d")
+        self.assertIn("git clone --branch 'a b' https://github.com/Mellanox/"
+                      "nccl-rdma-sharp-plugins.git", lines)
+        self.assertIn("git checkout 'c d'", lines)
 
     def test_nccl_tests_script_matches_bash(self):
-        self.assertEqual(install_nccl.nccl_tests_script(7), _EXPECTED_TESTS_SCRIPT)
+        self.assertEqual(_script(install_nccl.nccl_tests_lines(7)), _EXPECTED_TESTS_SCRIPT)
 
 
 class InstallTests(unittest.TestCase):
@@ -243,6 +257,8 @@ class InstallTests(unittest.TestCase):
             return self.fail_rc
         if command[0] == "tar" and self.tar_creates_source:
             os.makedirs(os.path.join(cwd, f"nccl-{_V}"))
+        elif command == _TESTS_CLONE:
+            os.makedirs(os.path.join(cwd, "nccl-tests"))
         elif command == ["make", "pkg.redhat.build"]:
             for arch in ("x86_64", "aarch64"):
                 rpm_dir = Path(cwd, "build", "pkg", "rpm", arch)
@@ -255,14 +271,14 @@ class InstallTests(unittest.TestCase):
         self.events.append(("download", url, sha256))
         self.download_in_empty_dir = os.listdir(dest_dir) == []
         if self.download_error:
-            raise self.download_error
+            raise self.download_error     # fetch_verified logs it and returns None
         path = Path(dest_dir, os.path.basename(url))
         path.write_bytes(b"tgz")
         return path
 
     def _fake_capture(self, command, op, *, env=None):
         self.captures.append(command)
-        return self.nproc if command == ["nproc"] else self.dpkg_query
+        return self.dpkg_query
 
     def _fake_source(self, component, repo_dir, op, *, commit=None, ref=None, env=None):
         self.events.append(("source", component, repo_dir, commit, ref))
@@ -275,7 +291,7 @@ class InstallTests(unittest.TestCase):
 
     def _install(self, distro="ubuntu24.04", arch="x86_64", arch_distro="amd64",
                  sku="A100", node_type="", nccl=_NCCL_CFG, cuda=_CUDA_CFG, *,
-                 fail_on=None, fail_rc=2, nproc=(0, f"{_NPROC}\n"), pin_ok=True,
+                 fail_on=None, fail_rc=2, nproc=_NPROC, pin_ok=True,
                  write_error=None, tar_creates_source=True, download_error=None,
                  dpkg_query=(0, "2.28.9-1+cuda13.0"), source_ok=True,
                  rpm_names=("libnccl", "libnccl-devel", "libnccl-static")):
@@ -289,27 +305,36 @@ class InstallTests(unittest.TestCase):
         env = {"DISTRIBUTION": distro, "ARCHITECTURE": arch, "ARCHITECTURE_DISTRO": arch_distro,
                "SKU": sku, "TARGET_NODE_TYPE": node_type, "PATH": "/usr/bin"}
         self.env = env
-        with mock.patch.object(install_nccl, "config_for",
-                               side_effect=lambda c, e: configs[c]), \
-             mock.patch.object(install_nccl, "exec_program", side_effect=self._fake_exec), \
+        fake_config = lambda c, e: configs[c]     # noqa: E731
+        with mock.patch.object(install_nccl, "config_for", side_effect=fake_config), \
+             mock.patch.object(component_config, "config_for", side_effect=fake_config), \
+             mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "log_info"), \
-             mock.patch.object(package_installer, "log_error") as install_error, \
-             mock.patch.object(install_nccl, "run_capture", side_effect=self._fake_capture), \
-             mock.patch.object(install_nccl, "download_and_verify",
+             mock.patch.object(package_installer, "log_error") as pkg_error, \
+             mock.patch.object(package_installer, "run_capture",
+                               side_effect=self._fake_capture), \
+             mock.patch.object(install_nccl, "cpu_count", return_value=nproc), \
+             mock.patch.object(download, "download_and_verify",
                                side_effect=self._fake_download), \
+             mock.patch.object(download, "log_error") as download_error, \
              mock.patch.object(install_nccl, "write_repo_source_info",
                                side_effect=self._fake_source) as source, \
              mock.patch.object(install_nccl, "dnf_pin_packages", return_value=pin_ok) as pin, \
-             mock.patch.object(install_nccl, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=self._fake_record) as record, \
+             mock.patch.object(component_config, "log_info") as config_info, \
+             mock.patch.object(files, "log_info"), \
+             mock.patch.object(repo_source, "log_info"), \
              mock.patch.object(install_nccl, "log_info") as info, \
              mock.patch.object(install_nccl, "log_warn") as warn, \
              mock.patch.object(install_nccl, "log_error") as error:
             result = install_nccl.install(env)
         self.pin, self.record, self.source_mock = pin, record, source
         self.info, self.warn, self.error = info, warn, error
-        self.install_error = install_error
+        self.config_error, self.download_error_log = config_error, download_error
+        self.pkg_error, self.config_info = pkg_error, config_info
         return result
 
     def _commands(self):
@@ -352,7 +377,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(cwds, [None, None, self.work, self.source, self.source]
                          + [deb_dir] * 4 + [self.work] * 4)
         self.assertTrue(all(c[2] is self.env for c in self.calls))
-        self.assertEqual(self.captures, [["nproc"]])
+        self.assertEqual(self.captures, [])          # nproc is cpu_count()
         self.pin.assert_not_called()                 # Ubuntu holds with apt-mark
         self.assertTrue(self.download_in_empty_dir)
         self.assertFalse(os.path.exists(self.work))  # all scratch removed
@@ -415,8 +440,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(),
                          _UBUNTU2604_DEPS + _APT_NCCL + _sharp("ubuntu26.04") + _tests())
         self.assertNotIn("download", [e[0] for e in self.events if isinstance(e, tuple)])
-        self.assertEqual(self.captures, [["nproc"],
-                                         ["dpkg-query", "-W", "-f=${Version}", "libnccl2"]])
+        self.assertEqual(self.captures,
+                         [["dpkg-query", "-W", "-f", "${Version}", "libnccl2"]])
         self.assertEqual(self.events[-1], ("version", "NCCL", "2.28.9-1"))
         self.pin.assert_not_called()
         self.warn.assert_not_called()
@@ -432,7 +457,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(result=result):
                 self.assertEqual(self._install("ubuntu26.04", dpkg_query=result), 3)
                 self.assertEqual(self._commands(), _UBUNTU2604_DEPS + _APT_NCCL)
-                self.assertIn("dpkg-query", self.error.call_args.args[1])
+                self.assertIn("dpkg-query", self.pkg_error.call_args.args[1])
                 self.record.assert_not_called()
 
     def test_azure_linux_aarch64(self):
@@ -516,7 +541,7 @@ class InstallTests(unittest.TestCase):
 
     # ---- job count ------------------------------------------------------------
     def test_one_cpu_builds_with_make_j_1(self):
-        self.assertEqual(self._install(nproc=(0, "1\n")), 0)
+        self.assertEqual(self._install(nproc=1), 0)
         self.assertIn(["make", "-j", "1", "src.build"], self._commands())
         self.assertIn(_tests(jobs=1)[1], self._commands())
         self.warn.assert_not_called()
@@ -564,10 +589,11 @@ class InstallTests(unittest.TestCase):
                       "with apt-mark", messages)
         self.assertIn(f"Building the NCCL RDMA SHARP plugin from {_REF} at {_COMMIT} with "
                       "HPC-X into /usr/local/nccl-rdma-sharp-plugins", messages)
-        self.assertIn(f"Recorded NCCL-RDMA_SHARP_PLUGIN={_COMMIT}", messages)
+        recorded = self._messages(self.config_info)
+        self.assertIn(f"Recorded NCCL-RDMA_SHARP_PLUGIN {_COMMIT}", recorded)
         self.assertIn(f"nccl-tests built and moved to {self.opt / 'nccl-tests'}", messages)
-        self.assertIn(f"Recorded NCCL={_V}", messages)
-        self.assertIn("Removed the NCCL tarball and source tree", messages)
+        self.assertIn(f"Recorded NCCL {_V}", recorded)
+
         end = self.info.call_args_list[-1]
         self.assertEqual(end.args[1], f"NCCL {_V} installed (packages held), SHARP plugin "
                                       f"built, nccl-tests in {self.opt / 'nccl-tests'}")
@@ -596,7 +622,8 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._install(**kwargs), 3)
                 self.assertEqual(self.calls, [])
                 self.assertEqual(self.captures, [])
-                self.error.assert_called_once()
+                # Logged once, by require_config or by install_nccl.
+                self.assertEqual(self.error.call_count + self.config_error.call_count, 1)
 
     def test_each_failing_command_stops_the_step(self):
         cases = [("ubuntu24.04", "x86_64", self._ubuntu_commands()),
@@ -618,30 +645,25 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual("NCCL-RDMA_SHARP_PLUGIN" in versions,
                                      index > sharp_build)
                     self.assertEqual("NCCL" in versions, command == _PURGE)
-                    # install_packages() logs failed installs itself.
-                    self.assertTrue(self.error.called or self.install_error.called)
+                    # (exec_program, mocked here, logs the failed command.)
                     self.assertFalse(os.path.exists(self.work))
 
     def test_download_failure_returns_3(self):
-        self.assertEqual(self._install(download_error=RuntimeError("checksum mismatch")), 3)
+        self.assertEqual(self._install(download_error=ChecksumError("checksum mismatch")), 3)
         self.assertEqual(self._commands(), _UBUNTU_DEPS)
-        self.assertIn("checksum mismatch", self.error.call_args.args[1])
+        self.assertIn("checksum mismatch", self.download_error_log.call_args.args[1])
 
     def test_repo_source_failure_returns_3(self):
         self.assertEqual(self._install(source_ok=False), 3)
         self.assertEqual(self._commands(), self._ubuntu_commands()[:10])   # SHARP clone
-        self.assertIn("NCCL-RDMA_SHARP_PLUGIN", self.error.call_args.args[1])
+        self.source_mock.assert_called_once()     # (it logs its own git failure)
+        self.record.assert_not_called()
 
     def test_pin_failure_returns_3(self):
         self.assertEqual(self._install("almalinux9.8", pin_ok=False), 3)
         self.assertNotIn("bash", [c[0] for c in self._commands()])
-        self.assertIn("libnccl*", self.error.call_args.args[1])
-
-    def test_bad_nproc_returns_3_before_anything_runs(self):
-        for result in ((1, ""), (0, "abc\n"), (0, "0\n")):
-            with self.subTest(result=result):
-                self.assertEqual(self._install(nproc=result), 3)
-                self.assertEqual(self._commands(), [])
+        self.pin.assert_called_once_with(["libnccl*"], "install-nccl", self.env)
+        self.record.assert_not_called()           # (dnf_pin_packages logs the failure)
 
     def test_missing_source_folder_returns_3(self):
         self.assertEqual(self._install(tar_creates_source=False), 3)
@@ -652,7 +674,7 @@ class InstallTests(unittest.TestCase):
         rc = self._install(write_error=PermissionError("denied"))
         self.assertEqual(rc, 3)
         self.assertNotIn(_TESTS_CLONE, self._commands())     # failed recording SHARP
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("denied", self.config_error.call_args.args[1])   # record_version
         self.assertFalse(os.path.exists(self.work))
 
 

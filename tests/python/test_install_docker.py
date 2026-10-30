@@ -3,12 +3,14 @@
   * The pure parse helpers are tested directly with realistic command output.
     Their results were also compared against the real bash pipelines
     (grep/awk/cut and bash word splitting) in WSL.
-  * install() is tested with its external effects mocked: exec_program (here
-    and in utils.package_installer, one mock so the order of all commands is
-    kept: apt-get, dnf, systemctl, ctr, the nested toolkit script), run_capture (docker
-    --version, the package listings), write_component_version, config_for and
-    time.sleep. The containerd socket path is pointed at a temporary directory;
-    one test creates a real Unix socket there.
+  * install() is tested with its external effects mocked: exec_program (in
+    utils.process, under run() and systemctl(), and in utils.package_installer;
+    one mock so the order of all commands is kept: apt-get, dnf, systemctl,
+    ctr, the nested toolkit script), run_capture (docker --version, the
+    package listings, also in utils.package_installer for dpkg-query),
+    write_component_version, config_for, time.sleep and
+    utils.logger._log (every log line). The containerd socket path is pointed
+    at a temporary directory; one test creates a real Unix socket there.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_docker -v
@@ -20,11 +22,12 @@ import os
 import socket
 import tempfile
 import unittest
+from collections import namedtuple
 from unittest import mock
 
 from components.python import install_docker
-from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 _OP = "install-docker"
 # What install_packages() runs for bash's `apt-get install -y` / `dnf install -y`.
@@ -45,6 +48,8 @@ _RPM_OUT = ("bash-5.2.15-3.azl3.x86_64\n"
             "moby-engine-25.0.3-11.azl3.x86_64\n"
             "moby-cli-25.0.3-11.azl3.x86_64\n")
 _DPKG_OUT = "28.2.2-0ubuntu1"
+# installed_package_version()'s form of bash's dpkg-query -W -f='${Version}'.
+_DPKG_QUERY = ["dpkg-query", "-W", "-f", "${Version}", "docker.io"]
 
 _SERVICES = [
     ["systemctl", "enable", "docker"],
@@ -54,6 +59,14 @@ _CONTAINERD = [
     ["systemctl", "restart", "containerd"],
     ["ctr", "plugin", "ls"],
 ]
+
+
+def _moby_command(distribution):
+    return install_docker.moby_version_query(Distro(distribution))[0]
+
+
+def _parse_moby(distribution, output):
+    return install_docker.moby_version_query(Distro(distribution))[1](output)
 
 
 def _env(distribution="ubuntu24.04", **extra):
@@ -89,15 +102,15 @@ class DockerVersionTests(unittest.TestCase):
 
 class MobyVersionParseTests(unittest.TestCase):
     def test_apt_list(self):
-        self.assertEqual(install_docker.parse_moby_version("ubuntu24.04", _APT_OUT),
+        self.assertEqual(_parse_moby("ubuntu24.04", _APT_OUT),
                          "29.1.4-ubuntu24.04u1")
 
     def test_dnf_list(self):
-        self.assertEqual(install_docker.parse_moby_version("almalinux9.8", _DNF_OUT),
+        self.assertEqual(_parse_moby("almalinux9.8", _DNF_OUT),
                          "28.5.1-1.el9")
 
     def test_rpm_qa(self):
-        self.assertEqual(install_docker.parse_moby_version("azurelinux3.0", _RPM_OUT),
+        self.assertEqual(_parse_moby("azurelinux3.0", _RPM_OUT),
                          "25.0.3-11.azl3.x86_64")
 
     def test_rpm_qa_records_the_first_moby_package_like_bash(self):
@@ -120,28 +133,18 @@ class MobyVersionParseTests(unittest.TestCase):
         self.assertIsNone(install_docker.grep_awk_version(wrapped, "moby-engine"))
 
     def test_no_match_gives_none(self):
-        self.assertIsNone(install_docker.parse_moby_version("ubuntu24.04", "Listing...\n"))
-        self.assertIsNone(install_docker.parse_moby_version("azurelinux3.0", ""))
+        self.assertIsNone(_parse_moby("ubuntu24.04", "Listing...\n"))
+        self.assertIsNone(_parse_moby("azurelinux3.0", ""))
 
     def test_version_commands_per_distro(self):
-        self.assertEqual(install_docker.moby_version_command("ubuntu22.04"),
+        self.assertEqual(_moby_command("ubuntu22.04"),
                          ["apt", "list", "--installed"])
-        self.assertEqual(install_docker.moby_version_command("ubuntu24.04"),
+        self.assertEqual(_moby_command("ubuntu24.04"),
                          ["apt", "list", "--installed"])
-        # bash: dpkg-query -W -f='${Version}' docker.io (single-quoted, literal).
-        self.assertEqual(install_docker.moby_version_command("ubuntu26.04"),
-                         ["dpkg-query", "-W", "-f=${Version}", "docker.io"])
-        self.assertEqual(install_docker.moby_version_command("azurelinux3.0"),
+        self.assertEqual(_moby_command("azurelinux3.0"),
                          ["rpm", "-qa"])
-        self.assertEqual(install_docker.moby_version_command("rocky8.10"),
+        self.assertEqual(_moby_command("rocky8.10"),
                          ["dnf", "list", "installed"])
-
-    def test_dpkg_query_version(self):
-        # dpkg-query -W -f='${Version}' prints the bare version, no newline
-        # (checked in WSL).
-        self.assertEqual(install_docker.parse_moby_version("ubuntu26.04", _DPKG_OUT),
-                         "28.2.2-0ubuntu1")
-        self.assertIsNone(install_docker.parse_moby_version("ubuntu26.04", ""))
 
 
 class WantsContainerToolkitTests(unittest.TestCase):
@@ -157,6 +160,23 @@ class WantsContainerToolkitTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # install(): external effects mocked.
 # --------------------------------------------------------------------------- #
+_Record = namedtuple("_Record", "level message fields")
+
+
+class _Logs:
+    """Stands in for utils.logger._log; filter by level with info/warn/error."""
+
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, level, op, message, fields=None, detail=None):
+        assert op == _OP
+        self.records.append(_Record(level, message, fields or {}))
+
+    def at(self, level):
+        return [record for record in self.records if record.level == level]
+
+
 class InstallTests(unittest.TestCase):
     def setUp(self):
         # A temporary directory for the containerd socket; the socket path
@@ -188,32 +208,31 @@ class InstallTests(unittest.TestCase):
             return captures[command[0]]
 
         exec_program = mock.Mock(side_effect=fake_exec)
-        with mock.patch.object(install_docker, "exec_program", exec_program), \
-             mock.patch.object(package_installer, "exec_program", exec_program), \
-             mock.patch.object(package_installer, "log_info"), \
-             mock.patch.object(package_installer, "log_error"), \
-             mock.patch.object(install_docker, "run_capture",
-                               side_effect=fake_capture) as run_capture, \
-             mock.patch.object(install_docker, "config_for",
-                               return_value=moby_cfg) as config_for, \
-             mock.patch.object(install_docker, "write_component_version",
-                               side_effect=write_error) as record, \
+        run_capture = mock.Mock(side_effect=fake_capture)
+        logs = _Logs()
+        with mock.patch("utils.process.exec_program", exec_program), \
+             mock.patch("utils.package_installer.exec_program", exec_program), \
+             mock.patch.object(install_docker, "run_capture", run_capture), \
+             mock.patch("utils.package_installer.run_capture", run_capture), \
+             mock.patch("utils.component_config.config_for",
+                        return_value=moby_cfg) as config_for, \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=write_error, return_value="/versions") as record, \
              mock.patch.object(install_docker.time, "sleep") as sleep, \
-             mock.patch.object(install_docker, "log_info") as log_info, \
-             mock.patch.object(install_docker, "log_warn") as log_warn, \
-             mock.patch.object(install_docker, "log_error") as log_error:
+             mock.patch("utils.logger._log", logs):
             rc = install_docker.install(env)
         return rc, {"exec": exec_program, "capture": run_capture,
                     "config_for": config_for, "record": record, "sleep": sleep,
-                    "info": log_info, "warn": log_warn, "error": log_error}
+                    "info": logs.at("info"), "warn": logs.at("warn"),
+                    "error": logs.at("error")}
 
     @staticmethod
     def _commands(mocks):
         return [c.args[0] for c in mocks["exec"].call_args_list]
 
     @staticmethod
-    def _messages(log_mock):
-        return [c.args[1] for c in log_mock.call_args_list]
+    def _messages(records):
+        return [r.message for r in records]
 
     # ---- success paths -----------------------------------------------------
     def test_ubuntu_nvidia(self):
@@ -240,7 +259,7 @@ class InstallTests(unittest.TestCase):
             mock.call("MOBY_ENGINE", "29.1.4-ubuntu24.04u1"),
         ])
         m["config_for"].assert_not_called()     # only read on baremetal_3p
-        m["error"].assert_not_called()
+        self.assertEqual(m["error"], [])
 
     def test_ubuntu_2604_installs_docker_io_on_every_node_type(self):
         # Checked before baremetal_3p in bash, so no moby pin and no config.
@@ -258,14 +277,13 @@ class InstallTests(unittest.TestCase):
                 ])
                 self.assertEqual(
                     [c.args[0] for c in m["capture"].call_args_list],
-                    [["docker", "--version"],
-                     ["dpkg-query", "-W", "-f=${Version}", "docker.io"]])
+                    [["docker", "--version"], _DPKG_QUERY])
                 self.assertEqual(m["record"].call_args_list, [
                     mock.call("DOCKER", "29.1.4"),
                     mock.call("MOBY_ENGINE", "28.2.2-0ubuntu1"),
                 ])
                 m["config_for"].assert_not_called()
-                m["error"].assert_not_called()
+                self.assertEqual(m["error"], [])
                 messages = self._messages(m["info"])
                 self.assertIn("Ubuntu 26.04: installing Canonical's docker.io and "
                               "docker-buildx (no Microsoft moby packages), on every "
@@ -318,15 +336,15 @@ class InstallTests(unittest.TestCase):
                               captures={"rpm": (0, output)})
         self.assertEqual(rc, 0)
         m["record"].assert_called_with("MOBY_ENGINE", "2.0.0-3.azl3.x86_64")
-        m["warn"].assert_called_once()
-        self.assertEqual(m["warn"].call_args.kwargs,
+        self.assertEqual(len(m["warn"]), 1)
+        self.assertEqual(m["warn"][-1].fields,
                          {"matched_package": "moby-containerd-2.0.0-3.azl3.x86_64",
                           "version": "2.0.0-3.azl3.x86_64"})
 
     def test_azure_linux_moby_engine_first_does_not_warn(self):
         rc, m = self._install(_env("azurelinux3.0", GPU="AMD"))
         self.assertEqual(rc, 0)
-        m["warn"].assert_not_called()
+        self.assertEqual(m["warn"], [])
 
     def test_rpm_moby_source_line(self):
         self.assertEqual(install_docker.rpm_moby_source_line(_RPM_OUT),
@@ -383,9 +401,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(m["sleep"].call_count, 30)
         m["sleep"].assert_called_with(1)
-        m["warn"].assert_called_once()
-        self.assertIn("did not appear", m["warn"].call_args.args[1])
-        self.assertEqual(m["warn"].call_args.kwargs["waited_s"], 30)
+        self.assertEqual(len(m["warn"]), 1)
+        self.assertIn("did not appear", m["warn"][-1].message)
+        self.assertEqual(m["warn"][-1].fields["waited_s"], 30)
         # Like bash, ctr plugin ls still runs.
         self.assertEqual(self._commands(m)[-1], ["ctr", "plugin", "ls"])
 
@@ -399,10 +417,10 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         m["sleep"].assert_not_called()
-        m["warn"].assert_not_called()
-        ready = [c for c in m["info"].call_args_list if "socket ready" in c.args[1]]
+        self.assertEqual(m["warn"], [])
+        ready = [r for r in m["info"] if "socket ready" in r.message]
         self.assertEqual(len(ready), 1)
-        self.assertEqual(ready[0].kwargs["waited_s"], 0)
+        self.assertEqual(ready[0].fields["waited_s"], 0)
 
     def test_regular_file_is_not_a_socket(self):
         with open(self.socket_path, "w", encoding="utf-8"):
@@ -418,37 +436,38 @@ class InstallTests(unittest.TestCase):
             rc, m = self._install(_env())
         self.assertEqual(rc, 0)
         self.assertEqual(m["sleep"].call_count, 2)
-        m["warn"].assert_not_called()
+        self.assertEqual(m["warn"], [])
 
     # ---- logging -----------------------------------------------------------
     def test_key_log_lines(self):
         rc, m = self._install(_env())
         self.assertEqual(rc, 0)
 
-        start = m["info"].call_args_list[0]
-        self.assertEqual(start.args, (_OP, "Installing Docker (moby)"))
-        self.assertEqual(start.kwargs, {"distro": "ubuntu24.04", "gpu": "NVIDIA",
+        start = m["info"][0]
+        self.assertEqual(start.message, "Installing Docker (moby)")
+        self.assertEqual(start.fields, {"distro": "ubuntu24.04", "gpu": "NVIDIA",
                                         "node_type": "azure_vm_regular",
                                         "container_toolkit": True})
         messages = self._messages(m["info"])
-        self.assertTrue(any(msg.startswith("Ubuntu: installing") for msg in messages))
+        self.assertIn("Installing moby-engine, moby-cli, moby-buildx", messages)
         self.assertIn("Enabling and restarting the docker service", messages)
-        recorded = [c.kwargs for c in m["info"].call_args_list
-                    if c.args[1].startswith("Recorded")]
+        recorded = [(r.fields["component"], r.fields["version"])
+                    for r in m["info"] if r.message.startswith("Recorded")]
         self.assertEqual(recorded, [
-            {"component": "DOCKER", "version": "29.1.4"},
-            {"component": "MOBY_ENGINE", "version": "29.1.4-ubuntu24.04u1"},
+            ("DOCKER", "29.1.4"),
+            ("MOBY_ENGINE", "29.1.4-ubuntu24.04u1"),
         ])
-        summary = m["info"].call_args_list[-1]
-        self.assertEqual(summary.args[1], "Docker installed")
-        self.assertEqual(summary.kwargs["moby_engine_version"], "29.1.4-ubuntu24.04u1")
+        summary = m["info"][-1]
+        self.assertEqual(summary.message, "Docker installed")
+        self.assertEqual(summary.fields["moby_engine_version"], "29.1.4-ubuntu24.04u1")
 
     # ---- failure paths -----------------------------------------------------
     def test_baremetal_3p_without_moby_version_returns_3(self):
         rc, m = self._install(_env(TARGET_NODE_TYPE="baremetal_3p"), moby_cfg=None)
         self.assertEqual(rc, 3)
         m["exec"].assert_not_called()
-        self.assertIn("moby version", m["error"].call_args.args[1])
+        self.assertIn("'moby'", m["error"][-1].message)
+        self.assertEqual(m["error"][-1].fields["missing"], "version")
 
     def test_unknown_distribution_installs_nothing_and_returns_3(self):
         # Bash's else branch would try dnf; install_packages() knows no
@@ -457,7 +476,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         m["exec"].assert_not_called()
         m["record"].assert_not_called()
-        self.assertEqual(m["error"].call_args.args[1], "moby package installation failed")
+        self.assertIn("no package manager known", m["error"][-1].message)
 
     def test_each_failing_command_returns_3_and_stops(self):
         sequence = [
@@ -476,7 +495,6 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._commands(m), sequence[:index + 1])
                 m["capture"].assert_not_called()
                 m["record"].assert_not_called()
-                m["error"].assert_called()
 
     def test_docker_version_failure_returns_3(self):
         for result in [(1, _DOCKER_OUT), (0, "")]:
@@ -484,7 +502,7 @@ class InstallTests(unittest.TestCase):
                 rc, m = self._install(_env(), captures={"docker": result})
                 self.assertEqual(rc, 3)
                 m["record"].assert_not_called()
-                self.assertIn("docker version", m["error"].call_args.args[1])
+                self.assertIn("docker version", m["error"][-1].message)
 
     def test_moby_version_failure_returns_3(self):
         for result in [(1, _APT_OUT), (0, "Listing...\n")]:
@@ -493,13 +511,13 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 # DOCKER was already recorded, as in bash; MOBY_ENGINE never is.
                 m["record"].assert_called_once_with("DOCKER", "29.1.4")
-                self.assertIn("moby-engine version", m["error"].call_args.args[1])
+                self.assertIn("moby-engine version", m["error"][-1].message)
 
     def test_unwritable_versions_file_returns_3(self):
         rc, m = self._install(_env(), write_error=PermissionError("denied"))
         self.assertEqual(rc, 3)
         self.assertEqual(len(m["capture"].call_args_list), 1)  # stopped after DOCKER
-        self.assertIn("denied", m["error"].call_args.args[1])
+        self.assertIn("denied", m["error"][-1].message)
 
 
 # --------------------------------------------------------------------------- #

@@ -16,9 +16,11 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from components.python import disable_predictive_interface_renaming as renaming
+from utils import files, process
 from utils.build_config import BuildConfig, build_plan
 
 # What bash searches for when GRUB_CMDLINE_LINUX is unset (note the leading space).
@@ -100,11 +102,11 @@ class InstallTests(unittest.TestCase):
                 f.write(contents)
         env = {"DISTRIBUTION": "ubuntu24.04"} if env is None else env
         with mock.patch.object(renaming, "_GRUB_SETTINGS_FILE", self.path), \
-             mock.patch.object(renaming, "exec_program",
+             mock.patch.object(process, "exec_program",
                                return_value=grub_rc) as run, \
              mock.patch.object(renaming, "log_info") as log_info, \
              mock.patch.object(renaming, "log_warn") as log_warn, \
-             mock.patch.object(renaming, "log_error") as log_error:
+             mock.patch.object(files, "log_error") as log_error:
             rc = renaming.install(env)
         self.log_info, self.log_warn = log_info, log_warn
         return rc, run, log_error
@@ -120,7 +122,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._read(), _CFG_UPDATED)
         run.assert_called_once_with(
-            ["update-grub"], "disable-predictive-interface-renaming", env=env)
+            ["update-grub"], "disable-predictive-interface-renaming", cwd=None, env=env)
         log_error.assert_not_called()
         self.log_warn.assert_not_called()
         added = self.log_info.call_args_list[0]
@@ -162,17 +164,8 @@ class InstallTests(unittest.TestCase):
         log_error.assert_called_once()
 
     def test_unwritable_file_returns_3(self):
-        real_open = open
-
-        def fail_on_write(path, mode="r", *args, **kwargs):
-            if "w" in mode:
-                raise PermissionError("permission denied")
-            return real_open(path, mode, *args, **kwargs)
-
-        # create=True adds an `open` name to the module, shadowing the builtin
-        # only for code in disable_predictive_interface_renaming.
-        with mock.patch.object(renaming, "open", create=True,
-                               side_effect=fail_on_write):
+        with mock.patch.object(Path, "write_bytes",
+                               side_effect=PermissionError("permission denied")):
             rc, run, log_error = self._install()
 
         self.assertEqual(rc, 3)
@@ -185,7 +178,7 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         run.assert_called_once()
-        log_error.assert_called_once()
+        log_error.assert_not_called()      # exec_program logs the failed command
 
 
 # --------------------------------------------------------------------------- #

@@ -1,137 +1,96 @@
 """install_waagent.py — Python port of components/install_waagent.sh.
 
-What this step does
--------------------
 WALinuxAgent (waagent) is the Azure guest agent: it provisions the VM, runs
-VM extensions and, on InfiniBand SKUs, sets up IPoIB (IP over InfiniBand).
-This step updates the agent and tunes its config file, /etc/waagent.conf.
+VM extensions and, on InfiniBand SKUs, sets up IPoIB. This step updates the
+agent, tunes /etc/waagent.conf, records the agent's versions and restarts it.
 
-  * Azure Linux 3.0: update the WALinuxAgent package with dnf, then set nine
-    keys in /etc/waagent.conf (OS.EnableRDMA=y always).
-  * Every other distro: build and install the agent from the GitHub release
-    tarball (version and sha256 from versions.json "waagent"):
-      - RHEL family (Alma/Rocky/RHEL): first make sure pip, setuptools and the
-        `distro` module are available for python3.
-      - EL8 (almalinux8.10, rocky8.10, rhel8*): the same pip set-up again, then
-        `python3 setup.py install --register-service`.
-      - EL9 (almalinux9*, rocky9*, rhel9*): the pip set-up and setup.py install
-        with python3.12, then point waagent.service's ExecStart at python3.12
-        (backing the unit file up first) and re-enable the service.
-      - Anything else (Ubuntu): `python3 setup.py install --register-service`.
-    Then set the waagent.conf keys. OS.EnableRDMA=y is only set when the
-    target uses IPoIB (see utils/sku.py: sku_uses_ipoib).
-  * Record the agent version (WAAGENT) and its extension handler version
-    (WAAGENT_EXTENSIONS) from `waagent --version`.
-  * Reload systemd, restart the agent (walinuxagent on Ubuntu, waagent on
-    Alma/Rocky/RHEL/Azure Linux), then wait 60 seconds so the restarted agent
-    doesn't grab the package manager lock from the next build step.
+Bash takes one of four branches (install_branch()):
 
-Setting a waagent.conf key (bash's update_waagent_conf):
+  * azurelinux — `dnf update -y WALinuxAgent`, then nine waagent.conf keys
+    with OS.EnableRDMA=y for every SKU.
+  * el8 / el9 / default — build the GitHub release (versions.json "waagent")
+    with `setup.py install --register-service`. The RHEL family first makes
+    pip, setuptools and `distro` available for python3; EL8 repeats that
+    inside the source tree, EL9 does it for python3.12, installs with
+    python3.12 and points waagent.service's ExecStart at python3.12. Then the
+    waagent.conf keys, with OS.EnableRDMA=y only if the target uses IPoIB.
 
-    if grep -q "^$key=" /etc/waagent.conf; then
-        sed -i "s/^$key=.*/$key=$value/" /etc/waagent.conf
-    else
-        echo "$key=$value" >> /etc/waagent.conf
-    fi
+Every branch then records WAAGENT and WAAGENT_EXTENSIONS from
+`waagent --version`, reloads systemd, restarts the agent (walinuxagent on
+Ubuntu, waagent elsewhere) and sleeps 60s so the restarted agent doesn't take
+the package manager lock from the next step.
 
-The rest of the original bash, summarised (see components/install_waagent.sh):
-
-    if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
-        dnf update -y WALinuxAgent
-        update_waagent_conf ... (9 calls, OS.EnableRDMA=y first)
-    else
-        [RHEL family] python3 -m ensurepip --upgrade; pip install --upgrade
-                      pip setuptools; pip install distro
-        download_and_verify .../WALinuxAgent/archive/refs/tags/v${V}.tar.gz ${SHA}
-        tar -xvf v${V}.tar.gz; pushd WALinuxAgent-${V}/
-        [EL8]  pip set-up again; python3 setup.py install --register-service
-        [EL9]  pip set-up with python3.12; python3.12 setup.py install ...;
-               systemctl stop/disable waagent; cp unit file to .bak.$(date +%F_%T);
-               sed -i 's|^ExecStart=/usr/bin/python3 -u ...|...python3.12 -u ...|';
-               systemctl daemon-reexec; systemctl enable waagent
-        [else] python3 setup.py install --register-service
-        popd
-        update_waagent_conf ... (OS.EnableRDMA=y only if sku_uses_ipoib)
-        rm -rf WALinuxAgent-${V}
-    fi
-    write_component_version "WAAGENT"            <line 1, field 1, part after "-">
-    write_component_version "WAAGENT_EXTENSIONS" <line 3, field 4>
-    systemctl daemon-reload
-    systemctl restart walinuxagent | waagent
-    sleep 60
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-waagent" Step. The build then calls install(env) instead of running
-the bash script. Deleting `action=` runs the bash script again, which is why
-the .sh file is kept.
-
-The waagent.conf and waagent.service edits are plain Python (small, tested
-text helpers that mirror grep/sed exactly). dnf, pip, setup.py, tar and
-systemctl run as programs with exec_program; `waagent --version` runs with
-run_capture because its output is parsed. The release tarball is unpacked
-with the `tar` command, as in bash.
-
-install() returns 0 for success or 3 for failure. It logs problems and returns
-3; it does not let exceptions escape to the build loop.
+utils/plans/steps.py makes install() the action of the "install-waagent"
+Step; deleting `action=` there runs the bash script again.
 
 Deliberate differences from bash
 --------------------------------
-  * A missing waagent version or sha256 fails the step before anything is
-    installed (bash would try to download "vnull.tar.gz"). On Azure Linux the
-    config isn't used, exactly as in bash (versions.json has an azurelinux3.0
-    entry that the script never reads; a warning says so in the log).
-  * Work directory: bash downloads and unpacks in its current directory (the
-    distro build dir). We use _WORK_DIR, emptied first so a leftover from an
-    earlier run can't get in the way. As in bash, only the unpacked
-    WALinuxAgent-<version> folder is removed afterwards; the tarball stays.
-  * `waagent --version` runs once, not twice. If it fails, or its output
-    doesn't contain both versions, the step fails. Bash would silently record
-    empty versions.
+  * A missing waagent version or sha256 fails the step before anything runs
+    (bash would do the pip set-up, then download "vnull.tar.gz").
+  * Bash downloads and unpacks in its cwd; we use _WORK_DIR, emptied first.
+    As in bash, only WALinuxAgent-<version>/ is removed afterwards.
+  * `waagent --version` runs once, not twice, and the step fails if it fails
+    or its output lacks either version (bash records empty versions).
+  * Distro tests go through Distro: bash's `== azurelinux3.0` and `rhel8*`
+    become is_azurelinux and major "8" (the same for every distro built).
+  * The EL9 systemctl calls don't run inside the source tree (bash's pushd);
+    systemctl doesn't use its cwd.
+
+Kept bash quirks
+----------------
+  * EL8 is an exact match for almalinux8.10 and rocky8.10, so e.g.
+    almalinux8.9 takes the default branch.
+  * Azure Linux sets Extensions.GoalStatePeriod twice and ignores the waagent
+    version versions.json pins for it (a warning says so).
+  * update_waagent_conf's grep/sed treat "." in a key as "any character", and
+    `echo >>` glues a new key onto a last line that has no newline (warned).
 """
 
-# Lets type hints such as `str | None` work on Python versions older than 3.10.
 from __future__ import annotations
 
 import json
 import os
 import re
-import shutil
 import time
 from datetime import datetime
 
-from utils.component_config import DEFAULT_NODE_TYPE, config_for, write_component_version
-from utils.download import ChecksumError, download_and_verify
+from utils.component_config import DEFAULT_NODE_TYPE, record_version, require_config
+from utils.distro import Distro
+from utils.download import fetch_verified
+from utils.files import copy_file, edit_file, extract_tarball, remove_paths
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.process import exec_program, run_capture
+from utils.package_installer import update_packages
+from utils.process import run_all, run_capture
+from utils.services import systemctl
 from utils.sku import sku_network_mode, sku_uses_ipoib
 
-# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "install-waagent"
-
-_AZURE_LINUX = "azurelinux3.0"
 
 _WAAGENT_CONF = "/etc/waagent.conf"
 _WAAGENT_SERVICE_FILE = "/usr/lib/systemd/system/waagent.service"
-
-# Where the release tarball is downloaded and unpacked (bash used its cwd).
 _WORK_DIR = "/tmp/waagent-build"
-
 _DOWNLOAD_URL = "https://github.com/Azure/WALinuxAgent/archive/refs/tags/v{version}.tar.gz"
-
-# How long bash waits after restarting the agent.
 _WAIT_SECONDS = 60
 
-# The EL9 waagent.service edit. The sed pattern contains no regex special
-# characters (apart from the leading ^), so it is a plain text match at the
-# start of a line. The rest of the line is kept, as sed keeps it.
+# Bash's branches (see install_branch()).
+_AZURE_LINUX = "azurelinux"
+_EL8 = "el8"
+_EL9 = "el9"
+_DEFAULT = "default"
+
+# The python each source branch runs setup.py with.
+_SETUP_PYTHON = {_EL8: "python3", _EL9: "python3.12", _DEFAULT: "python3"}
+
+# The agent's systemd unit, by distro family; other distros restart nothing.
+_AGENT_SERVICE = {"ubuntu": "walinuxagent", "rhel": "waagent", "azurelinux": "waagent"}
+
+# The EL9 sed edit of waagent.service. Apart from the leading ^ the pattern
+# has no regex characters, so it is a plain match at the start of a line.
 _EXEC_START_OLD = "ExecStart=/usr/bin/python3 -u /usr/sbin/waagent -daemon"
 _EXEC_START_NEW = "ExecStart=/usr/bin/python3.12 -u /usr/sbin/waagent -daemon"
 
-# waagent.conf settings, as (key, value), in bash's exact order.
-# Azure Linux sets the GoalStatePeriod twice; that is copied from bash (the
-# second call just replaces the value with the same one).
+# waagent.conf settings, (key, value) in bash's order. The repeated
+# GoalStatePeriod is bash's; the second write changes nothing.
 _AZURE_LINUX_CONF = (
     ("OS.EnableRDMA", "y"),
     ("Extensions.GoalStatePeriod", "300"),
@@ -143,9 +102,7 @@ _AZURE_LINUX_CONF = (
     ("OS.MonitorDhcpClientRestartPeriod", "60"),
     ("Provisioning.MonitorHostNamePeriod", "60"),
 )
-
-# The other distros: the settings before and after the optional
-# OS.EnableRDMA=y (written only when the target uses IPoIB).
+# The source branches: OS.EnableRDMA=y goes between these, on IPoIB targets.
 _CONF_BEFORE_RDMA = (
     ("Extensions.GoalStatePeriod", "300"),
     ("Extensions.InitialGoalStatePeriod", "6"),
@@ -160,36 +117,19 @@ _CONF_AFTER_RDMA = (
     ("Provisioning.MonitorHostNamePeriod", "60"),
 )
 
-# The three setup.py paths (see install_handler()).
-_HANDLER_EL8 = "el8"
-_HANDLER_EL9 = "el9"
-_HANDLER_DEFAULT = "default"
-
 
 # --------------------------------------------------------------------------- #
-# Pure helpers: no side effects, so tests call them directly.
+# Pure helpers
 # --------------------------------------------------------------------------- #
-def is_rhel_family(distribution: str) -> bool:
-    """Bash's `*"almalinux"* || *"rocky"* || *"rhel"*` test ("contains")."""
-    return any(name in distribution for name in ("almalinux", "rocky", "rhel"))
-
-
-def is_el9(distribution: str) -> bool:
-    """Bash's `almalinux9* || rocky9* || rhel9*` test ("starts with")."""
-    return distribution.startswith(("almalinux9", "rocky9", "rhel9"))
-
-
-def install_handler(distribution: str) -> str:
-    """Which setup.py path bash takes for this distro: el8, el9 or default.
-
-    EL8 is an exact match for almalinux8.10 and rocky8.10 (so e.g. almalinux8.9
-    would take the default path, as in bash), plus anything starting "rhel8".
-    """
-    if distribution in ("almalinux8.10", "rocky8.10") or distribution.startswith("rhel8"):
-        return _HANDLER_EL8
-    if is_el9(distribution):
-        return _HANDLER_EL9
-    return _HANDLER_DEFAULT
+def install_branch(distro: Distro) -> str:
+    """Which branch bash takes: azurelinux, el8, el9 or default."""
+    if distro.is_azurelinux:
+        return _AZURE_LINUX
+    if distro.name in ("almalinux8.10", "rocky8.10") or (distro.is_rhel and distro.major == "8"):
+        return _EL8
+    if distro.is_rhel_family and distro.major == "9":
+        return _EL9
+    return _DEFAULT
 
 
 def pip_setup_commands(python: str) -> list[list[str]]:
@@ -201,43 +141,40 @@ def pip_setup_commands(python: str) -> list[list[str]]:
     ]
 
 
-def setup_commands(handler: str) -> list[list[str]]:
-    """The commands bash runs inside WALinuxAgent-<version>/ for a handler.
+def setup_commands(branch: str) -> list[list[str]]:
+    """What bash runs inside WALinuxAgent-<version>/ for a source branch."""
+    python = _SETUP_PYTHON[branch]
+    setup = [[python, "setup.py", "install", "--register-service"]]
+    if branch == _DEFAULT:
+        return setup
+    return pip_setup_commands(python) + setup
 
-    (The EL9 service edit that follows setup.py is done separately.)
-    """
-    setup = ["setup.py", "install", "--register-service"]
-    if handler == _HANDLER_EL8:
-        return pip_setup_commands("python3") + [["python3", *setup]]
-    if handler == _HANDLER_EL9:
-        return pip_setup_commands("python3.12") + [["python3.12", *setup]]
-    return [["python3", *setup]]
+
+def version_command(branch: str) -> list[str]:
+    """How bash runs `waagent --version`: with python3.12 on EL9."""
+    if branch == _EL9:
+        return ["python3.12", "-u", "/usr/sbin/waagent", "--version"]
+    return ["waagent", "--version"]
+
+
+def agent_service(distro: Distro) -> str | None:
+    """The agent's systemd unit bash restarts, or None if it restarts none."""
+    return _AGENT_SERVICE.get(distro.family)
 
 
 def conf_key_pattern(key: str) -> str:
-    """Translate bash's grep/sed pattern "^$key=" into a Python regex.
-
-    In the bash pattern, the "." in a key such as "OS.EnableRDMA" is a regex
-    wildcard (it matches any character), and the keys contain only letters and
-    dots. re.escape() escapes the dots; we then turn them back into wildcards
-    so the pattern matches exactly what grep and sed match.
-    """
+    """Bash's grep/sed pattern "^$key=" as a Python regex ("." stays a wildcard)."""
     return "^" + re.escape(key).replace(r"\.", ".") + "="
 
 
 def update_waagent_conf_text(text: str, key: str, value: str) -> tuple[str, int]:
-    """Mirror bash's update_waagent_conf on the file's text.
+    """Bash's update_waagent_conf on the file's text: (new text, lines replaced).
 
-    Returns (new text, number of lines replaced). 0 replaced means the line
-    "key=value\\n" was appended (bash's `echo "$key=$value" >>`). Like sed,
-    every line starting with "key=" is replaced as a whole, and a file
-    without a final newline is left without one.
+    Like sed, every line matching "^key=" is replaced whole and a missing
+    final newline stays missing. 0 replaced means "key=value\\n" was appended
+    (bash's `echo >>`).
     """
-    # re.MULTILINE makes ^ match at the start of every line, not only the
-    # start of the text. "." doesn't match "\n", so ".*" stops at the end of
-    # the line, like sed's ".*". subn() returns the new text and how many
-    # replacements it made.
-    # A function as the replacement makes re.subn use its result literally.
+    # A function replacement is used literally (no backslash processing).
     pattern = re.compile(conf_key_pattern(key) + ".*", re.MULTILINE)
     new_text, count = pattern.subn(lambda _match: f"{key}={value}", text)
     if count:
@@ -246,368 +183,243 @@ def update_waagent_conf_text(text: str, key: str, value: str) -> tuple[str, int]
 
 
 def retarget_exec_start(text: str) -> tuple[str, int]:
-    """Mirror the EL9 sed edit of waagent.service. Returns (new text, lines changed).
+    """The EL9 sed edit of waagent.service: (new text, lines changed).
 
-    sed -i 's|^ExecStart=/usr/bin/python3 -u /usr/sbin/waagent -daemon|
-              ExecStart=/usr/bin/python3.12 -u /usr/sbin/waagent -daemon|'
-
-    An already-edited line ("python3.12 -u") doesn't match, because the text
-    after "python3" must be " -u". So a rerun changes nothing.
+    An already-edited line ("python3.12 -u") doesn't match, so reruns are no-ops.
     """
     pattern = re.compile("^" + re.escape(_EXEC_START_OLD), re.MULTILINE)
     return pattern.subn(lambda _match: _EXEC_START_NEW, text)
 
 
 def parse_waagent_version(output: str) -> tuple[str, str]:
-    """Extract (WAAGENT, WAAGENT_EXTENSIONS) from `waagent --version` output.
-
-    Typical output:
+    """(WAAGENT, WAAGENT_EXTENSIONS) from `waagent --version` output.
 
         WALinuxAgent-2.15.0.1 running on ubuntu 24.04
         Python: 3.12.3
         Goal state agent: 2.15.0.1
 
-    WAAGENT mirrors `head -n 1 | awk -F' ' '{print $1}' | awk -F- '{print $2}'`:
-    the first word of line 1, then the part after its first "-" ("2.15.0.1").
-    WAAGENT_EXTENSIONS mirrors `sed '3q;d' | awk -F' ' '{print $4}'`: the
-    fourth word of line 3 ("2.15.0.1"). A missing piece gives "", as awk does.
+    WAAGENT is bash's `head -n 1 | awk '{print $1}' | awk -F- '{print $2}'`;
+    WAAGENT_EXTENSIONS is `sed '3q;d' | awk '{print $4}'`. A missing piece
+    gives "", as awk does.
     """
     lines = output.split("\n")
-
-    # str.split() with no argument splits on runs of spaces/tabs and ignores
-    # leading ones, like awk's default field splitting (-F' ').
+    # split() with no argument skips leading blanks, like awk's fields.
     first_words = lines[0].split()
-    agent = ""
-    if first_words:
-        # split("-") keeps empty parts, like awk -F-; [1] is awk's $2.
-        dash_parts = first_words[0].split("-")
-        if len(dash_parts) > 1:
-            agent = dash_parts[1]
-
-    extensions = ""
-    if len(lines) > 2:
-        third_words = lines[2].split()
-        if len(third_words) > 3:
-            extensions = third_words[3]
+    dash_parts = first_words[0].split("-") if first_words else []
+    agent = dash_parts[1] if len(dash_parts) > 1 else ""
+    third_words = lines[2].split() if len(lines) > 2 else []
+    extensions = third_words[3] if len(third_words) > 3 else ""
     return agent, extensions
 
 
-def version_command(distribution: str) -> list[str]:
-    """How bash runs `waagent --version`: with python3.12 on EL9."""
-    if is_el9(distribution):
-        return ["python3.12", "-u", "/usr/sbin/waagent", "--version"]
-    return ["waagent", "--version"]
+def unused_azure_linux_entry(env: dict[str, str], distro: Distro):
+    """versions.json's waagent entry for this Azure Linux, or None.
 
-
-def restart_service(distribution: str) -> str | None:
-    """The agent's systemd service bash restarts, or None if it restarts none."""
-    if "ubuntu" in distribution:
-        return "walinuxagent"
-    if (distribution.startswith(("almalinux", "rocky", "rhel"))
-            or distribution == _AZURE_LINUX):
-        return "waagent"
-    return None
-
-
-def unused_azure_linux_entry(env: dict[str, str]):
-    """versions.json's waagent -> azurelinux3.0 entry, or None if there is none.
-
-    Bash never reads it (Azure Linux updates the distro's package instead), so
-    install() warns that the pinned version there is ignored. Reads the raw
-    COMPONENT_VERSIONS JSON; text that isn't valid JSON counts as "no entry",
-    because this is only used for a warning.
+    Bash never reads it, so install() only warns that it is ignored. Read
+    from the raw JSON because config_for() would fall back to "common";
+    invalid JSON counts as no entry.
     """
     try:
         versions = json.loads(env.get("COMPONENT_VERSIONS") or "{}")
-    except ValueError:       # json.JSONDecodeError is a kind of ValueError
+    except ValueError:
         return None
     waagent = versions.get("waagent") if isinstance(versions, dict) else None
-    entry = waagent.get(_AZURE_LINUX) if isinstance(waagent, dict) else None
-    return entry if entry else None
+    entry = waagent.get(distro.name) if isinstance(waagent, dict) else None
+    return entry or None
 
 
 def backup_timestamp() -> str:
-    """The suffix bash's `date +%F_%T` gives, e.g. "2026-10-29_15:07:42".
-
-    A separate function so tests can replace it with a fixed value.
-    """
+    """The suffix bash's `date +%F_%T` gives, e.g. "2026-10-29_15:07:42"."""
     return datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
 
 # --------------------------------------------------------------------------- #
-# Steps. Each returns True on success, or False after logging why not.
+# File edits
 # --------------------------------------------------------------------------- #
-def _run_all(commands, env: dict[str, str], cwd: str | None = None) -> bool:
-    """Run commands in order, stopping at the first failure (like `set -e`).
-
-    exec_program already logs a failed command with its output; we add the
-    consequence.
-    """
-    for command in commands:
-        rc = exec_program(command, _OP, cwd=cwd, env=env)
-        if rc != 0:
-            log_error(_OP, f"`{' '.join(command)}` failed; stopping the waagent install",
-                      command=command[0], exit_code=rc)
-            return False
-    return True
-
-
-def _read_text(path: str) -> str:
-    # newline="" keeps "\r\n" as it is (no newline translation), and
-    # surrogateescape round-trips any non-UTF-8 bytes unchanged, so writing the
-    # text back only changes what sed would change.
-    with open(path, encoding="utf-8", errors="surrogateescape", newline="") as handle:
-        return handle.read()
-
-
-def _write_text(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-        handle.write(text)
-
-
 def _set_conf(key: str, value: str) -> bool:
-    """Set one waagent.conf key (bash's update_waagent_conf) and log what changed."""
-    try:
-        try:
-            text = _read_text(_WAAGENT_CONF)
-            existed = True
-        except FileNotFoundError:
-            # Bash's grep fails on a missing file, so it takes the `echo >>`
-            # branch, which creates the file.
-            text, existed = "", False
-        new_text, replaced = update_waagent_conf_text(text, key, value)
-        _write_text(_WAAGENT_CONF, new_text)
-    except OSError as exc:
-        log_error(_OP, f"could not set {key}={value} in {_WAAGENT_CONF}: {exc}",
-                  path=_WAAGENT_CONF, key=key, value=value)
-        return False
+    """Set one waagent.conf key (bash's update_waagent_conf) and log what changed.
 
-    if replaced:
-        action = "replaced"
-    elif existed:
-        action = "appended"
-        # BASH QUIRK (kept): `echo "$key=$value" >>` appends right after the
-        # last character. If the file didn't end with a newline, the new key
-        # lands on the same line as the old last line (e.g.
-        # "Foo=1OS.EnableRDMA=y"), and waagent won't see either setting right.
-        if text and not text.endswith("\n"):
-            log_warn(_OP, f"{_WAAGENT_CONF} did not end with a newline, so {key} "
-                          "was glued onto its last line, as bash's `echo >>` does",
+    A missing file is created, as bash's `echo >>` does.
+    """
+    existed = os.path.exists(_WAAGENT_CONF)
+
+    def edit(text: str) -> str:
+        new_text, replaced = update_waagent_conf_text(text, key, value)
+        action = "replaced" if replaced else ("appended" if existed else "created")
+        if action == "appended" and text and not text.endswith("\n"):
+            log_warn(_OP, f"{_WAAGENT_CONF} did not end with a newline, so {key} was "
+                          "glued onto its last line, as bash's `echo >>` does",
                      path=_WAAGENT_CONF, key=key, value=value)
-    else:
-        action = "created"
-    log_info(_OP, f"Set {key}={value} in {_WAAGENT_CONF} ({action})",
-             path=_WAAGENT_CONF, key=key, value=value, action=action,
-             lines_replaced=replaced)
-    return True
+        log_info(_OP, f"Setting {key}={value} in {_WAAGENT_CONF} ({action})",
+                 path=_WAAGENT_CONF, key=key, value=value, action=action,
+                 lines_replaced=replaced)
+        return new_text
+    return edit_file(_WAAGENT_CONF, edit, _OP, create=True)
 
 
 def _apply_conf(settings) -> bool:
-    for key, value in settings:
-        if not _set_conf(key, value):
-            return False
-    return True
+    return all(_set_conf(key, value) for key, value in settings)
+
+
+def _retarget_exec_start_text(text: str) -> str:
+    """The edit_file transform for waagent.service; warns when nothing matches."""
+    new_text, changed = retarget_exec_start(text)
+    if changed:
+        log_info(_OP, f"Editing {_WAAGENT_SERVICE_FILE}: ExecStart now runs waagent "
+                      "with python3.12", path=_WAAGENT_SERVICE_FILE, lines_changed=changed)
+    else:
+        log_warn(_OP, f"No '{_EXEC_START_OLD}' line in {_WAAGENT_SERVICE_FILE}; "
+                      "ExecStart left unchanged (bash's sed does the same)",
+                 path=_WAAGENT_SERVICE_FILE, lines_changed=0)
+    return new_text
 
 
 def _retarget_service_file() -> bool:
     """Back up waagent.service and point its ExecStart at python3.12 (EL9)."""
     backup = f"{_WAAGENT_SERVICE_FILE}.bak.{backup_timestamp()}"
-    try:
-        # shutil.copy copies the contents and the permission bits, like `cp`.
-        shutil.copy(_WAAGENT_SERVICE_FILE, backup)
-        log_info(_OP, f"Backed up {_WAAGENT_SERVICE_FILE} to {backup}",
-                 path=_WAAGENT_SERVICE_FILE, backup=backup)
-        text = _read_text(_WAAGENT_SERVICE_FILE)
-        new_text, changed = retarget_exec_start(text)
-        _write_text(_WAAGENT_SERVICE_FILE, new_text)
-    except OSError as exc:
-        log_error(_OP, f"could not edit {_WAAGENT_SERVICE_FILE}: {exc}",
-                  path=_WAAGENT_SERVICE_FILE, backup=backup)
-        return False
+    return (copy_file(_WAAGENT_SERVICE_FILE, backup, _OP)      # contents + mode, like `cp`
+            and edit_file(_WAAGENT_SERVICE_FILE, _retarget_exec_start_text, _OP))
 
-    if changed:
-        log_info(_OP, f"Edited {_WAAGENT_SERVICE_FILE} in place: ExecStart now runs "
-                      "waagent with python3.12",
-                 path=_WAAGENT_SERVICE_FILE, action="edited", lines_changed=changed)
-    else:
-        # sed is silent when nothing matches; the unit keeps whatever it had.
-        log_warn(_OP, f"No '{_EXEC_START_OLD}' line in {_WAAGENT_SERVICE_FILE}; "
-                      "ExecStart left unchanged (bash's sed does the same)",
-                 path=_WAAGENT_SERVICE_FILE, lines_changed=0)
+
+# --------------------------------------------------------------------------- #
+# Steps: each returns True, or False after the failure was logged.
+# --------------------------------------------------------------------------- #
+def _update_from_distro_repo(env: dict[str, str], distro: Distro) -> bool:
+    """Bash's azurelinux branch: dnf update, then the Azure Linux conf keys."""
+    log_info(_OP, "Updating WALinuxAgent from the Azure Linux repository",
+             distro=str(distro), method="dnf update", source="distro repository")
+    if not update_packages(["WALinuxAgent"], env, _OP):
+        return False
+    entry = unused_azure_linux_entry(env, distro)
+    if entry is not None:
+        log_warn(_OP, f"versions.json has a waagent entry for {distro} that is not used: "
+                      "Azure Linux takes WALinuxAgent from the distro repository, as in bash",
+                 distro=str(distro), unused_entry=entry)
+    log_info(_OP, "Azure Linux: OS.EnableRDMA=y is set for every SKU and node type",
+             distro=str(distro), sku=env.get("SKU", ""),
+             node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE)
+    return _apply_conf(_AZURE_LINUX_CONF)
+
+
+def _download_release(version: str, sha256: str, env: dict[str, str]) -> str | None:
+    """Fetch and unpack the release into _WORK_DIR; the source dir, or None."""
+    remove_paths(_WORK_DIR, op=_OP)
+    tarball = fetch_verified(_DOWNLOAD_URL.format(version=version), sha256, _OP,
+                             dest_dir=_WORK_DIR)
+    if tarball is None:
+        return None
+    if not extract_tarball(os.path.basename(tarball), _OP, cwd=_WORK_DIR, env=env):
+        return None
+    source_dir = os.path.join(_WORK_DIR, f"WALinuxAgent-{version}")
+    if not os.path.isdir(source_dir):
+        log_error(_OP, f"{tarball} did not unpack into {source_dir}")
+        return None
+    return source_dir
+
+
+def _run_agent_with_python312(env: dict[str, str]) -> bool:
+    """EL9: setup.py registered a python3 unit; rewrite it for python3.12."""
+    if not (systemctl("stop", "waagent", op=_OP, env=env)
+            and systemctl("disable", "waagent", op=_OP, env=env)
+            and _retarget_service_file()
+            and systemctl("daemon-reexec", op=_OP, env=env)
+            and systemctl("enable", "waagent", op=_OP, env=env)):
+        return False
+    log_info(_OP, "waagent service re-enabled with its python3.12 ExecStart",
+             service="waagent", action="enabled")
     return True
 
 
-def _install_from_source(env: dict[str, str], distribution: str) -> bool:
-    """Everything bash's non-Azure-Linux branch does, in order."""
-    config = config_for("waagent", env)
-    # isinstance() guards against a missing (None) or oddly shaped config.
-    if not isinstance(config, dict) or not config.get("version") or not config.get("sha256"):
-        log_error(_OP, "could not resolve waagent version and sha256 from versions.json",
-                  distro=distribution)
-        return False
-    version = config["version"]
-    url = _DOWNLOAD_URL.format(version=version)
-    handler = install_handler(distribution)
-
-    log_info(_OP, f"Installing WALinuxAgent {version} from source",
-             version=version, source=url, distro=distribution, handler=handler,
-             sku=env.get("SKU", ""),
-             node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE)
-
-    # ---- 1. pip set-up for python3 on the RHEL family ---------------------
-    if is_rhel_family(distribution):
-        log_info(_OP, "RHEL family: making pip, setuptools and distro available "
-                      "for python3", distro=distribution)
-        if not _run_all(pip_setup_commands("python3"), env):
-            return False
-
-    # ---- 2. Download and unpack the release ------------------------------
-    try:
-        shutil.rmtree(_WORK_DIR, ignore_errors=True)
-        tarball = download_and_verify(url, config["sha256"], dest_dir=_WORK_DIR)
-    # download() raises OSError (network/file errors); a bad hash raises ChecksumError.
-    except (OSError, ChecksumError) as exc:
-        log_error(_OP, f"download/verify of WALinuxAgent {version} failed: {exc}",
-                  source=url)
-        return False
-
-    if not _run_all([["tar", "-xvf", os.path.basename(tarball)]], env, cwd=_WORK_DIR):
-        return False
-    source_dir = os.path.join(_WORK_DIR, f"WALinuxAgent-{version}")
-    if not os.path.isdir(source_dir):
-        # Bash's `pushd WALinuxAgent-${V}/` would fail here.
-        log_error(_OP, f"{tarball} did not unpack into {source_dir}")
-        return False
-
-    # ---- 3. setup.py install (per distro) ---------------------------------
-    commands = setup_commands(handler)
-    log_info(_OP, f"Using the {handler} setup path: {' '.join(commands[-1])}",
-             handler=handler, python=commands[-1][0], distro=distribution)
-    if not _run_all(commands, env, cwd=source_dir):
-        return False
-
-    if handler == _HANDLER_EL9:
-        # The unit file setup.py registered runs waagent with python3; on EL9
-        # the agent was installed for python3.12, so the unit is rewritten.
-        if not _run_all([["systemctl", "stop", "waagent"],
-                         ["systemctl", "disable", "waagent"]], env, cwd=source_dir):
-            return False
-        if not _retarget_service_file():
-            return False
-        if not _run_all([["systemctl", "daemon-reexec"],
-                         ["systemctl", "enable", "waagent"]], env, cwd=source_dir):
-            return False
-        log_info(_OP, "waagent service re-enabled with its python3.12 ExecStart",
-                 service="waagent", action="enabled")
-
-    # ---- 4. waagent.conf ---------------------------------------------------
+def _conf_for_target(env: dict[str, str]) -> tuple:
+    """The source branches' conf settings, with OS.EnableRDMA=y on IPoIB targets."""
     sku = env.get("SKU", "")
     node_type = env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
     uses_ipoib = sku_uses_ipoib(sku, node_type)
-    mode = sku_network_mode(sku, node_type)
-    if uses_ipoib:
-        log_info(_OP, "Target uses IPoIB: OS.EnableRDMA=y will be set",
-                 sku=sku, node_type=node_type, network_mode=mode, uses_ipoib=True)
-    else:
-        log_info(_OP, "Target doesn't use IPoIB: OS.EnableRDMA is left as it is",
-                 sku=sku, node_type=node_type, network_mode=mode, uses_ipoib=False)
+    message = ("Target uses IPoIB: OS.EnableRDMA=y will be set" if uses_ipoib
+               else "Target doesn't use IPoIB: OS.EnableRDMA is left as it is")
+    log_info(_OP, message, sku=sku, node_type=node_type,
+             network_mode=sku_network_mode(sku, node_type), uses_ipoib=uses_ipoib)
+    return _CONF_BEFORE_RDMA + ((_RDMA_SETTING,) if uses_ipoib else ()) + _CONF_AFTER_RDMA
 
-    settings = _CONF_BEFORE_RDMA + ((_RDMA_SETTING,) if uses_ipoib else ()) + _CONF_AFTER_RDMA
-    if not _apply_conf(settings):
+
+def _install_from_source(env: dict[str, str], distro: Distro, branch: str) -> bool:
+    """Bash's el8/el9/default branches: build the release, then the conf keys."""
+    cfg = require_config("waagent", env, _OP, "version", "sha256")
+    if cfg is None:
         return False
+    version = cfg["version"]
+    log_info(_OP, f"Installing WALinuxAgent {version} from source",
+             version=version, source=_DOWNLOAD_URL.format(version=version),
+             distro=str(distro), handler=branch, sku=env.get("SKU", ""),
+             node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE)
 
-    # Bash's `rm -rf WALinuxAgent-${V}`. A leftover is harmless (the next run
-    # empties _WORK_DIR first), so a failed cleanup doesn't fail the step.
-    shutil.rmtree(source_dir, ignore_errors=True)
-    log_debug(_OP, f"Removed {source_dir}; {tarball} is kept, as in bash")
+    if distro.is_rhel_family and not run_all(pip_setup_commands("python3"), _OP, env=env):
+        return False
+    source_dir = _download_release(version, cfg["sha256"], env)
+    if source_dir is None:
+        return False
+    if not run_all(setup_commands(branch), _OP, cwd=source_dir, env=env):
+        return False
+    if branch == _EL9 and not _run_agent_with_python312(env):
+        return False
+    if not _apply_conf(_conf_for_target(env)):
+        return False
+    remove_paths(source_dir, op=_OP)      # the tarball stays, as in bash
     return True
 
 
-def _record_versions(env: dict[str, str], distribution: str) -> tuple[str, str] | None:
+def _record_versions(env: dict[str, str], branch: str) -> tuple[str, str] | None:
     """Run `waagent --version` and record WAAGENT and WAAGENT_EXTENSIONS."""
-    command = version_command(distribution)
+    command = version_command(branch)
     rc, output = run_capture(command, _OP, env=env)
     if rc != 0:
-        log_error(_OP, "could not read the installed waagent version",
-                  command=" ".join(command), exit_code=rc)
         return None
     log_debug(_OP, f"`{' '.join(command)}` output:\n{output}")
-
-    agent, extensions = parse_waagent_version(output)
-    if not agent or not extensions:
+    versions = parse_waagent_version(output)
+    if not all(versions):
         log_error(_OP, f"unexpected `{' '.join(command)}` output: {output.strip()!r}",
-                  waagent=agent, waagent_extensions=extensions)
+                  waagent=versions[0], waagent_extensions=versions[1])
         return None
+    if not all(record_version(component, version, _OP)
+               for component, version in zip(("WAAGENT", "WAAGENT_EXTENSIONS"), versions)):
+        return None
+    return versions
 
-    for component, version in (("WAAGENT", agent), ("WAAGENT_EXTENSIONS", extensions)):
-        try:
-            write_component_version(component, version)
-        except OSError as exc:
-            log_error(_OP, f"could not record {component}={version}: {exc}",
-                      component=component, version=version)
-            return None
-        log_info(_OP, f"Recorded {component}={version}", component=component,
-                 version=version)
-    return agent, extensions
+
+def _restart_agent(env: dict[str, str], distro: Distro) -> bool:
+    """Bash's `systemctl daemon-reload`, then restart the agent's unit, if it has one."""
+    if not systemctl("daemon-reload", op=_OP, env=env):
+        return False
+    service = agent_service(distro)
+    if service is None:
+        log_info(_OP, f"No agent restart rule for {distro}; not restarting (same as bash)",
+                 distro=str(distro))
+        return True
+    log_info(_OP, f"Restarting {service}", service=service, action="restarted")
+    return systemctl("restart", service, op=_OP, env=env)
 
 
 def install(env: dict[str, str]) -> int:
-    """Install/update WALinuxAgent, configure it, record its versions, restart it.
-
-    `env` is the build environment made by component_env() in build_config.py.
-    Uses DISTRIBUTION, SKU, TARGET_NODE_TYPE and the values config_for() reads.
-
-    Returns 0 on success and 3 on failure.
-    """
-    distribution = env.get("DISTRIBUTION", "")
-
-    # ---- 1. Install and configure -----------------------------------------
-    if distribution == _AZURE_LINUX:
-        log_info(_OP, "Updating WALinuxAgent from the Azure Linux repository",
-                 distro=distribution, method="dnf update", source="distro repository")
-        if not _run_all([["dnf", "update", "-y", "WALinuxAgent"]], env):
-            return 3
-        # BASH QUIRK (kept): versions.json pins a waagent version for
-        # azurelinux3.0, but bash never reads it; dnf installs whatever the
-        # distro repository has. Warn so nobody assumes the pin is applied.
-        entry = unused_azure_linux_entry(env)
-        if entry is not None:
-            log_warn(_OP, "versions.json has a waagent entry for azurelinux3.0 that "
-                          "is not used: Azure Linux takes WALinuxAgent from the "
-                          "distro repository, as in bash",
-                     distro=distribution, unused_entry=entry)
-        # Unlike the other distros, bash doesn't check sku_uses_ipoib here.
-        log_info(_OP, "Azure Linux: OS.EnableRDMA=y is set for every SKU and node type",
-                 distro=distribution, sku=env.get("SKU", ""),
-                 node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE)
-        if not _apply_conf(_AZURE_LINUX_CONF):
-            return 3
-    elif not _install_from_source(env, distribution):
+    """Install/update WALinuxAgent, configure it, record its versions, restart it."""
+    distro = Distro.from_env(env)
+    branch = install_branch(distro)
+    if branch == _AZURE_LINUX:
+        installed = _update_from_distro_repo(env, distro)
+    else:
+        installed = _install_from_source(env, distro, branch)
+    if not installed:
         return 3
-
-    # ---- 2. Record versions -------------------------------------------------
-    versions = _record_versions(env, distribution)
+    versions = _record_versions(env, branch)
     if versions is None:
         return 3
-
-    # ---- 3. Reload systemd and restart the agent ---------------------------
-    if not _run_all([["systemctl", "daemon-reload"]], env):
+    if not _restart_agent(env, distro):
         return 3
-    service = restart_service(distribution)
-    if service is None:
-        log_info(_OP, f"No agent restart rule for {distribution!r}; not restarting "
-                      "(same as bash)", distro=distribution)
-    else:
-        log_info(_OP, f"Restarting {service}", service=service, action="restarted")
-        if not _run_all([["systemctl", "restart", service]], env):
-            return 3
 
     log_info(_OP, f"Waiting {_WAIT_SECONDS}s so waagent doesn't take the package "
                   "manager locks", seconds=_WAIT_SECONDS)
     time.sleep(_WAIT_SECONDS)
-
     agent, extensions = versions
     log_info(_OP, f"WALinuxAgent {agent} installed and configured",
-             waagent=agent, waagent_extensions=extensions, distro=distribution,
-             conf=_WAAGENT_CONF, service=service or "")
+             waagent=agent, waagent_extensions=extensions, distro=str(distro),
+             conf=_WAAGENT_CONF, service=agent_service(distro) or "")
     return 0

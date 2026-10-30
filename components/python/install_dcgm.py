@@ -3,110 +3,54 @@
 What this step does
 -------------------
 Installs NVIDIA DCGM (Data Center GPU Manager), the GPU health-monitoring and
-diagnostics service, including its multinode diagnostic packages (upstream
-#600), records its version as DCGM in the component-versions file, and runs
-the nvidia-dcgm service's nv-hostengine inside a screen session with HPC-X's
-Open MPI loaded, so `dcgmi mndiag` finds an mpirun (upstream #649). The
-NVIDIA package repos were already added by the driver/CUDA steps.
+diagnostics service, with its multinode diagnostic packages (upstream #600);
+records its version as DCGM; and runs the nvidia-dcgm service's nv-hostengine
+inside a screen session with HPC-X's Open MPI loaded, so `dcgmi mndiag` finds
+an mpirun (upstream #649). The NVIDIA package repos were added by the
+driver/CUDA steps.
 
 DCGM packages are built per CUDA major version (e.g. ...-cuda13), so the step
-first asks the installed NVIDIA driver which CUDA version it supports. Like
-bash, it compiles and runs a tiny C program that loads libcuda.so.1 and calls
-cuDriverGetVersion(), which returns 1000 * major + 10 * minor (13000 for CUDA
-13.0). This needs the driver's user-space library, not GPU hardware, so it
-works on a build VM without a GPU (nvidia-smi would not).
+first asks the installed driver which CUDA version it supports. Like bash, it
+compiles and runs a tiny C program (_CUDA_PROBE_SOURCE, the bash heredoc byte
+for byte) that calls cuDriverGetVersion(): 1000 * major + 10 * minor, e.g.
+13000 for CUDA 13.0. That needs the driver's user-space library, not a GPU,
+so it works on a build VM (nvidia-smi would not).
 
-Per distro family:
+Per distro family (_INSTALLERS):
 
-  * Ubuntu 22.04/24.04  install the six datacenter-gpu-manager-4 packages
-                  (cuda<N>, core, proprietary, proprietary-cuda<N>, multinode,
-                  multinode-cuda<N>) pinned to the "dcgm" version in
-                  versions.json, plus every sub-package they depend on with
-                  "(= <that version>)", found by walking `apt-cache show`
-                  (upstream #639: DCGM 4.7+ is split into many exactly-versioned
-                  sub-packages, and apt would otherwise pick their newest
-                  revision and fail to resolve).
-  * Ubuntu 26.04  install the same six packages unpinned, then read the
-                  installed version from dpkg-query.
-  * Azure Linux   build and install an "hpcx-provides-openmpi" marker rpm
-                  (unless installed), so the multinode package's openmpi
-                  dependency doesn't pull Azure Linux's openmpi (its PMIx files
-                  clash with the pmix package); then install cuda13,
-                  multinode and multinode-cuda13 at the "dcgm" version (see
-                  "Bash bug, mirrored" below).
-  * RHEL family   (AlmaLinux, Rocky, RHEL) install cuda<N> and
-                  multinode-cuda<N> (unpinned), then read the installed
-                  version from `dcgmi`.
+  * Ubuntu 22.04/24.04  the six datacenter-gpu-manager-4 packages pinned to
+                  versions.json's "dcgm" version, plus every sub-package they
+                  depend on with "(= <that version>)", found by walking
+                  `apt-cache show` (bash's resolve_exact_version_deps,
+                  upstream #639: otherwise apt picks the sub-packages' newest
+                  revision and fails to resolve).
+  * Ubuntu 26.04  the same six packages unpinned; the version is read back
+                  with dpkg-query.
+  * Azure Linux   an "hpcx-provides-openmpi" marker rpm first (unless
+                  installed: it Provides openmpi, so the multinode package
+                  doesn't pull Azure Linux's openmpi, whose PMIx files clash
+                  with the pmix package), then cuda13, multinode and
+                  multinode-cuda13 at the "dcgm" version.
+  * RHEL family   (AlmaLinux, Rocky, RHEL; bash's final `else`) cuda<N> and
+                  multinode-cuda<N> unpinned; the version is read back from
+                  `dcgmi --version`.
 
-When the SKU's CUDA version in versions.json (e.g. 12.9 for a V100) has a
-lower major than the driver supports, Ubuntu and RHEL also install the cuda,
-(Ubuntu: proprietary-cuda,) and multinode-cuda packages for that lower major
-(DCGM needs both; NVIDIA/DCGM issue #254).
-
-The original bash, for comparison (comments trimmed; the C program is in
-_CUDA_PROBE_SOURCE below, byte for byte, and the heredocs in
-_AZURE_LINUX_MARKER_SPEC and hostengine_dropin()):
-
-    CUDA_DRIVER_SUPPORTED_VERSION=$( <compile and run the C probe in mktemp -d> )
-    CUDA_VERSION=$((CUDA_DRIVER_SUPPORTED_VERSION / 1000))
-    SKU_CUDA_VERSION=$(jq -r '.driver.version' <<< $cuda_metadata | cut -d'.' -f1)
-
-    if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
-        if ubuntu26.04:
-            apt-get install -y <the six packages for CUDA_VERSION>
-        else:
-            DCGM_VERSION=$(jq -r '.version' <<< $dcgm_metadata)
-            dcgm_packages=$(resolve_exact_version_deps "${DCGM_VERSION}" <the six packages>)
-            apt-get install -y ${dcgm_packages}
-        if [[ "${SKU_CUDA_VERSION}" -lt "${CUDA_VERSION}" ]]; then
-            same, for cuda${SKU}, proprietary-cuda${SKU}, multinode-cuda${SKU}
-        fi
-        [ubuntu26.04: DCGM_VERSION=$(dpkg-query -W -f='${Version}' datacenter-gpu-manager-4-core)]
-    elif [[ $DISTRIBUTION == *"azurelinux"* ]]; then
-        DCGM_VERSION=$(jq -r '.version' <<< $dcgm_metadata)
-        if ! rpm -q hpcx-provides-openmpi; then
-            rpm_topdir=$(mktemp -d); <write spec>; rpmbuild --define "_topdir ..." -bb <spec>
-            rpm -Uvh --replacepkgs $(find .../RPMS -name 'hpcx-provides-openmpi-*.rpm' | head -n1)
-            rm -rf "${rpm_topdir}"
-        fi
-        if [ "$1" = "V100" ]; then
-            dnf install -y ...-cuda12-${V} ...-multinode-${V} ...-multinode-cuda12-${V}
-        else
-            dnf install -y ...-cuda13-${V} ...-multinode-${V} ...-multinode-cuda13-${V}
-        fi
-    else
-        dnf clean expire-cache
-        dnf install --assumeyes --setopt=install_weak_deps=True datacenter-gpu-manager-4-cuda${CUDA_VERSION}
-        dnf install --assumeyes datacenter-gpu-manager-4-multinode-cuda${CUDA_VERSION}
-        [SKU lower: the same two for ${SKU_CUDA_VERSION}]
-        DCGM_VERSION=$(dcgmi --version | awk '{print $3}')
-    fi
-
-    write_component_version "DCGM" ${DCGM_VERSION}
-
-    command -v screen || apt-get install -y screen  (else: dnf install -y screen)
-    DCGM_UNIT_FILE=$(systemctl show -p FragmentPath --value nvidia-dcgm.service)
-    DCGM_HOSTENGINE_CMD=$(sed -n 's/^ExecStart=//p' "${DCGM_UNIT_FILE}" | tail -n1)
-    [[ "${DCGM_HOSTENGINE_CMD}" != */nv-hostengine* ]] && exit 1
-    cat > /etc/systemd/system/nvidia-dcgm.service.d/99-mndiag-hpcx.conf <<EOF ... EOF
-    systemctl daemon-reload
-    systemctl --now enable nvidia-dcgm
-    systemctl restart nvidia-dcgm
-    systemctl is-active --quiet nvidia-dcgm     # set -e: a failure stops the script
-
-Bash bug, mirrored: the Azure Linux branch checks `[ "$1" = "V100" ]`, but
-install.sh runs install_dcgm.sh with no arguments, so $1 is always empty and
-every SKU (V100 included) gets the cuda13 packages. This port always installs
-cuda13 on Azure Linux too, does not try to "fix" it from SKU, and warns on V100.
+When the SKU's CUDA version in versions.json (cuda.driver.version, e.g. 12.9
+for a V100) has a lower major than the driver's, Ubuntu and the RHEL family
+also install that major's cuda (Ubuntu: and proprietary-cuda) and
+multinode-cuda packages: DCGM needs both (NVIDIA/DCGM issue #254).
 
 How it fits into the Python build
 ---------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-dcgm" Step. Deleting `action=` from that Step makes the build run the
-bash script again, which is why the .sh file is kept.
+utils/plans/steps.py sets install() as the "install-dcgm" Step's `action=`;
+deleting `action=` runs install_dcgm.sh again, which is why it is kept.
 
-install() receives the build environment (a dict) and returns 0 for success or
-3 for failure. It logs problems and never lets an exception escape.
+Kept bash quirk
+---------------
+The Azure Linux branch picks cuda12 only for `[ "$1" = "V100" ]`, but
+install.sh runs install_dcgm.sh with no arguments, so every SKU (V100
+included) gets the cuda13 packages. This port does the same, and warns on a
+V100 so its build log shows the packages it really got.
 
 Deliberate differences from bash
 --------------------------------
@@ -114,19 +58,20 @@ Deliberate differences from bash
     `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y` (RHEL family:
     `dnf install -y --setopt=install_weak_deps=True` for bash's `--assumeyes`).
   * A missing "dcgm" version (Ubuntu 22.04/24.04, Azure Linux) or a
-    missing/non-numeric CUDA driver version for the SKU (Ubuntu, RHEL family,
-    where it is compared) fails before installing anything. Bash would look
-    for "...=null", or compare "null" (which bash arithmetic treats as 0)
-    and install "...-cudanull". Azure Linux never uses the SKU CUDA version,
-    so, as in bash, it may be missing.
-  * Output from the CUDA probe that isn't a positive integer fails the step.
-  * On the RHEL family, a failing `dcgmi --version` or an empty parsed
-    version fails the step; bash (no pipefail) would record "". Likewise an
-    empty dpkg-query result on Ubuntu 26.04.
-  * The probe's temporary directory is created by Python's tempfile.mkdtemp()
-    (like `mktemp -d`, under $TMPDIR or /tmp) and removed afterwards in all
-    cases, like bash's EXIT trap. The Azure Linux marker's rpmbuild
-    directory is removed in all cases too (bash leaves it behind on failure).
+    missing/non-numeric SKU CUDA version (Ubuntu, RHEL family, where it is
+    compared) fails before installing anything. Bash would look for
+    "...=null", or compare "null" (bash arithmetic: 0) and install
+    "...-cudanull". Azure Linux never uses the SKU CUDA version, so, as in
+    bash, it may be missing.
+  * Probe output that isn't a positive integer fails the step.
+  * RHEL family: a failing `dcgmi --version` or an empty parsed version fails
+    the step; bash (no pipefail) would record "". Likewise an empty
+    dpkg-query result on Ubuntu 26.04.
+  * The probe's and the marker's temporary directories (make_temp_dir, bash
+    `mktemp -d`) are removed in all cases; bash leaves the marker's behind
+    when rpmbuild fails.
+  * Ubuntu 26.04 reads the version with installed_package_version(), which
+    spells it `dpkg-query -W -f ${Version} <package>` (bash: -f='${Version}').
   * resolve_exact_version_deps sorts each package's dependencies in plain
     character order (bash: `sort -u`, locale order). That only changes the
     order of the packages in the apt install.
@@ -139,27 +84,23 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
-import tempfile
 
-from utils.component_config import config_for, write_component_version
+from utils.component_config import config_for, record_version, require_config
+from utils.distro import Distro
+from utils.files import make_dirs, make_temp_dir, remove_paths, write_file
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.package_installer import install_packages
-from utils.process import exec_program, run_capture
+from utils.package_installer import install_packages, installed_package_version
+from utils.process import command_exists, command_path, exec_program, run, run_capture
+from utils.services import service_is_active, systemctl
 
-# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-dcgm"
 
-# Where the probe's (and the Azure Linux marker's) temporary directory is
-# created. None means Python's default temp location, like `mktemp -d`. The
-# tests point it at their own directory.
-_PROBE_PARENT_DIR: str | None = None
 _PROBE_SOURCE_NAME = "cuda_driver_api_version.c"
 _PROBE_BINARY_NAME = "cuda_driver_api_version"
 
-# The C program from install_dcgm.sh's quoted heredoc (<<'EOF'), byte for byte:
-# a quoted heredoc expands nothing, and its text ends with a newline after "}".
-# A test checks this against the .sh file so the two can't drift apart.
+# The C program from install_dcgm.sh's quoted heredoc (<<'EOF'), byte for
+# byte: a quoted heredoc expands nothing. The raw string keeps C's "\n"
+# escapes as written. A test checks it against the .sh file.
 _CUDA_PROBE_SOURCE = r"""#include <dlfcn.h>
 #include <stdio.h>
 
@@ -199,24 +140,21 @@ cleanup:
     return exit_code;
 }
 """
-# (The r"""...""" "raw string" keeps the C "\n" escapes as the two characters
-# backslash and n, exactly as they appear in the bash heredoc.)
 
-# The DCGM service, and the Azure Linux package's fixed CUDA major (see above).
 _SERVICE = "nvidia-dcgm"
+# See "Kept bash quirk" above.
 _AZURE_LINUX_CUDA_MAJOR = 13
 # The one Ubuntu that installs DCGM unpinned and reads the version back.
 _UNPINNED_UBUNTU = "ubuntu26.04"
-
 # The extra dnf option bash passes when installing cuda<N> on the RHEL family.
 _RHEL_CUDA_OPTIONS = ["--setopt=install_weak_deps=True"]
+# Ubuntu 26.04 records this package's version (bash: dpkg-query -W -f='${Version}').
+_DCGM_CORE = "datacenter-gpu-manager-4-core"
 
-# bash: DCGM_VERSION=$(dpkg-query -W -f='${Version}' datacenter-gpu-manager-4-core)
-_DPKG_QUERY_DCGM = ["dpkg-query", "-W", "-f=${Version}", "datacenter-gpu-manager-4-core"]
-
-# ---- Azure Linux marker rpm ---------------------------------------------------
 _AZURE_LINUX_MARKER = "hpcx-provides-openmpi"
+_RPMBUILD_DIRS = ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS")
 # The spec from bash's unquoted heredoc (only the marker name is expanded).
+# {{ and }} are literal braces in an f-string: %{buildroot} stays as is.
 _AZURE_LINUX_MARKER_SPEC = f"""Name: {_AZURE_LINUX_MARKER}
 Version: 1.0
 Release: 1
@@ -241,10 +179,7 @@ README
 %files
 /usr/share/doc/%{{name}}/README
 """
-# (In an f-string, {{ and }} are literal braces, so the spec's %{buildroot}
-# and %{name} come out unchanged.)
 
-# ---- nv-hostengine under screen (upstream #649) -------------------------------
 # A module constant so tests can point it at a temporary directory.
 _DROPIN_DIR = "/etc/systemd/system/nvidia-dcgm.service.d"
 _DROPIN_NAME = "99-mndiag-hpcx.conf"
@@ -260,38 +195,28 @@ _EXACT_DEP = re.compile(r"([^ ]+) \(= ([^)]+)\)")
 # Pure helpers: they only transform values, so tests call them directly.
 # --------------------------------------------------------------------------- #
 def parse_cuda_driver_version(output: str) -> int | None:
-    """The integer the CUDA probe printed (e.g. "13000\\n" -> 13000), or None.
-
-    Bash's $(...) drops the trailing newline and $(( ... )) does the maths. We
-    only accept a plain positive integer; anything else is None.
-    """
+    """The positive integer the CUDA probe printed ("13000\\n" -> 13000), or None."""
     text = output.strip()
-    # fullmatch() requires the WHOLE string to match: digits only.
     if not re.fullmatch(r"[0-9]+", text) or int(text) <= 0:
         return None
     return int(text)
 
 
 def cuda_major(driver_api_version: int) -> int:
-    """$((CUDA_DRIVER_SUPPORTED_VERSION / 1000)): 13000 -> 13, 12090 -> 12.
-
-    `//` is integer division (it drops the remainder), like bash's `/`.
-    """
+    """bash $((CUDA_DRIVER_SUPPORTED_VERSION / 1000)): 13000 -> 13, 12090 -> 12."""
     return driver_api_version // 1000
 
 
 def sku_cuda_major(cuda_config) -> int | None:
     """The major of cuda.driver.version from versions.json ("12.9" -> 12).
 
-    Mirrors  jq -r '.driver.version' | cut -d'.' -f1 . Returns None when the
-    value is missing or its major isn't a number, where bash would carry on
-    with "null" (see the module docstring).
+    bash: jq -r '.driver.version' | cut -d'.' -f1. None when the value is
+    missing or its major isn't a number, where bash would carry on with "null".
     """
     driver = cuda_config.get("driver") if isinstance(cuda_config, dict) else None
     version = driver.get("version") if isinstance(driver, dict) else None
     if version is None:
         return None
-    # str() handles a version written as a JSON number; split(".")[0] is cut -f1.
     major = str(version).split(".")[0]
     return int(major) if re.fullmatch(r"[0-9]+", major) else None
 
@@ -299,9 +224,9 @@ def sku_cuda_major(cuda_config) -> int | None:
 def dcgmi_version(output: str) -> str | None:
     """The DCGM version from `dcgmi --version` output, or None.
 
-    Mirrors  DCGM_VERSION=$(dcgmi --version | awk '{print $3}')  followed by the
-    unquoted ${DCGM_VERSION}: awk prints field 3 of every line ("" if a line is
-    shorter), and write_component_version records only the first word.
+    bash: DCGM_VERSION=$(dcgmi --version | awk '{print $3}'), then the unquoted
+    ${DCGM_VERSION}: awk prints field 3 of every line ("" if a line is
+    shorter) and write_component_version records only the first word.
 
         "dcgmi  version: 4.4.1"  ->  "4.4.1"
     """
@@ -343,18 +268,19 @@ def azure_linux_packages(cuda: int, dcgm_version: str) -> list[str]:
     ]
 
 
+def rhel_installs(cuda: int) -> list[tuple[list[str], list[str]]]:
+    """The cuda<N> and multinode-cuda<N> installs bash runs on the RHEL family,
+    as (packages, dnf options), one per bash command."""
+    return [([f"datacenter-gpu-manager-4-cuda{cuda}"], _RHEL_CUDA_OPTIONS),
+            ([f"datacenter-gpu-manager-4-multinode-cuda{cuda}"], [])]
+
+
 def exact_version_deps(apt_cache_output: str, version: str) -> list[str]:
     """Dependencies declared as "(= <version>)" in `apt-cache show` output.
 
-    Mirrors resolve_exact_version_deps' awk filter + `sort -u`:
-
-        /^(Pre-)?Depends:/ {
-            sub(/^[^:]*:[ \\t]*/, "")                    drop "Depends: "
-            n = split($0, deps, /[,|]/)                 alternatives too
-            for each d: trim blanks; if d ~ /^[^ ]+ \\(= [^)]+\\)$/:
-                name = d before " (= ", minus any ":arch"; ver = inside
-                if (ver == version) print name
-        }
+    Mirrors the awk filter + `sort -u` in bash's resolve_exact_version_deps:
+    on each (Pre-)Depends line, split on "," and "|", keep "name (= ver)"
+    entries whose ver is `version`, and drop any ":arch" from the name.
 
         "Depends: libdcgm4 (= 1:4.7.0-2), dcgmi (>= 4)"  ->  ["libdcgm4"]
     """
@@ -373,7 +299,7 @@ def exact_version_deps(apt_cache_output: str, version: str) -> list[str]:
 def unit_exec_start(unit_text: str) -> str:
     """The last ExecStart= value in a systemd unit, or "".
 
-    Mirrors  sed -n 's/^ExecStart=//p' "${DCGM_UNIT_FILE}" | tail -n1 .
+    bash: sed -n 's/^ExecStart=//p' "${DCGM_UNIT_FILE}" | tail -n1
     """
     values = [line[len("ExecStart="):] for line in unit_text.split("\n")
               if line.startswith("ExecStart=")]
@@ -405,77 +331,76 @@ def hostengine_dropin(screen: str, hostengine_cmd: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Helpers with side effects.
+# 1. Which CUDA major the installed driver supports.
 # --------------------------------------------------------------------------- #
-def _probe_cuda_driver_version(env: dict[str, str]) -> int | None:
-    """Compile and run the C probe; return cuDriverGetVersion(), or None (logged)."""
-    # mkdtemp() creates a new, uniquely named directory and returns its path.
-    probe_dir = tempfile.mkdtemp(prefix="cuda_probe.", dir=_PROBE_PARENT_DIR)
+def _driver_cuda_major(env) -> int | None:
+    """Compile and run the C probe in a temporary directory; its CUDA major,
+    or None (logged)."""
+    probe_dir = make_temp_dir(_OP, prefix="cuda_probe.")
+    if probe_dir is None:
+        return None
+    try:
+        driver_api = _run_cuda_probe(probe_dir, env)
+    finally:
+        remove_paths(probe_dir, op=_OP)     # bash: trap 'rm -rf ...' EXIT
+    if driver_api is None:
+        return None
+    cuda = cuda_major(driver_api)
+    log_info(_OP, f"Probed CUDA driver API version {driver_api} (CUDA {cuda})",
+             cuda_driver_api_version=driver_api, cuda_major=cuda)
+    return cuda
+
+
+def _run_cuda_probe(probe_dir: str, env) -> int | None:
+    """cuDriverGetVersion() from the probe built in `probe_dir`, or None (logged)."""
     source = os.path.join(probe_dir, _PROBE_SOURCE_NAME)
     binary = os.path.join(probe_dir, _PROBE_BINARY_NAME)
-    try:
-        with open(source, "w", encoding="utf-8") as handle:
-            handle.write(_CUDA_PROBE_SOURCE)
-        log_debug(_OP, f"Wrote CUDA probe source {source}", path=source)
-
-        if exec_program(["gcc", source, "-ldl", "-o", binary], _OP, env=env) != 0:
-            log_error(_OP, "could not compile the CUDA driver probe", path=source)
-            return None
-        # The probe prints the version on stdout; its errors go to stderr.
-        rc, output = run_capture([binary], _OP, env=env)
-        if rc != 0:
-            log_error(_OP, "the CUDA driver probe could not query libcuda.so.1 "
-                           "(is the NVIDIA driver installed?)", exit_code=rc)
-            return None
-        version = parse_cuda_driver_version(output)
-        if version is None:
-            log_error(_OP, f"unexpected CUDA driver probe output: {output.strip()!r}")
-        return version
-    finally:
-        # Like bash's `trap 'rm -rf ...' EXIT`: always remove the directory.
-        shutil.rmtree(probe_dir, ignore_errors=True)
-
-
-def _run_all(commands: list[list[str]], env: dict[str, str]) -> bool:
-    """Run commands in order, stopping at the first failure (like `set -e`)."""
-    for command in commands:
-        if exec_program(command, _OP, env=env) != 0:
-            return False
-    return True
-
-
-def _command_path(name: str, env: dict[str, str]) -> str | None:
-    """bash `command -v <name>`: its path on the build env's PATH, or None."""
-    return shutil.which(name, path=env.get("PATH"))
-
-
-def _config_dcgm_version(env: dict[str, str]) -> str | None:
-    """The "dcgm" version from versions.json, or None (logged)."""
-    cfg = config_for("dcgm", env)
-    if not isinstance(cfg, dict) or not cfg.get("version"):
-        log_error(_OP, "could not resolve dcgm version from versions.json",
-                  distro=env.get("DISTRIBUTION", ""))
+    if not (write_file(source, _CUDA_PROBE_SOURCE, _OP)
+            and run(["gcc", source, "-ldl", "-o", binary], _OP, env=env)):
         return None
-    return str(cfg["version"])
+    # The probe prints the version on stdout; its errors go to stderr.
+    rc, output = run_capture([binary], _OP, env=env)
+    if rc != 0:
+        log_error(_OP, "the CUDA driver probe could not query libcuda.so.1 "
+                       "(is the NVIDIA driver installed?)", exit_code=rc)
+        return None
+    version = parse_cuda_driver_version(output)
+    if version is None:
+        log_error(_OP, f"unexpected CUDA driver probe output: {output.strip()!r}")
+    return version
+
+
+# --------------------------------------------------------------------------- #
+# 2. The packages, per distro. Each installer returns the DCGM version to
+#    record, or None on failure (logged).
+# --------------------------------------------------------------------------- #
+def _config_dcgm_version(env) -> str | None:
+    """versions.json's "dcgm" version, or None (logged by require_config)."""
+    cfg = require_config("dcgm", env, _OP, "version")
+    return None if cfg is None else str(cfg["version"])
+
+
+def _have_sku_cuda(sku_cuda: int | None) -> bool:
+    """Whether the SKU CUDA major the Ubuntu/RHEL comparison needs is known."""
+    if sku_cuda is None:
+        log_error(_OP, "could not resolve a numeric cuda driver version for this "
+                       "SKU from versions.json")
+    return sku_cuda is not None
 
 
 def _needs_sku_packages(cuda: int, sku_cuda: int) -> bool:
-    """Log and return whether extra packages for the SKU's CUDA major are needed."""
+    """Whether a lower SKU CUDA major needs its own DCGM packages too (logged)."""
     needed = sku_cuda < cuda
-    if needed:
-        log_info(_OP, f"SKU CUDA major {sku_cuda} is lower than the driver's "
-                      f"{cuda}: also installing the cuda{sku_cuda} DCGM packages",
-                 cuda_major=cuda, sku_cuda_major=sku_cuda)
-    else:
-        log_info(_OP, f"SKU CUDA major {sku_cuda} is not lower than the driver's "
-                      f"{cuda}: no extra DCGM packages", cuda_major=cuda,
-                 sku_cuda_major=sku_cuda)
+    decision = (f"also installing the cuda{sku_cuda} DCGM packages" if needed
+                else "no extra DCGM packages")
+    log_info(_OP, f"SKU CUDA major {sku_cuda}, driver CUDA major {cuda}: {decision}",
+             cuda_major=cuda, sku_cuda_major=sku_cuda)
     return needed
 
 
 def _resolve_exact_version_deps(version: str, packages: list[str],
-                                env: dict[str, str]) -> list[str] | None:
-    """Port of resolve_exact_version_deps: "<pkg>=<version>" for `packages` and,
+                                env) -> list[str] | None:
+    """bash resolve_exact_version_deps: "<pkg>=<version>" for `packages` and,
     recursively, every dependency they declare as "(= <version>)".
 
     Breadth-first, each package once, in bash's order. None (logged) if a
@@ -507,151 +432,17 @@ def _resolve_exact_version_deps(version: str, packages: list[str],
 
 
 def _apt_install_dcgm(env, packages: list[str], dcgm: str | None) -> bool:
-    """Install the packages in one command: pinned with their exact-version
-    dependencies (dcgm version given), or unpinned (Ubuntu 26.04, dcgm None)."""
+    """One apt install: pinned with the exact-version dependencies when `dcgm`
+    is given, else unpinned (Ubuntu 26.04)."""
     if dcgm is not None:
-        resolved = _resolve_exact_version_deps(dcgm, packages, env)
-        if resolved is None:
+        packages = _resolve_exact_version_deps(dcgm, packages, env)
+        if packages is None:
             return False
-        packages = resolved
     return install_packages(packages, env, _OP)
 
 
-def _install_azure_linux_marker(env) -> bool:
-    """Build and install the hpcx-provides-openmpi marker rpm unless installed."""
-    rc = exec_program(["rpm", "-q", _AZURE_LINUX_MARKER], _OP, env=env,
-                      failure_is_error=False)
-    if rc == 0:
-        log_info(_OP, f"Marker rpm {_AZURE_LINUX_MARKER} is already installed",
-                 package=_AZURE_LINUX_MARKER)
-        return True
-
-    # bash: rpm_topdir=$(mktemp -d)
-    topdir = tempfile.mkdtemp(dir=_PROBE_PARENT_DIR)
-    try:
-        spec_file = os.path.join(topdir, f"{_AZURE_LINUX_MARKER}.spec")
-        for sub in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS"):
-            os.makedirs(os.path.join(topdir, sub), exist_ok=True)
-        with open(spec_file, "w", encoding="utf-8") as handle:
-            handle.write(_AZURE_LINUX_MARKER_SPEC)
-        log_info(_OP, f"Building the marker rpm {_AZURE_LINUX_MARKER} (Provides: openmpi, "
-                      "so the multinode package doesn't pull Azure Linux's openmpi)",
-                 package=_AZURE_LINUX_MARKER, spec=spec_file)
-        if not _run_all([["rpmbuild", "--define", f"_topdir {topdir}", "-bb", spec_file]],
-                        env):
-            return False
-        # bash: find "${rpm_topdir}/RPMS" -type f -name "<marker>-*.rpm" | head -n1
-        built = sorted(path for path in glob.glob(
-            os.path.join(topdir, "RPMS", "**", f"{_AZURE_LINUX_MARKER}-*.rpm"),
-            recursive=True) if os.path.isfile(path))
-        if not built:
-            log_error(_OP, f"failed to build {_AZURE_LINUX_MARKER} marker RPM",
-                      rpms_dir=os.path.join(topdir, "RPMS"))
-            return False
-        if not _run_all([["rpm", "-Uvh", "--replacepkgs", built[0]]], env):
-            return False
-        log_info(_OP, f"Installed the marker rpm {_AZURE_LINUX_MARKER}",
-                 package=_AZURE_LINUX_MARKER, rpm=os.path.basename(built[0]))
-        return True
-    finally:
-        shutil.rmtree(topdir, ignore_errors=True)
-
-
-# --------------------------------------------------------------------------- #
-# Per-distro handlers. Each returns the DCGM version to record, or None on
-# failure (already logged).
-# --------------------------------------------------------------------------- #
-def _install_ubuntu(env, cuda: int, sku_cuda: int | None) -> str | None:
-    distribution = env.get("DISTRIBUTION", "")
-    unpinned = distribution == _UNPINNED_UBUNTU
-    dcgm = None
-    if not unpinned:
-        dcgm = _config_dcgm_version(env)
-        if dcgm is None:
-            return None
-    if sku_cuda is None:
-        log_error(_OP, "could not resolve a numeric cuda driver version for this "
-                       "SKU from versions.json")
-        return None
-    if unpinned:
-        log_info(_OP, f"{distribution}: installing the latest DCGM for CUDA {cuda} "
-                      "from apt (unpinned)", distro=distribution, cuda_major=cuda,
-                 pinned=False)
-    else:
-        log_info(_OP, f"Ubuntu: installing DCGM {dcgm} for CUDA {cuda} from apt, with "
-                      "its exact-version dependencies", dcgm_version=dcgm,
-                 version_source="versions.json", cuda_major=cuda, distro=distribution,
-                 pinned=True)
-
-    if not _apt_install_dcgm(env, ubuntu_packages(cuda), dcgm):
-        return None
-    if _needs_sku_packages(cuda, sku_cuda):
-        if not _apt_install_dcgm(env, ubuntu_extra_packages(sku_cuda), dcgm):
-            return None
-    if not unpinned:
-        return dcgm
-
-    rc, output = run_capture(_DPKG_QUERY_DCGM, _OP, env=env)
-    dcgm = output.rstrip("\n") if rc == 0 else ""
-    if not dcgm:
-        log_error(_OP, "could not read the installed datacenter-gpu-manager-4-core "
-                       "version with dpkg-query", exit_code=rc)
-        return None
-    log_info(_OP, f"Installed DCGM version is {dcgm}", dcgm_version=dcgm,
-             version_source="dpkg-query")
-    return dcgm
-
-
-def _install_azurelinux(env, cuda: int, sku_cuda: int | None) -> str | None:
-    dcgm = _config_dcgm_version(env)
-    if dcgm is None:
-        return None
-    if not _install_azure_linux_marker(env):
-        return None
-    # BASH BUG (mirrored on purpose): install_dcgm.sh picks cuda12 only when
-    # its first argument is "V100", but install.sh never passes one, so it
-    # always installs the cuda13 packages, whatever the SKU or probed CUDA major.
-    packages = azure_linux_packages(_AZURE_LINUX_CUDA_MAJOR, dcgm)
-    log_info(_OP, f"Azure Linux: installing DCGM {dcgm} (always the "
-                  f"cuda{_AZURE_LINUX_CUDA_MAJOR} packages, like bash)",
-             dcgm_version=dcgm, version_source="versions.json", cuda_major=cuda,
-             sku_cuda_major=sku_cuda, packages=packages)
-    # The bug only changes the result for a V100: bash meant it to get cuda12.
-    # Warn so a V100 image build's log shows the packages it really received.
-    sku = env.get("SKU", "")
-    if sku == "V100":
-        log_warn(_OP, "Azure Linux V100: installing the cuda13 DCGM packages "
-                      "because install.sh passes no SKU argument to "
-                      "install_dcgm.sh (kept for bash parity)",
-                 sku=sku, packages=packages)
-    return dcgm if install_packages(packages, env, _OP) else None
-
-
-def rhel_installs(cuda: int) -> list[tuple[list[str], list[str]]]:
-    """The cuda<N> and multinode-cuda<N> installs bash runs on the RHEL family,
-    as (packages, dnf options), one per bash command."""
-    return [([f"datacenter-gpu-manager-4-cuda{cuda}"], _RHEL_CUDA_OPTIONS),
-            ([f"datacenter-gpu-manager-4-multinode-cuda{cuda}"], [])]
-
-
-def _install_rhel(env, cuda: int, sku_cuda: int | None) -> str | None:
-    if sku_cuda is None:
-        log_error(_OP, "could not resolve a numeric cuda driver version for this "
-                       "SKU from versions.json")
-        return None
-    log_info(_OP, f"RHEL family: installing the latest DCGM for CUDA {cuda} from dnf",
-             distro=env.get("DISTRIBUTION", ""), cuda_major=cuda)
-
-    installs = rhel_installs(cuda)
-    if _needs_sku_packages(cuda, sku_cuda):
-        installs.extend(rhel_installs(sku_cuda))
-    if not _run_all([["dnf", "clean", "expire-cache"]], env):
-        return None
-    for packages, options in installs:
-        if not install_packages(packages, env, _OP, options=options):
-            return None
-
-    # The RHEL family installs unpinned, so record what dcgmi reports.
+def _dcgmi_reported_version(env) -> str | None:
+    """The version `dcgmi --version` reports, or None (logged)."""
     rc, output = run_capture(["dcgmi", "--version"], _OP, env=env)
     dcgm = dcgmi_version(output) if rc == 0 else None
     if dcgm is None:
@@ -663,8 +454,110 @@ def _install_rhel(env, cuda: int, sku_cuda: int | None) -> str | None:
     return dcgm
 
 
+def _install_ubuntu(env, distro: Distro, cuda: int, sku_cuda: int | None) -> str | None:
+    """apt-install DCGM, pinned to the "dcgm" version except on Ubuntu 26.04,
+    which installs the latest and reads its version back."""
+    pinned = distro.name != _UNPINNED_UBUNTU
+    dcgm = _config_dcgm_version(env) if pinned else None
+    if (pinned and dcgm is None) or not _have_sku_cuda(sku_cuda):
+        return None
+    log_info(_OP, f"Ubuntu: installing DCGM {dcgm or '(latest)'} for CUDA {cuda} "
+                  "from apt", distro=distro.name, dcgm_version=dcgm, pinned=pinned,
+             cuda_major=cuda)
+
+    if not _apt_install_dcgm(env, ubuntu_packages(cuda), dcgm):
+        return None
+    if (_needs_sku_packages(cuda, sku_cuda)
+            and not _apt_install_dcgm(env, ubuntu_extra_packages(sku_cuda), dcgm)):
+        return None
+    return dcgm if pinned else installed_package_version(_DCGM_CORE, env, _OP)
+
+
+def _install_azurelinux(env, distro: Distro, cuda: int,
+                        sku_cuda: int | None) -> str | None:
+    """The marker rpm, then the cuda13 DCGM packages at the "dcgm" version."""
+    dcgm = _config_dcgm_version(env)
+    if dcgm is None or not _install_azure_linux_marker(env):
+        return None
+    packages = azure_linux_packages(_AZURE_LINUX_CUDA_MAJOR, dcgm)
+    log_info(_OP, f"Azure Linux: installing DCGM {dcgm} (always the "
+                  f"cuda{_AZURE_LINUX_CUDA_MAJOR} packages, like bash)",
+             dcgm_version=dcgm, cuda_major=cuda, sku_cuda_major=sku_cuda,
+             packages=packages)
+    # The kept bash quirk only matters on a V100, which bash meant to get cuda12.
+    if env.get("SKU", "") == "V100":
+        log_warn(_OP, "Azure Linux V100: installing the cuda13 DCGM packages "
+                      "because install.sh passes no SKU argument to "
+                      "install_dcgm.sh (kept for bash parity)",
+                 sku="V100", packages=packages)
+    return dcgm if install_packages(packages, env, _OP) else None
+
+
+def _install_azure_linux_marker(env) -> bool:
+    """Build and install the hpcx-provides-openmpi marker rpm unless installed."""
+    if exec_program(["rpm", "-q", _AZURE_LINUX_MARKER], _OP, env=env,
+                    failure_is_error=False) == 0:
+        log_info(_OP, f"Marker rpm {_AZURE_LINUX_MARKER} is already installed",
+                 package=_AZURE_LINUX_MARKER)
+        return True
+    topdir = make_temp_dir(_OP)
+    if topdir is None:
+        return False
+    try:
+        marker_rpm = _build_marker_rpm(str(topdir), env)
+        return marker_rpm is not None and run(
+            ["rpm", "-Uvh", "--replacepkgs", marker_rpm], _OP, env=env)
+    finally:
+        remove_paths(topdir, op=_OP)
+
+
+def _build_marker_rpm(topdir: str, env) -> str | None:
+    """rpmbuild the marker spec under `topdir`; the rpm's path, or None (logged)."""
+    if not make_dirs(*(os.path.join(topdir, sub) for sub in _RPMBUILD_DIRS), op=_OP):
+        return None
+    spec_file = os.path.join(topdir, f"{_AZURE_LINUX_MARKER}.spec")
+    if not write_file(spec_file, _AZURE_LINUX_MARKER_SPEC, _OP):
+        return None
+    log_info(_OP, f"Building the marker rpm {_AZURE_LINUX_MARKER}",
+             package=_AZURE_LINUX_MARKER, spec=spec_file)
+    if not run(["rpmbuild", "--define", f"_topdir {topdir}", "-bb", spec_file],
+               _OP, env=env):
+        return None
+    # bash: find "${rpm_topdir}/RPMS" -type f -name "<marker>-*.rpm" | head -n1
+    built = sorted(path for path in glob.glob(
+        os.path.join(topdir, "RPMS", "**", f"{_AZURE_LINUX_MARKER}-*.rpm"),
+        recursive=True) if os.path.isfile(path))
+    if not built:
+        log_error(_OP, f"failed to build {_AZURE_LINUX_MARKER} marker RPM",
+                  rpms_dir=os.path.join(topdir, "RPMS"))
+        return None
+    return built[0]
+
+
+def _install_rhel(env, distro: Distro, cuda: int, sku_cuda: int | None) -> str | None:
+    """dnf-install the latest DCGM for the driver's (and a lower SKU's) CUDA
+    major, then read the version from dcgmi."""
+    if not _have_sku_cuda(sku_cuda):
+        return None
+    log_info(_OP, f"RHEL family: installing the latest DCGM for CUDA {cuda} from dnf",
+             distro=distro.name, cuda_major=cuda)
+    installs = rhel_installs(cuda)
+    if _needs_sku_packages(cuda, sku_cuda):
+        installs += rhel_installs(sku_cuda)
+    if not run(["dnf", "clean", "expire-cache"], _OP, env=env):
+        return None
+    for packages, options in installs:
+        if not install_packages(packages, env, _OP, options=options):
+            return None
+    return _dcgmi_reported_version(env)
+
+
+# Keyed by Distro.family; anything else takes bash's final `else` (RHEL family).
+_INSTALLERS = {"ubuntu": _install_ubuntu, "azurelinux": _install_azurelinux}
+
+
 # --------------------------------------------------------------------------- #
-# nv-hostengine under screen with HPC-X, then the service.
+# 3. nv-hostengine under screen with HPC-X, then the service.
 # --------------------------------------------------------------------------- #
 def _configure_hostengine(env) -> bool:
     """Write the drop-in that runs nv-hostengine in screen with mpi/hpcx loaded.
@@ -676,21 +569,39 @@ def _configure_hostengine(env) -> bool:
     Restart=always; UCX needs unlimited memlock. Attach with
     `sudo SCREENDIR=/run/nvidia-dcgm-screen screen -r nvidia-dcgm`.
     """
-    if _command_path("screen", env) is None:
+    screen = _ensure_screen(env)
+    if screen is None:
+        return False
+    hostengine_cmd = _hostengine_command(env)
+    if hostengine_cmd is None:
+        return False
+    log_info(_OP, f"nv-hostengine command: {hostengine_cmd}",
+             exec_start=hostengine_cmd, screen=screen)
+    dropin = os.path.join(_DROPIN_DIR, _DROPIN_NAME)
+    return (write_file(dropin, hostengine_dropin(screen, hostengine_cmd), _OP)
+            and systemctl("daemon-reload", op=_OP, env=env))
+
+
+def _ensure_screen(env) -> str | None:
+    """bash `command -v screen || <install screen>`; screen's path, or None (logged)."""
+    if not command_exists("screen", env):
         log_info(_OP, "screen not found: installing it", package="screen")
         if not install_packages(["screen"], env, _OP):
-            return False
-    screen = _command_path("screen", env)
+            return None
+    screen = command_path("screen", env)
     if screen is None:
         log_error(_OP, "screen is still not on PATH after installing it; the drop-in "
                        "needs its path", path=env.get("PATH"))
-        return False
+    return screen
 
+
+def _hostengine_command(env) -> str | None:
+    """The nvidia-dcgm unit's (last) nv-hostengine ExecStart, or None (logged)."""
     rc, output = run_capture(["systemctl", "show", "-p", "FragmentPath", "--value",
                               f"{_SERVICE}.service"], _OP, env=env)
     if rc != 0:
         log_error(_OP, f"could not find the {_SERVICE} unit file", exit_code=rc)
-        return False
+        return None
     unit_file = output.rstrip("\n")
     try:
         with open(unit_file, "r", encoding="utf-8", errors="replace") as handle:
@@ -701,89 +612,43 @@ def _configure_hostengine(env) -> bool:
     if "/nv-hostengine" not in hostengine_cmd:
         log_error(_OP, f"could not find the nv-hostengine ExecStart in {unit_file}",
                   path=unit_file, exec_start=hostengine_cmd)
+        return None
+    return hostengine_cmd
+
+
+def _restart_service(env) -> bool:
+    """Enable and restart nvidia-dcgm (so a running instance picks up the
+    drop-in), then check it is active."""
+    if not (systemctl("--now", "enable", _SERVICE, op=_OP, env=env)    # bash's order
+            and systemctl("restart", _SERVICE, op=_OP, env=env)):
         return False
-    log_info(_OP, f"nv-hostengine command from {unit_file}: {hostengine_cmd}",
-             path=unit_file, exec_start=hostengine_cmd, screen=screen)
-
-    os.makedirs(_DROPIN_DIR, exist_ok=True)
-    dropin = os.path.join(_DROPIN_DIR, _DROPIN_NAME)
-    existed = os.path.exists(dropin)
-    text = hostengine_dropin(screen, hostengine_cmd)
-    with open(dropin, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    action = "replaced" if existed else "created"
-    log_info(_OP, f"{action.capitalize()} {dropin} (nv-hostengine runs under screen "
-                  "with mpi/hpcx loaded)", path=dropin, action=action)
-    log_debug(_OP, f"{dropin}:\n{text}")
-    return _run_all([["systemctl", "daemon-reload"]], env)
+    if not service_is_active(_SERVICE, op=_OP, env=env):
+        log_error(_OP, "DCGM is inactive!", service=_SERVICE)      # bash's message
+        return False
+    log_info(_OP, f"{_SERVICE} service is active", service=_SERVICE)
+    return True
 
 
-# --------------------------------------------------------------------------- #
-# Orchestrator.
-# --------------------------------------------------------------------------- #
 def install(env: dict[str, str]) -> int:
     """Install DCGM, record its version and (re)start nvidia-dcgm. Returns 0 or 3."""
-    distribution = env.get("DISTRIBUTION", "")
-    log_info(_OP, "Installing DCGM", distro=distribution, sku=env.get("SKU", ""),
+    distro = Distro.from_env(env)
+    log_info(_OP, "Installing DCGM", distro=distro.name, sku=env.get("SKU", ""),
              node_type=env.get("TARGET_NODE_TYPE", ""))
 
-    # ---- 1. CUDA major supported by the installed driver -------------------
-    try:
-        driver_api = _probe_cuda_driver_version(env)
-    except OSError as exc:
-        log_error(_OP, f"could not set up the CUDA driver probe: {exc}")
+    cuda = _driver_cuda_major(env)
+    if cuda is None:
         return 3
-    if driver_api is None:
-        return 3
-    cuda = cuda_major(driver_api)
-    log_info(_OP, f"Probed CUDA driver API version {driver_api} (CUDA {cuda})",
-             cuda_driver_api_version=driver_api, cuda_major=cuda)
-
-    # ---- 2. CUDA major of this SKU's driver in versions.json ---------------
     sku_cuda = sku_cuda_major(config_for("cuda", env))
     log_info(_OP, f"SKU CUDA major from versions.json: {sku_cuda}",
              sku_cuda_major=sku_cuda, cuda_major=cuda)
 
-    try:
-        # ---- 3. packages, per distro ----------------------------------------
-        if "ubuntu" in distribution:
-            handler = _install_ubuntu
-        elif "azurelinux" in distribution:
-            handler = _install_azurelinux
-        else:  # RHEL family: AlmaLinux, Rocky Linux, RHEL, etc.
-            handler = _install_rhel
-        dcgm = handler(env, cuda, sku_cuda)
-        if dcgm is None:
-            log_error(_OP, "DCGM installation failed", distro=distribution)
-            return 3
-
-        # ---- 4. record the version ------------------------------------------
-        write_component_version("DCGM", dcgm)
-        log_info(_OP, f"Recorded DCGM version {dcgm}", component="DCGM", version=dcgm)
-
-        # ---- 5. nv-hostengine under screen ----------------------------------
-        if not _configure_hostengine(env):
-            log_error(_OP, "could not set up nv-hostengine under screen with HPC-X",
-                      service=_SERVICE)
-            return 3
-    except OSError as exc:
-        # The marker rpm files, the drop-in and the versions file.
-        log_error(_OP, f"file operation failed: {exc}",
-                  path=getattr(exc, "filename", None))
+    installer = _INSTALLERS.get(distro.family, _install_rhel)
+    dcgm = installer(env, distro, cuda, sku_cuda)
+    if dcgm is None or not record_version("DCGM", dcgm, _OP):
+        return 3
+    if not _configure_hostengine(env) or not _restart_service(env):
         return 3
 
-    # ---- 6. service: restart so a running instance picks up the drop-in ------
-    log_info(_OP, f"Enabling and restarting the {_SERVICE} service", service=_SERVICE)
-    if not _run_all([["systemctl", "--now", "enable", _SERVICE],
-                     ["systemctl", "restart", _SERVICE]], env):
-        log_error(_OP, f"could not enable/restart the {_SERVICE} service",
-                  service=_SERVICE)
-        return 3
-    if exec_program(["systemctl", "is-active", "--quiet", _SERVICE], _OP, env=env) != 0:
-        log_error(_OP, "DCGM is inactive!", service=_SERVICE)
-        return 3
-    log_info(_OP, f"{_SERVICE} service is active", service=_SERVICE)
-
-    log_info(_OP, "DCGM installed", distro=distribution, dcgm_version=dcgm,
+    log_info(_OP, "DCGM installed", distro=distro.name, dcgm_version=dcgm,
              cuda_major=cuda, sku_cuda_major=sku_cuda)
     return 0

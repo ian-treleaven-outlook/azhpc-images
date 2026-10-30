@@ -5,10 +5,11 @@ Two kinds of test:
   * The pure helpers (branch checks, the sed-like line deletion, and the two
     generated EL8 files) are tested directly with real inputs.
   * install() runs against a temporary directory: every path constant in the
-    module is pointed into it with mock.patch.object, and exec_program (which
-    would run systemctl / netplan) is replaced by a mock. The tests check the
-    files written, their modes, the exact commands, and the key log lines.
-    They never touch /etc or run real commands.
+    module is pointed into it with mock.patch.object, exec_program (under
+    run(), systemctl() and service_is_active()) is replaced by a fake, and
+    utils.logger._log records every log line. The tests check the files
+    written, their modes, the exact commands, and the key log lines. They
+    never touch /etc or run real commands.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -20,10 +21,12 @@ import os
 import stat
 import tempfile
 import unittest
+from collections import namedtuple
 from unittest import mock
 
 from components.python import disable_cloudinit
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 # The real paths, relative to "/". Tests re-root them in a temporary directory.
 _PATHS = {
@@ -57,20 +60,21 @@ _SERVICE_COMMANDS = [
 # Pure helpers: real inputs, no mocks.
 # --------------------------------------------------------------------------- #
 class BranchHelperTests(unittest.TestCase):
-    def test_rhel_family_is_a_substring_match(self):
+    def test_rhel_branch_is_alma_rocky_and_rhel(self):
+        # install() takes the RHEL branch on Distro.is_rhel_family.
         for distro in ("almalinux8.10", "almalinux9.7", "rocky8.10", "rocky9.7",
                        "rhel8.10", "rhel9.6"):
-            self.assertTrue(disable_cloudinit.is_rhel_family(distro), distro)
-        # Azure Linux contains none of the markers, so it takes the netplan branch.
+            self.assertTrue(Distro(distro).is_rhel_family, distro)
+        # Azure Linux is none of them, so it takes the netplan branch.
         for distro in ("ubuntu24.04", "ubuntu22.04", "azurelinux3.0", ""):
-            self.assertFalse(disable_cloudinit.is_rhel_family(distro), distro)
+            self.assertFalse(Distro(distro).is_rhel_family, distro)
 
     def test_el8_service_only_for_alma810_rocky810_and_rhel8(self):
         for distro in ("almalinux8.10", "rocky8.10", "rhel8.10", "rhel8.8"):
-            self.assertTrue(disable_cloudinit.needs_ifcfg_cleanup_service(distro))
+            self.assertTrue(disable_cloudinit.needs_ifcfg_cleanup_service(Distro(distro)))
         for distro in ("almalinux8.9", "rocky8.9", "almalinux9.7", "rocky9.7",
                        "rhel9.6", "ubuntu24.04"):
-            self.assertFalse(disable_cloudinit.needs_ifcfg_cleanup_service(distro))
+            self.assertFalse(disable_cloudinit.needs_ifcfg_cleanup_service(Distro(distro)))
 
     def test_node_type_defaults_when_unset_or_empty(self):
         # Like bash ${TARGET_NODE_TYPE:-azure_vm_regular}.
@@ -146,6 +150,9 @@ class GeneratedFileTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # install(): real file I/O in a temporary directory, commands mocked.
 # --------------------------------------------------------------------------- #
+_Record = namedtuple("_Record", "level message fields")
+
+
 class InstallTestBase(unittest.TestCase):
     def setUp(self):
         # TemporaryDirectory() is deleted again by cleanup at the end of the test.
@@ -177,26 +184,32 @@ class InstallTestBase(unittest.TestCase):
     def install(self, env, *, rcs=None):
         """Run install(env). `rcs` maps a command (tuple) to a fake exit code.
 
-        Returns (exit code, commands run, the info/warn/error log mocks).
+        Returns (exit code, commands run, and the info, warn and error log
+        records).
         """
         rcs = rcs or {}
         commands = []
+        records = []
 
         def fake_exec(command, op, **kwargs):
             commands.append(command)
             return rcs.get(tuple(command), 0)
 
-        with mock.patch.object(disable_cloudinit, "exec_program",
-                               side_effect=fake_exec), \
-             mock.patch.object(disable_cloudinit, "log_info") as info, \
-             mock.patch.object(disable_cloudinit, "log_warn") as warn, \
-             mock.patch.object(disable_cloudinit, "log_error") as error:
+        def fake_log(level, op, message, fields=None, detail=None):
+            self.assertEqual(op, "disable-cloudinit")
+            records.append(_Record(level, message, fields or {}))
+
+        with mock.patch("utils.process.exec_program", side_effect=fake_exec), \
+             mock.patch("utils.services.exec_program", side_effect=fake_exec), \
+             mock.patch("utils.logger._log", side_effect=fake_log):
             rc = disable_cloudinit.install(env)
-        return rc, commands, info, warn, error
+        by_level = {level: [r for r in records if r.level == level]
+                    for level in ("info", "warn", "error")}
+        return rc, commands, by_level["info"], by_level["warn"], by_level["error"]
 
     @staticmethod
-    def messages(log_mock):
-        return [c.args[1] for c in log_mock.call_args_list]
+    def messages(records):
+        return [r.message for r in records]
 
 
 class RhelInstallTests(InstallTestBase):
@@ -215,7 +228,7 @@ class RhelInstallTests(InstallTestBase):
                 rc, commands, info, _, error = self.install({"DISTRIBUTION": distro})
 
                 self.assertEqual(rc, 0)
-                error.assert_not_called()
+                self.assertEqual(error, [])
                 # Appended, not replaced.
                 self.assertEqual(self.read("_CUSTOM_NETWORKING_CFG"),
                                  "existing: 1\nnetwork: {config: disabled}\n")
@@ -229,11 +242,11 @@ class RhelInstallTests(InstallTestBase):
                                      self.paths["_SCRIPT_PATH"]))
                 self.assertEqual(commands, _SERVICE_COMMANDS)
                 # Start line with structured fields, and the closing summary.
-                start = info.call_args_list[0]
-                self.assertEqual(start.args[1],
+                start = info[0]
+                self.assertEqual(start.message,
                                  "Disabling cloud-init network configuration")
-                self.assertEqual(start.kwargs["distro"], distro)
-                self.assertEqual(start.kwargs["branch"], "rhel-ifcfg")
+                self.assertEqual(start.fields["distro"], distro)
+                self.assertEqual(start.fields["branch"], "rhel-ifcfg")
                 self.assertIn("Cloud-init network configuration disabled",
                               self.messages(info))
 
@@ -245,22 +258,19 @@ class RhelInstallTests(InstallTestBase):
         self.assertFalse(os.path.exists(self.paths["_SCRIPT_PATH"]))
         self.assertFalse(os.path.exists(self.paths["_SERVICE_PATH"]))
         self.assertEqual(commands, [])
-        decision = [c for c in info.call_args_list
-                    if c.kwargs.get("el8_service") is False]
+        decision = [r for r in info if r.fields.get("el8_service") is False]
         self.assertEqual(len(decision), 1)
 
     def test_logs_each_file_change(self):
         _, _, info, _, _ = self.install({"DISTRIBUTION": "rocky8.10"})
 
-        by_path = {c.kwargs.get("path"): c.kwargs for c in info.call_args_list
-                   if "action" in c.kwargs}
+        by_path = {r.fields.get("path"): r.fields for r in info if "action" in r.fields}
         self.assertEqual(by_path[self.paths["_CUSTOM_NETWORKING_CFG"]]["action"],
                          "appended")
-        ifcfg = by_path[self.paths["_IFCFG_FILE"]]
-        self.assertEqual(ifcfg["action"], "edited")
-        self.assertEqual((ifcfg["hwaddr_removed"], ifcfg["dhcp_hostname_removed"],
-                          ifcfg["ipv6init_removed"]), (1, 1, 1))
-        self.assertEqual(by_path[self.paths["_SCRIPT_PATH"]]["mode"], "755")
+        edited = [r.fields for r in info
+                  if r.fields.get("path") == self.paths["_IFCFG_FILE"]]
+        self.assertEqual(edited, [{"path": self.paths["_IFCFG_FILE"], "changed": True}])
+        self.assertEqual(by_path[self.paths["_SCRIPT_PATH"]]["action"], "created")
         self.assertEqual(by_path[self.paths["_SERVICE_PATH"]]["action"], "created")
 
     def test_rerun_appends_again_and_warns(self):
@@ -270,7 +280,7 @@ class RhelInstallTests(InstallTestBase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.read("_CUSTOM_NETWORKING_CFG"),
                          "existing: 1\n" + "network: {config: disabled}\n" * 2)
-        warn.assert_called_once()
+        self.assertEqual(len(warn), 1)
 
     def test_missing_ifcfg_returns_3_before_any_service_work(self):
         os.remove(self.paths["_IFCFG_FILE"])
@@ -279,18 +289,19 @@ class RhelInstallTests(InstallTestBase):
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
         self.assertFalse(os.path.exists(self.paths["_SCRIPT_PATH"]))
-        self.assertIn("ifcfg-eth0", error.call_args.args[1])
+        self.assertIn("ifcfg-eth0", error[-1].message)
 
     def test_each_failing_service_command_returns_3_and_stops(self):
         for i, failing in enumerate(_SERVICE_COMMANDS):
             with self.subTest(command=failing):
                 self.write("_IFCFG_FILE", _IFCFG)
-                rc, commands, _, _, error = self.install(
+                rc, commands, info, _, _ = self.install(
                     {"DISTRIBUTION": "almalinux8.10"}, rcs={tuple(failing): 1})
 
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, _SERVICE_COMMANDS[:i + 1])
-                error.assert_called_once()
+                self.assertNotIn("Cloud-init network configuration disabled",
+                                 self.messages(info))
 
     def test_inactive_service_is_reported(self):
         rc, _, _, _, error = self.install(
@@ -298,16 +309,15 @@ class RhelInstallTests(InstallTestBase):
             rcs={tuple(_SERVICE_COMMANDS[-1]): 3})
 
         self.assertEqual(rc, 3)
-        self.assertIn("not active", error.call_args.args[1])
-        self.assertEqual(error.call_args.kwargs["exit_code"], 3)
+        self.assertIn("not active", error[-1].message)
 
     def test_unwritable_script_returns_3_without_raising(self):
-        os.rmdir(os.path.join(self.root, "usr/sbin"))   # parent dir missing
+        os.makedirs(self.paths["_SCRIPT_PATH"])   # a folder can't be written as a file
         rc, commands, _, _, error = self.install({"DISTRIBUTION": "almalinux8.10"})
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertIn(self.paths["_SCRIPT_PATH"], error.call_args.args[1])
+        self.assertIn(self.paths["_SCRIPT_PATH"], error[-1].message)
 
 
 class NetplanInstallTests(InstallTestBase):
@@ -326,7 +336,7 @@ class NetplanInstallTests(InstallTestBase):
                 rc, commands, info, _, error = self.install(env)
 
                 self.assertEqual(rc, 0)
-                error.assert_not_called()
+                self.assertEqual(error, [])
                 # tee (no -a) replaces the file.
                 self.assertEqual(self.read("_DISABLE_NETWORK_CFG"),
                                  "network: {config: disabled}\n")
@@ -338,7 +348,7 @@ class NetplanInstallTests(InstallTestBase):
                                  "    version: 2\n")
                 self.assertFalse(os.path.exists(self.paths["_NETPLAN_BAREMETAL"]))
                 self.assertEqual(commands, [["netplan", "apply"]])
-                self.assertEqual(info.call_args_list[0].kwargs["branch"], "netplan")
+                self.assertEqual(info[0].fields["branch"], "netplan")
 
     def test_baremetal_1p_writes_net_yaml_and_disables_cloud_init(self):
         rc, commands, info, _, _ = self.install(
@@ -359,9 +369,8 @@ class NetplanInstallTests(InstallTestBase):
         self.assertFalse(os.path.exists(self.paths["_NETPLAN_CLOUD_INIT"]))
         self.assertEqual(self.read("_CLOUD_INIT_DISABLED"), "")
         self.assertEqual(commands, [])          # no netplan apply on bare metal
-        removed = [c for c in info.call_args_list
-                   if c.kwargs.get("action") == "removed"]
-        self.assertEqual(removed[0].kwargs["path"], self.paths["_NETPLAN_CLOUD_INIT"])
+        removed = [r for r in info if r.fields.get("action") == "removed"]
+        self.assertEqual(removed[0].fields["path"], self.paths["_NETPLAN_CLOUD_INIT"])
 
     def test_baremetal_1p_without_cloud_init_yaml(self):
         os.remove(self.paths["_NETPLAN_CLOUD_INIT"])
@@ -372,24 +381,26 @@ class NetplanInstallTests(InstallTestBase):
         self.assertTrue(os.path.exists(self.paths["_CLOUD_INIT_DISABLED"]))
 
     def test_netplan_apply_failure_returns_3(self):
-        rc, _, _, _, error = self.install({"DISTRIBUTION": "ubuntu24.04"},
-                                          rcs={("netplan", "apply"): 1})
+        rc, commands, info, _, _ = self.install({"DISTRIBUTION": "ubuntu24.04"},
+                                                rcs={("netplan", "apply"): 1})
 
         self.assertEqual(rc, 3)
-        self.assertEqual(error.call_args.kwargs["exit_code"], 1)
+        self.assertEqual(commands, [["netplan", "apply"]])
+        self.assertNotIn("Cloud-init network configuration disabled", self.messages(info))
 
     def test_azure_linux_takes_netplan_branch_and_fails_without_netplan(self):
         os.remove(self.paths["_NETPLAN_CLOUD_INIT"])
         os.rmdir(os.path.join(self.root, "etc/netplan"))
-        rc, commands, _, warn, error = self.install({"DISTRIBUTION": "azurelinux3.0"})
+        rc, commands, _, warn, _ = self.install({"DISTRIBUTION": "azurelinux3.0"},
+                                                rcs={("netplan", "apply"): 127})
 
-        # Same as bash: the cloud-init file is written, then the netplan write fails.
+        # As in bash the cloud-init file is written; write_file creates the
+        # missing /etc/netplan, so the step fails at `netplan apply` (not found).
         self.assertEqual(rc, 3)
         self.assertEqual(self.read("_DISABLE_NETWORK_CFG"),
                          "network: {config: disabled}\n")
-        self.assertEqual(commands, [])
-        self.assertIn("Azure Linux", warn.call_args.args[1])
-        self.assertIn(self.paths["_NETPLAN_CLOUD_INIT"], error.call_args.args[1])
+        self.assertEqual(commands, [["netplan", "apply"]])
+        self.assertIn("Azure Linux", warn[-1].message)
 
 
 # --------------------------------------------------------------------------- #

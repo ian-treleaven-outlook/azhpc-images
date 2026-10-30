@@ -2,12 +2,14 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_packages, configured_ref, configured_commit,
-    build_script) are tested directly. configured_ref/configured_commit were
-    also compared with real jq/bash in WSL on the same configs.
-  * install() is tested with exec_program (the module's and
-    utils.package_installer's, which runs the dependency installs) replaced
-    by one fake that records each command and imitates its effect on disk: `git clone` creates the source
+  * The pure helpers (dependency_packages, configured_commit) are tested
+    directly. configured_commit was also compared with real jq/bash in WSL
+    on the same configs. (configured_ref is utils.repo_source's; test_toolkit
+    covers it.)
+  * install() is tested with exec_program (in utils.process, behind run and
+    run_script, and in utils.package_installer, which runs the dependency
+    installs) replaced by one fake that records each command and imitates
+    its effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvbandwidth binary.
     write_repo_source_info is mocked and recorded in the same list, so the
     order is checked. The install paths (_DEST_DIR, _WORK_DIR) point into a
@@ -31,8 +33,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvbandwidth_tool as m
-from utils import package_installer
+from utils import component_config, files, package_installer, process, repo_source
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 _OP = "install-nvbandwidth"
 _URL = "https://github.com/NVIDIA/nvbandwidth"
@@ -50,6 +53,12 @@ _DNF = ["dnf", "install", "-y"]
 _UBUNTU_DEPS = [[*_APT, *p] for p in _UBUNTU_PACKAGES]
 _DNF_BOOST = [[*_DNF, *p] for p in _DNF_BOOST_PACKAGES]
 _AZL_ARM_DEPS = [[*_DNF, *p] for p in _AZL_ARM_PACKAGES]
+# The one-shell build run_script() runs: HPC-X loaded, then cmake and make.
+_BUILD_SCRIPT = ("set -e\n"
+                 "source /etc/profile.d/modules.sh\n"
+                 "module load mpi/hpcx\n"
+                 "cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DMULTINODE=1 .\n"
+                 "make\n")
 
 
 class _FakeExec:
@@ -102,7 +111,8 @@ def _env(distribution="ubuntu24.04", arch="aarch64", *, config=None, node_type=N
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
     def test_dependency_packages_follow_bash_branches(self):
-        deps = m.dependency_packages
+        def deps(name, arch):
+            return m.dependency_packages(Distro(name), arch)
         self.assertEqual(list(deps("ubuntu24.04", "aarch64")), _UBUNTU_PACKAGES)
         self.assertEqual(list(deps("ubuntu26.04", "x86_64")), _UBUNTU_PACKAGES)
         self.assertEqual(list(deps("almalinux9.8", "x86_64")), _DNF_BOOST_PACKAGES)
@@ -113,30 +123,16 @@ class HelperTests(unittest.TestCase):
             with self.subTest(distribution=other):
                 self.assertEqual(deps(other, "x86_64"), ())
 
-    def test_configured_ref_follows_jq_and_bash_defaults(self):
-        ref = m.configured_ref
-        self.assertEqual(ref({}, "0.9"), "v0.9")
-        self.assertEqual(ref({"ref": "v0.8"}, "0.9"), "v0.8")
-        self.assertEqual(ref({"ref": "v0.8", "branch": "main"}, "0.9"), "v0.8")
-        self.assertEqual(ref({"branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": None, "branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": False, "branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": "", "branch": "main"}, "0.9"), "v0.9")
-
     def test_configured_commit_is_empty_when_unset(self):
         self.assertEqual(m.configured_commit({"commit": _COMMIT}), _COMMIT)
         self.assertEqual(m.configured_commit({}), "")
         self.assertEqual(m.configured_commit({"commit": None}), "")
         self.assertEqual(m.configured_commit({"commit": False}), "")
 
-    def test_build_script_loads_hpcx_then_builds_in_one_shell(self):
-        self.assertEqual(m.build_script().splitlines(), [
-            "set -e",
-            "source /etc/profile.d/modules.sh",
-            "module load mpi/hpcx",
-            "cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DMULTINODE=1 .",
-            "make",
-        ])
+    def test_build_lines_match_the_bash_script(self):
+        script = (_REPO_ROOT / "components" / "install_nvbandwidth_tool.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("module load mpi/hpcx\n" + "\n".join(m._BUILD_LINES) + "\n", script)
 
     def test_bash_script_still_matches(self):
         script = (_REPO_ROOT / "components" / "install_nvbandwidth_tool.sh").read_text(
@@ -199,26 +195,33 @@ class InstallTests(unittest.TestCase):
 
         with mock.patch.object(m, "_DEST_DIR", str(self.dest)), \
              mock.patch.object(m, "_WORK_DIR", str(self.work)), \
-             mock.patch.object(m, "exec_program", side_effect=fake), \
+             mock.patch.object(process, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(m, "write_repo_source_info", side_effect=fake_source), \
-             mock.patch.object(m, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(m, "log_info") as log_info, \
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(files, "log_info") as files_info, \
+             mock.patch.object(repo_source, "log_info"), \
              mock.patch.object(m, "log_warn") as log_warn, \
-             mock.patch.object(m, "log_error") as log_error:
+             mock.patch.object(component_config, "log_error") as log_error, \
+             mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(repo_source, "log_error", log_error), \
+             mock.patch.object(m, "log_error", log_error):
             rc = m.install(env)
         return rc, fake, {"record": record, "info": log_info, "warn": log_warn,
-                          "error": log_error, "pkg_error": pkg_error}
+                          "files_info": files_info, "error": log_error,
+                          "pkg_error": pkg_error}
 
     def _build_calls(self, *, ref="v0.9", commit=_COMMIT):
         calls = [(["git", "clone", "--branch", ref, _URL], str(self.work))]
         if commit:
             calls.append((["git", "checkout", commit], self.source))
         calls += [(("repo_source", "NVBANDWIDTH", commit or None, ref), self.source),
-                  (["bash", "-c", m.build_script()], self.source)]
+                  (["bash", "-c", _BUILD_SCRIPT], self.source)]
         return calls
 
     @staticmethod
@@ -239,7 +242,9 @@ class InstallTests(unittest.TestCase):
         start = mocks["info"].call_args_list[0].kwargs
         self.assertEqual((start["version"], start["ref"], start["commit"], start["source"]),
                          ("0.9", "v0.9", _COMMIT, _URL))
-        self.assertIn(f"Installed {self.dest / 'nvbandwidth'}", self._messages(mocks["info"]))
+        moved = [c.kwargs["path"] for c in mocks["files_info"].call_args_list
+                 if c.args[1].startswith("Moved ")]
+        self.assertEqual(moved, [str(self.dest / "nvbandwidth")])
         self.assertEqual(self._messages(mocks["info"])[-1],
                          f"nvbandwidth 0.9 installed to {self.dest}")
 
@@ -286,8 +291,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual((self.dest / "nvbandwidth").read_text(encoding="utf-8"),
                          "built binary\n")
-        installed = [c for c in mocks["info"].call_args_list
-                     if c.args[1].startswith("Installed ")]
+        installed = [c for c in mocks["files_info"].call_args_list
+                     if c.args[1].startswith("Moved ")]
         self.assertEqual(installed[0].kwargs["action"], "replaced")
 
     def test_real_versions_json_honours_the_baremetal_3p_override(self):
@@ -327,8 +332,11 @@ class InstallTests(unittest.TestCase):
                 self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.dest / "nvbandwidth").exists())
                 mocks["record"].assert_not_called()
-                # install_packages() logs a failing dependency install itself.
-                mocks["pkg_error" if fail_at < 2 else "error"].assert_called_once()
+                # A failed command is logged where it ran: by install_packages()
+                # for the dependencies, else by exec_program (faked here).
+                if fail_at < 2:
+                    mocks["pkg_error"].assert_called_once()
+                mocks["error"].assert_not_called()
 
     def test_repo_source_failure_returns_3(self):
         for result in (False, PermissionError("denied")):

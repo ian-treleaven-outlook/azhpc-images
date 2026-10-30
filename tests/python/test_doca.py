@@ -7,8 +7,9 @@
     heredocs rendered by real bash.
   * Parity tests compare every file text with the heredoc in
     components/install_doca.sh, so the two can't drift apart.
-  * install() runs with commands, downloads, config, DKMS check and the
-    versions file mocked; every path it writes (/etc/dkms, dnf.conf, /tmp
+  * install() runs with commands (exec_program, wherever the toolkit runs
+    them, recorded in one ordered list), downloads, config, DKMS check and
+    the versions file mocked; every path it writes (/etc/dkms, dnf.conf, /tmp
     marker files, openibd drop-in, openib.conf, the apt pin) points into a
     temporary directory. The patches are read from the real components/patches.
 
@@ -26,7 +27,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_doca
-from utils import package_installer
+from utils import component_config, download, files, package_installer, process
+from utils.distro import Distro
+from utils.download import ChecksumError
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-doca"
@@ -108,11 +111,19 @@ class ParseTests(unittest.TestCase):
                          ["libibverbs", "rdma-core"])
 
     def test_baseos_repo_name(self):
-        name = install_doca.baseos_repo_name
+        def name(distro, arch):
+            return install_doca.baseos_repo_name(Distro(distro), arch)
         self.assertEqual(name("almalinux9.8", "x86_64"), "baseos")
         self.assertEqual(name("rocky8.10", "x86_64"), "baseos")
         self.assertEqual(name("rhel9.8", "x86_64"), "rhel-9-for-x86_64-baseos-rhui-rpms")
         self.assertEqual(name("rhel8.10", "aarch64"), "rhel-8-for-aarch64-baseos-rhui-rpms")
+
+    def test_bash_branch(self):
+        for distro, branch in (("ubuntu22.04", "ubuntu"), ("ubuntu26.04", "ubuntu"),
+                               ("azurelinux3.0", "azurelinux"), ("almalinux9.8", "rhel"),
+                               ("rocky8.10", "rhel"), ("rhel9.8", "rhel"), ("", "rhel")):
+            with self.subTest(distro=distro):
+                self.assertEqual(install_doca.bash_branch(Distro(distro)), branch)
 
     def test_expand_glob(self):
         with tempfile.TemporaryDirectory() as root:
@@ -259,26 +270,35 @@ class InstallTests(unittest.TestCase):
                     "COMPONENT_DIR": str(_REPO / "components"), "PATH": "/usr/bin"}
         self.work = os.path.join(str(self.top), "distros", distro)
         with mock.patch.object(install_doca, "config_for", return_value=cfg), \
+             mock.patch.object(component_config, "config_for", return_value=cfg), \
+             mock.patch.object(component_config, "log_error") as config_error, \
              mock.patch.object(install_doca, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
+             mock.patch.object(files, "log_info") as file_info, \
              mock.patch.object(install_doca, "run_capture", side_effect=self._fake_capture), \
-             mock.patch.object(install_doca, "download_and_verify",
+             mock.patch.object(download, "download_and_verify",
                                side_effect=self._fake_download), \
+             mock.patch.object(download, "log_error") as download_error, \
              mock.patch.object(install_doca, "verify_checksum",
                                return_value=checksum_ok) as checksum, \
-             mock.patch.object(install_doca, "_command_exists", return_value=rpmbuild_present), \
+             mock.patch.object(install_doca, "command_exists", return_value=rpmbuild_present), \
              mock.patch.object(install_doca, "check_dkms_status", return_value=dkms_ok) as dkms, \
              mock.patch.object(install_doca, "running_kernel", return_value=_KERNEL), \
-             mock.patch.object(install_doca, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(component_config, "log_info") as config_info, \
              mock.patch.object(install_doca, "log_info") as info, \
              mock.patch.object(install_doca, "log_warn") as warn, \
              mock.patch.object(install_doca, "log_error") as error:
             rc = install_doca.install(self.env)
         self.checksum, self.dkms_check, self.record = checksum, dkms, record
         self.info, self.warn, self.error = info, warn, error
+        self.file_info, self.config_error = file_info, config_error
+        self.config_info = config_info
+        self.download_error_log = download_error
         return rc
 
     # ---- helpers for expectations -----------------------------------------
@@ -352,15 +372,10 @@ class InstallTests(unittest.TestCase):
         self.error.assert_not_called()
 
     def test_ubuntu_marker_control_provides_sharp_before_3_3_0(self):
-        written = {}
-        real_write = install_doca._write_file
-
-        def capture(path, text, *, append=False):
-            written[path] = text
-            real_write(path, text, append=append)
-
-        with mock.patch.object(install_doca, "_write_file", side_effect=capture):
+        with mock.patch.object(install_doca, "write_file",
+                               wraps=install_doca.write_file) as write:
             self.assertEqual(self._install(), 0)
+        written = {c.args[0]: c.args[1] for c in write.call_args_list}
         self.assertEqual(written[str(self.tmp / _MARKER)], install_doca.apt_marker_control(
             _APT_VERSIONS["openmpi"], _APT_VERSIONS["ucx"], "3.2.3", _APT_VERSIONS["sharp"]))
 
@@ -422,7 +437,7 @@ class InstallTests(unittest.TestCase):
         rc = self._install(cfg=_PRIVATE_CFG, checksum_ok=False)
         self.assertEqual(rc, 3)
         self.assertEqual(self.calls, [])
-        self.error.assert_called()
+        self.record.assert_not_called()           # (verify_checksum logs the mismatch)
 
     # ---- IPoIB (sku_uses_ipoib) ---------------------------------------------
     def test_ipoib_disabled_on_baremetal_and_ncv6(self):
@@ -434,7 +449,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._install(sku=sku, node_type=node_type), 0)
                 self.assertEqual(self.openib.read_text(), "\n# Load IPoIB\nIPOIB_LOAD=no\n")
                 self.assertIn({"path": str(self.openib), "action": "created"},
-                              list(self._messages(self.info).values()))
+                              list(self._messages(self.file_info).values()))
 
     def test_ipoib_rerun_appends_again_with_warning(self):
         self.openib.write_text("ONBOOT=yes\n")
@@ -548,12 +563,12 @@ class InstallTests(unittest.TestCase):
             with self.subTest(cfg=cfg):
                 self.assertEqual(self._install(cfg=cfg), 3)
                 self.assertEqual(self.calls, [])
-                self.error.assert_called()
+                self.config_error.assert_called_once()     # by require_config
 
     def test_download_failure_returns_3(self):
-        self.assertEqual(self._install(download_error=RuntimeError("checksum")), 3)
+        self.assertEqual(self._install(download_error=ChecksumError("checksum")), 3)
         self.assertEqual(self.calls, [])
-        self.assertIn("checksum", self.error.call_args_list[0].args[1])
+        self.assertIn("checksum", self.download_error_log.call_args_list[0].args[1])
 
     def test_each_failing_ubuntu_command_stops_the_step(self):
         commands = self._ubuntu_commands(os.path.realpath(os.path.join(
@@ -564,7 +579,10 @@ class InstallTests(unittest.TestCase):
             with self.subTest(command=command[:3]):
                 self.assertEqual(self._install(fail_on=command), 3)
                 self.assertEqual(self._commands(), commands[:index + 1])
-                self.error.assert_called()
+                # exec_program (mocked here) logs the failed command; a failed
+                # distro branch also logs its consequence.
+                if command[0] != "systemctl":
+                    self.error.assert_called()
 
     def test_each_failing_rhel_command_stops_the_step(self):
         commands = self._rhel_commands()
@@ -606,7 +624,7 @@ class InstallTests(unittest.TestCase):
 
     def test_unwritable_versions_file_returns_3(self):
         self.assertEqual(self._install(write_error=PermissionError("denied")), 3)
-        self.assertIn("denied", self.error.call_args.args[1])
+        self.assertIn("denied", self.config_error.call_args.args[1])     # record_version
 
     # ---- logging --------------------------------------------------------------
     def test_key_log_lines(self):
@@ -619,14 +637,16 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(start.kwargs[key], value)
         messages = self._messages(self.info)
         conf = str(self.dkms / "mlnx-ofed-kernel.conf")
-        self.assertEqual(messages[f"Created {conf}"], {"path": conf, "action": "created"})
-        self.assertIn(f"Installed DKMS patch "
-                      f"{self.dkms / 'mlnx-ofed-kernel' / 'patches' / 'xdp-fragments.patch'}",
-                      messages)
+        self.assertEqual(self._messages(self.file_info)[f"Wrote {conf} (created)"],
+                         {"path": conf, "action": "created"})
+        patch = self.dkms / "mlnx-ofed-kernel" / "patches" / "xdp-fragments.patch"
+        self.assertIn(f"Copied {_PATCHES / 'mlnx-ofed-kernel-xdp-fragments.patch'} -> "
+                      f"{patch} (created)", self._messages(self.file_info))
         marker = [k for k in messages if k.startswith("Building the equivs marker")][0]
         self.assertEqual(messages[marker]["sharp_provided"], True)
-        self.assertIn("Recorded DOCA=3.2.3", messages)
-        self.assertIn("Recorded OFED=25.10-1.7.1", messages)
+        recorded = self._messages(self.config_info)
+        self.assertIn("Recorded DOCA 3.2.3", recorded)
+        self.assertIn("Recorded OFED 25.10-1.7.1", recorded)
         self.assertEqual(self.info.call_args_list[-1].args[1], "DOCA-OFED 3.2.3 installed")
 
 

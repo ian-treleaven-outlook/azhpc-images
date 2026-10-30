@@ -1,142 +1,67 @@
 """install_azure_persistent_rdma_naming.py — Python port of
 components/install_azure_persistent_rdma_naming.sh.
 
-What this step does
+Gives a VM's RDMA devices stable names (mlx5_ib<N> for InfiniBand ports,
+mlx5_an<N> for Ethernet / accelerated networking ports), at boot and again
+every minute:
+
+  1. Build `rdma_rename` from the rdma-core release in versions.json
+     ("rdma_core") and install it as /usr/sbin/rdma_rename_<version>. (The
+     distro's rdma_rename can't be used: the NAME_FIXED mode is needed.)
+  2. Write /usr/sbin/azure_persistent_rdma_naming.sh, which renames every
+     device not already called mlx5_ib<N> / mlx5_an<N>, numbering on from the
+     highest existing index.
+  3. Write azure_persistent_rdma_naming.service (runs the script after udev
+     settles and openibd starts) and its .timer (30s after boot, then 60s
+     after each run).
+  4. `systemctl daemon-reload`, enable the service and timer, start both.
+
+Upstream #614 (Ubuntu 26.04 support) made the script rerunnable, added the
+timer and deleted install_azure_persistent_rdma_naming_monitor.sh.
+
+The generated files
 -------------------
-Gives the RDMA (InfiniBand / RoCE) devices of a VM stable, predictable names:
-mlx5_ib0, mlx5_ib1, ... for InfiniBand ports and mlx5_an0, ... for Ethernet
-(accelerated networking) ports. It does that at boot, and again every minute,
-with a systemd service and timer:
+Bash writes the naming script with an unquoted heredoc: only
+`${RDMA_CORE_VERSION}` expands, every other `$` is escaped as `\\$` in the bash
+source. _NAMING_SCRIPT_TEMPLATE is the text as it lands in the file, with that
+one placeholder left for naming_script() to fill. It and the two units are
+compared byte for byte with fixtures rendered by real bash.
 
-  1. Build `rdma_rename` from the rdma-core source release named in
-     versions.json ("rdma_core"), and install it as
-     /usr/sbin/rdma_rename_<version>. (The distro's rdma_rename can't be used:
-     we need its NAME_FIXED mode, so we build a known version.)
-  2. Write /usr/sbin/azure_persistent_rdma_naming.sh, a small script that walks
-     the devices (`ibdev2netdev -v`), skips those already named mlx5_ib<N> /
-     mlx5_an<N>, and renames the others with rdma_rename, numbering on from
-     the highest existing index.
-  3. Write azure_persistent_rdma_naming.service, which runs that script (after
-     udev has settled and openibd has started), and
-     azure_persistent_rdma_naming.timer, which runs the service 30s after boot
-     and then 60s after each run.
-  4. `systemctl daemon-reload`, enable the service and the timer, then start
-     the service and the timer now.
+Kept bash quirks
+----------------
+  * `mkdir rdma-core && tar ...`: `set -e` ignores a failure that isn't the
+    last command of an `&&` list, so if /tmp/rdma-core is left over from a
+    failed run, bash skips tar and builds in the old folder. So does this
+    step, with a warning. A failing tar stops the step.
+  * The downloaded tarball is left in /tmp; only the source folder is removed.
+  * No component version is recorded (bash records none); the rdma-core
+    version is logged.
 
-Upstream (#614, the Ubuntu 26.04 support) rewrote the naming script so it can
-run repeatedly, added the timer, and deleted the separate
-install_azure_persistent_rdma_naming_monitor.sh (a looping monitor service that
-restarted the naming service), which this step used to run.
-
-The original bash, for comparison (the three heredoc texts are shortened here;
-they are in full below as _NAMING_SCRIPT_TEMPLATE, _SERVICE_UNIT and
-_TIMER_UNIT):
-
-    set -ex
-    source ${UTILS_DIR}/utilities.sh
-    rdma_core_metadata=$(get_component_config "rdma_core")
-    RDMA_CORE_VERSION=$(jq -r '.version' <<< $rdma_core_metadata)
-    RDMA_CORE_SHA=$(jq -r '.sha256' <<< $rdma_core_metadata)
-
-    TARBALL="v${RDMA_CORE_VERSION}.tar.gz"
-    RDMA_CORE_DOWNLOAD_URL=https://github.com/linux-rdma/rdma-core/archive/refs/tags/${TARBALL}
-    download_and_verify ${RDMA_CORE_DOWNLOAD_URL} ${RDMA_CORE_SHA} /tmp
-
-    pushd /tmp
-    mkdir rdma-core && tar -xvf $TARBALL --strip-components=1 -C rdma-core
-    pushd rdma-core
-    bash build.sh
-    cp build/bin/rdma_rename /usr/sbin/rdma_rename_$RDMA_CORE_VERSION
-    popd
-    rm -rf rdma-core
-    popd
-
-    cat <<EOF >/usr/sbin/azure_persistent_rdma_naming.sh
-    #!/bin/bash
-    rdma_rename=/usr/sbin/rdma_rename_${RDMA_CORE_VERSION}
-    ... (every other $ is written as \\$, so it stays literal) ...
-    EOF
-    chmod 755 /usr/sbin/azure_persistent_rdma_naming.sh
-
-    cat <<EOF >/etc/systemd/system/azure_persistent_rdma_naming.service
-    ...
-    EOF
-
-    cat <<EOF >/etc/systemd/system/azure_persistent_rdma_naming.timer
-    ...
-    EOF
-
-    systemctl daemon-reload
-    systemctl enable azure_persistent_rdma_naming.service
-    systemctl enable azure_persistent_rdma_naming.timer
-    systemctl start azure_persistent_rdma_naming.service
-    systemctl start azure_persistent_rdma_naming.timer
-
-About the generated script: `cat <<EOF` (an *unquoted* heredoc) expands
-variables while writing. Only `${RDMA_CORE_VERSION}` is meant to expand; every
-other `$` is escaped as `\\$` in the bash source so it reaches the file as a
-plain `$`. Our template is the text as it lands in the file, with the one
-`${RDMA_CORE_VERSION}` left in place and filled in by naming_script(). It and
-the two units were compared byte for byte with the files real bash writes.
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-persistent-rdma-naming" Step. The build then calls install(env)
-instead of running the bash script. Deleting `action=` runs the bash script
-again, which is why the .sh file is kept.
-
-install() returns 0 for success or 3 for failure. It logs problems and returns
-3; it does not let exceptions escape to the build loop. Like bash's `set -e`,
-the first failure stops the step.
-
-Which commands still run as programs
-------------------------------------
-  * `tar`: --strip-components has no simple tarfile equivalent, and the tar
-    command keeps the archive's symlinks and modes exactly as bash.
-  * `bash build.sh`: rdma-core's own build script (cmake + ninja/make).
-  * `systemctl daemon-reload` / `enable` / `start`.
-The copy, file writes, chmod and clean-up are plain Python.
-
-A bash subtlety we mirror: `mkdir rdma-core && tar ...`
--------------------------------------------------------
-`set -e` does not stop the script when a command that is *not the last* in an
-`&&` list fails (checked in WSL). So if /tmp/rdma-core already exists (a run
-that failed before its `rm -rf`), bash's `mkdir` fails, `tar` is skipped and
-the build runs in the folder that is already there. install() does the same,
-with a warning. A failing `tar` (the last command of the list) does stop bash,
-and returns 3 here.
-
-Deliberate differences from bash
---------------------------------
-  * A missing rdma_core version or sha256 fails the step before anything is
-    downloaded. Bash would have tried to download "vnull.tar.gz".
-  * Bash downloads into its current folder and then moves the file into /tmp;
-    we download straight into /tmp. As in bash, the tarball is left in /tmp.
-  * `cp` is shutil.copy(), which copies the file and its permission bits. For
-    a new file this matches `cp` (rdma_rename is built 0755). If an
-    rdma_rename_<version> already existed, `cp` would have kept that file's
-    old mode; shutil.copy sets the built file's mode.
-  * Bash records no component version for this step, and neither do we. The
-    rdma-core version used is logged instead.
+Deliberate differences
+----------------------
+  * A missing rdma_core version or sha256 fails before anything is downloaded
+    (bash would fetch "vnull.tar.gz").
+  * The tarball is downloaded straight into /tmp (bash downloads into its
+    current folder, then moves it there).
+  * `cp` is copy_file (shutil.copy), which also copies the built file's mode: a new file
+    gets 0755 either way, but an existing rdma_rename_<version> gets the
+    built mode too, where `cp` would have kept the old one.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
-import stat
 
-from utils.component_config import config_for
-from utils.download import ChecksumError, download_and_verify
-from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.process import exec_program
+from utils.component_config import require_config
+from utils.download import fetch_verified
+from utils.files import copy_file, extract_tarball, remove_paths, write_file
+from utils.logger import log_error, log_info, log_warn
+from utils.process import run
+from utils.services import systemctl
 
-# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "install-persistent-rdma-naming"
 
-# Where things go. They are module-level "constants" (capital names that the
-# program never changes) so the tests can point them at a temporary folder.
+# Paths are module constants so tests can point them at a temporary folder.
 _WORK_DIR = "/tmp"                       # download + build folder (bash: pushd /tmp)
 _SRC_DIR_NAME = "rdma-core"              # unpacked source, under _WORK_DIR
 _SBIN_DIR = "/usr/sbin"                  # where rdma_rename_<version> is installed
@@ -148,16 +73,19 @@ _TIMER_FILE = "/etc/systemd/system/azure_persistent_rdma_naming.timer"
 
 _URL = "https://github.com/linux-rdma/rdma-core/archive/refs/tags/{tarball}"
 
-# The generated naming script, exactly as bash writes it, except that the one
-# value bash expands, ${RDMA_CORE_VERSION}, is still a placeholder here.
-#
-# Careful when editing: the indentation is TAB characters and several "empty"
-# lines contain tabs, exactly as in the bash heredoc. The tests compare this
-# text with a file rendered by real bash, so a stray change shows up there.
-#
-# The r"""...""" prefix makes a "raw" string: backslashes are kept as typed, so
-# `[\ \t]` and `\1` in the sed command reach the file unchanged. The text
-# starts right after the opening quotes, so it begins with "#!/bin/bash".
+# bash's systemctl calls, in order.
+_SYSTEMCTL_CALLS = (
+    ("daemon-reload",),
+    ("enable", _SERVICE_NAME),
+    ("enable", _TIMER_NAME),
+    ("start", _SERVICE_NAME),
+    ("start", _TIMER_NAME),
+)
+
+# The naming script as bash writes it, ${RDMA_CORE_VERSION} still a placeholder.
+# Careful when editing: indentation and several "empty" lines are TABs, as in
+# the bash heredoc (the fixture test catches a stray change). Raw string, so
+# `[\ \t]` and `\1` in the sed command reach the file unchanged.
 _NAMING_SCRIPT_TEMPLATE = r"""#!/bin/bash
 
 rdma_rename=/usr/sbin/rdma_rename_${RDMA_CORE_VERSION}
@@ -208,11 +136,8 @@ for old_device in "${all_devices[@]}"; do
 	
 done
 """
-
-# The placeholder in the template above that naming_script() fills in.
 _VERSION_PLACEHOLDER = "${RDMA_CORE_VERSION}"
 
-# The systemd unit, exactly as bash writes it (nothing in it is expanded).
 _SERVICE_UNIT = """\
 [Unit]
 Description=Azure persistent RDMA naming
@@ -228,7 +153,6 @@ StandardOutput=journal
 WantedBy=multi-user.target
 """
 
-# The retry timer, exactly as bash writes it (nothing in it is expanded either).
 _TIMER_UNIT = """\
 [Unit]
 Description=Retry Azure persistent RDMA naming
@@ -244,73 +168,28 @@ WantedBy=timers.target
 """
 
 
+def tarball_name(version: str) -> str:
+    return f"v{version}.tar.gz"
+
+
 def rdma_rename_path(version: str) -> str:
     """Where the built rdma_rename is installed, e.g. /usr/sbin/rdma_rename_59.0."""
-    # _SBIN_DIR is read when the function runs, so tests can redirect it.
     return os.path.join(_SBIN_DIR, f"rdma_rename_{version}")
 
 
 def naming_script(version: str) -> str:
-    """Return the text of /usr/sbin/azure_persistent_rdma_naming.sh.
+    """The text of /usr/sbin/azure_persistent_rdma_naming.sh for `version`.
 
-    This is what bash's unquoted heredoc produces: ${RDMA_CORE_VERSION} becomes
-    the version, and everything else stays as written. The path inside the
-    script is always /usr/sbin/... (it's what runs on the finished image), so
-    it doesn't use _SBIN_DIR, which tests may redirect.
+    The path inside is always /usr/sbin/... (what runs on the image), not the
+    _SBIN_DIR tests may redirect.
     """
     return _NAMING_SCRIPT_TEMPLATE.replace(_VERSION_PLACEHOLDER, version)
 
 
-def _mode(path: str) -> str:
-    """A file's permission bits as an octal string such as "0755", for logging."""
-    # S_IMODE keeps only the permission bits of st_mode (drops the file type).
-    return f"{stat.S_IMODE(os.stat(path).st_mode):04o}"
-
-
-def _run(command: list[str], env: dict[str, str], cwd: str | None = None) -> bool:
-    """Run one command; log and return False if it fails.
-
-    exec_program() already logs the command, its output and its exit code;
-    here we only add what the failure means for this step.
-    """
-    rc = exec_program(command, _OP, cwd=cwd, env=env)
-    if rc != 0:
-        log_error(_OP, f"'{' '.join(command)}' failed; persistent RDMA naming "
-                       f"is not installed", command=command[0], exit_code=rc)
-        return False
-    return True
-
-
-def _write_file(path: str, text: str, mode: int | None = None) -> bool:
-    """Write `text` to `path`, replacing any old content (bash's `cat <<EOF >path`).
-
-    When `mode` is given, it is applied afterwards, like bash's `chmod 755`.
-    Returns True on success, or False after logging why it failed.
-    """
-    # Checked first only so the log can say "created" or "replaced".
-    action = "replaced" if os.path.exists(path) else "created"
-    try:
-        # Mode "w" creates the file or empties an existing one before writing.
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        if mode is not None:
-            os.chmod(path, mode)
-        actual_mode = _mode(path)
-    except OSError as exc:
-        log_error(_OP, f"could not write {path}: {exc}", path=path)
-        return False
-    log_info(_OP, f"Wrote {path}", path=path, action=action, mode=actual_mode)
-    # The full text is bulky, so it goes to DEBUG only.
-    log_debug(_OP, f"Contents of {path}:\n{text}", path=path)
-    return True
-
-
-def _unpack(work_dir: str, src_dir: str, tarball: str, env: dict[str, str]) -> bool:
+def _unpack(src_dir: str, tarball: str, env: dict[str, str]) -> bool:
     """bash: `mkdir rdma-core && tar -xvf $TARBALL --strip-components=1 -C rdma-core`."""
     try:
-        # os.mkdir, unlike os.makedirs(exist_ok=True), fails if the folder
-        # exists, like `mkdir` without -p.
-        os.mkdir(src_dir)
+        os.mkdir(src_dir)             # fails if it exists, like `mkdir` without -p
     except FileExistsError:
         if not os.path.isdir(src_dir):
             # bash would skip tar and then fail at `pushd rdma-core`.
@@ -321,96 +200,64 @@ def _unpack(work_dir: str, src_dir: str, tarball: str, env: dict[str, str]) -> b
                  path=src_dir)
         return True
     except OSError as exc:
-        # Bash would skip tar here too, then fail at `pushd rdma-core`.
         log_error(_OP, f"could not create {src_dir}: {exc}", path=src_dir)
         return False
-
-    # We only get here when mkdir succeeded.
-    return _run(["tar", "-xvf", tarball, "--strip-components=1",
-                 "-C", _SRC_DIR_NAME], env, cwd=work_dir)
+    return extract_tarball(tarball, _OP, dest=_SRC_DIR_NAME, strip_components=1,
+                           cwd=_WORK_DIR, env=env)
 
 
 def _build_rdma_rename(version: str, sha256: str, env: dict[str, str]) -> bool:
-    """Download rdma-core, build it, install rdma_rename_<version>, clean up."""
-    tarball = f"v{version}.tar.gz"
-    url = _URL.format(tarball=tarball)
-    try:
-        download_and_verify(url, sha256, dest_dir=_WORK_DIR)
-    # download() raises OSError (network/file errors); a bad hash raises ChecksumError.
-    except (OSError, ChecksumError) as exc:
-        log_error(_OP, f"rdma-core download/verify failed: {exc}", url=url)
+    """Step 1: download and build rdma-core, install rdma_rename_<version>."""
+    tarball = tarball_name(version)
+    if fetch_verified(_URL.format(tarball=tarball), sha256, _OP, _WORK_DIR) is None:
         return False
-
     src_dir = os.path.join(_WORK_DIR, _SRC_DIR_NAME)
-    if not _unpack(_WORK_DIR, src_dir, tarball, env):
+    if not (_unpack(src_dir, tarball, env)
+            and run(["bash", "build.sh"], _OP, cwd=src_dir, env=env)
+            and copy_file(os.path.join(src_dir, "build", "bin", "rdma_rename"),
+                          rdma_rename_path(version), _OP)):
         return False
-
-    if not _run(["bash", "build.sh"], env, cwd=src_dir):
-        return False
-    built = os.path.join(src_dir, "build", "bin", "rdma_rename")
-    log_info(_OP, "Built rdma-core", rdma_core_version=version, binary=built)
-
-    target = rdma_rename_path(version)
-    try:
-        # shutil.copy copies the content and the permission bits (see docstring).
-        shutil.copy(built, target)
-        target_mode = _mode(target)
-    except OSError as exc:
-        log_error(_OP, f"could not copy {built} to {target}: {exc}",
-                  source=built, path=target)
-        return False
-    log_info(_OP, f"Installed {target}", path=target, mode=target_mode,
-             rdma_core_version=version)
-
-    try:
-        # bash: rm -rf rdma-core. The source tree is only needed for the build.
-        shutil.rmtree(src_dir)
-    except OSError as exc:
-        log_error(_OP, f"could not remove {src_dir}: {exc}", path=src_dir)
-        return False
+    remove_paths(src_dir, op=_OP)
     log_info(_OP, f"Removed build folder {src_dir}; {tarball} is left in "
                   f"{_WORK_DIR} (same as bash)", path=src_dir)
     return True
 
 
-def install(env: dict[str, str]) -> int:
-    """Install rdma_rename and the persistent RDMA naming services. Returns 0 or 3."""
-    cfg = config_for("rdma_core", env)
-    if not cfg or not cfg.get("version") or not cfg.get("sha256"):
-        log_error(_OP, "could not resolve rdma_core version and sha256 from versions.json",
-                  distro=env.get("DISTRIBUTION", ""), arch=env.get("ARCHITECTURE", ""))
-        return 3
-    version = cfg["version"]
+def _write_units(version: str) -> bool:
+    """Steps 2-3: the naming script, its service and the retry timer."""
+    return (write_file(_NAMING_SCRIPT, naming_script(version), _OP, mode=0o755)
+            and write_file(_SERVICE_FILE, _SERVICE_UNIT, _OP)
+            and write_file(_TIMER_FILE, _TIMER_UNIT, _OP))
 
-    log_info(_OP, "Installing persistent RDMA naming",
-             rdma_core_version=version,
-             source=_URL.format(tarball=f"v{version}.tar.gz"),
-             distro=env.get("DISTRIBUTION", ""), arch=env.get("ARCHITECTURE", ""))
 
-    # ---- 1. rdma_rename_<version> -----------------------------------------
-    if not _build_rdma_rename(version, cfg["sha256"], env):
-        return 3
-
-    # ---- 2. The naming script, its service and the retry timer -------------
-    if not _write_file(_NAMING_SCRIPT, naming_script(version), mode=0o755):
-        return 3
-    if not _write_file(_SERVICE_FILE, _SERVICE_UNIT):
-        return 3
-    if not _write_file(_TIMER_FILE, _TIMER_UNIT):
-        return 3
-
-    # ---- 3. Load the new units, enable both, start both (bash's order) -----
-    for command in (["systemctl", "daemon-reload"],
-                    ["systemctl", "enable", _SERVICE_NAME],
-                    ["systemctl", "enable", _TIMER_NAME],
-                    ["systemctl", "start", _SERVICE_NAME],
-                    ["systemctl", "start", _TIMER_NAME]):
-        if not _run(command, env):
-            return 3
+def _enable_and_start(env: dict[str, str]) -> bool:
+    """Step 4: load the new units, enable both, start both (bash's order)."""
+    for args in _SYSTEMCTL_CALLS:
+        if not systemctl(*args, op=_OP, env=env):
+            return False
     log_info(_OP, f"Enabled and started {_SERVICE_NAME} and {_TIMER_NAME}",
              service=_SERVICE_NAME, timer=_TIMER_NAME)
+    return True
 
-    log_info(_OP, "Persistent RDMA naming installed",
-             rdma_core_version=version, rdma_rename=rdma_rename_path(version),
-             naming_script=_NAMING_SCRIPT, service=_SERVICE_NAME, timer=_TIMER_NAME)
+
+def install(env: dict[str, str]) -> int:
+    """Install rdma_rename and the persistent RDMA naming services. Returns 0 or 3."""
+    cfg = require_config("rdma_core", env, _OP, "version", "sha256")
+    if cfg is None:
+        return 3
+    version = cfg["version"]
+    log_info(_OP, "Installing persistent RDMA naming", rdma_core_version=version,
+             source=_URL.format(tarball=tarball_name(version)),
+             distro=env.get("DISTRIBUTION", ""), arch=env.get("ARCHITECTURE", ""))
+
+    if not _build_rdma_rename(version, cfg["sha256"], env):
+        return 3
+    if not _write_units(version):
+        return 3
+    if not _enable_and_start(env):
+        return 3
+
+    log_info(_OP, "Persistent RDMA naming installed", rdma_core_version=version,
+             rdma_rename=rdma_rename_path(version), naming_script=_NAMING_SCRIPT,
+             service=_SERVICE_NAME, timer=_TIMER_NAME)
     return 0

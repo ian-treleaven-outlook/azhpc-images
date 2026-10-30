@@ -1,142 +1,56 @@
 """install_amd_libs.py — Python port of components/install_amd_libs.sh.
 
-What this step does
--------------------
-On x86_64 images we install two AMD packages under /opt/amd:
+On x86_64 images, installs two AMD packages under /opt/amd:
 
-  * AOCL (AMD Optimizing CPU Libraries): the BLIS, FFTW and libFLAME math
-    libraries. We run AMD's installer, copy its output into /opt/amd, point
-    /opt/amd/lib and /opt/amd/include at the multi-threaded ("MT") build, and
-    write an `amd/aocl` environment module for it.
-  * AOCC (AMD Optimizing C/C++ and Fortran Compilers): we run AMD's installer
-    and copy the whole compiler folder to /opt/amd/aocc-compiler-<version>.
+  * AOCL (AMD Optimizing CPU Libraries: BLIS, FFTW, libFLAME): run AMD's
+    installer, copy its output into /opt/amd, point /opt/amd/lib and
+    /opt/amd/include at the multi-threaded ("MT") build, and write an
+    `amd/aocl` environment module.
+  * AOCC (AMD's C/C++/Fortran compilers): run AMD's installer and copy the
+    folder to /opt/amd/aocc-compiler-<version>.
 
-Both versions are recorded in the component-versions file as AOCL and AOCC.
+Both versions come from the "amd" entry of versions.json and are recorded as
+AOCL and AOCC.
 
-The original bash, for comparison (comments and blank lines trimmed):
+The vendor `./install.sh` installers and `cp -r` still run as programs: the
+AOCL/AOCC trees hold library symlinks that `cp -r` copies as symlinks while
+merging into existing folders, which shutil.copytree doesn't do the same way.
 
-    INSTALL_PREFIX=/opt/amd
-    mkdir -p ${INSTALL_PREFIX}
-    amd_metadata=$(get_component_config "amd")
-    AOCL_VERSION=$(jq -r '.aocl.version' <<< $amd_metadata)
-    AOCL_SHA256=$(jq -r '.aocl.sha256' <<< $amd_metadata)
-    AOCL_TARBALL="aocl-linux-aocc-${AOCL_VERSION}.tar.gz"
-    AOCL_FOLDER_VERSION=$(echo $AOCL_VERSION | cut -d'.' -f1-2 --output-delimiter='-')
-    AOCL_DOWNLOAD_URL=https://download.amd.com/developer/eula/aocl/aocl-${AOCL_FOLDER_VERSION}/${AOCL_TARBALL}
-    AOCL_FOLDER=$(basename $AOCL_TARBALL .tar.gz)
-    download_and_verify $AOCL_DOWNLOAD_URL $AOCL_SHA256
-    tar -xvf ${AOCL_TARBALL}
-    pushd ${AOCL_FOLDER}
-    ./install.sh -t amd -l blis fftw libflame -i lp64
-    cp -r amd/${AOCL_VERSION}/aocc/* ${INSTALL_PREFIX}
-    AOCL_MT_ROOT="${INSTALL_PREFIX}/MT"
-    if [[ ! -d "${AOCL_MT_ROOT}/lib" || ! -d "${AOCL_MT_ROOT}/include" ]]; then
-        echo "AOCL MT installation is incomplete: ..." >&2
-        exit 1
-    fi
-    ln -sfn "${AOCL_MT_ROOT}/lib" "${INSTALL_PREFIX}/lib"
-    ln -sfn "${AOCL_MT_ROOT}/include" "${INSTALL_PREFIX}/include"
-    popd
-    AMD_MODULE_FILES_DIRECTORY=${MODULE_FILES_DIRECTORY}/amd
-    mkdir -p ${AMD_MODULE_FILES_DIRECTORY}
-    cat << EOF >> ${AMD_MODULE_FILES_DIRECTORY}/aocl-${AOCL_VERSION}
-    #%Module 1.0
-    #
-    #  AOCL
-    #
-    prepend-path    LD_LIBRARY_PATH   ${INSTALL_PREFIX}/lib
-    setenv          AMD_FFTW_INCLUDE  ${INSTALL_PREFIX}/include
-    EOF
-    ln -s ${AMD_MODULE_FILES_DIRECTORY}/aocl-${AOCL_VERSION} ${AMD_MODULE_FILES_DIRECTORY}/aocl
-    write_component_version "AOCL" ${AOCL_VERSION}
+Kept bash quirks
+----------------
+  * The modulefile is appended to (`>>`) and `amd/aocl` is linked with
+    `ln -s` (no -f), so a rerun appends the modulefile text again and then
+    fails at the symlink, as bash does under `set -e`; the error says so.
+  * If /opt/amd/lib or /opt/amd/include is a real folder, `ln -sfn` creates
+    the link inside it rather than replacing it. Kept, with a warning.
 
-    AOCC_VERSION=$(jq -r '.aocc.version' <<< $amd_metadata)
-    AOCC_SHA256=$(jq -r '.aocc.sha256' <<< $amd_metadata)
-    AOCC_TARBALL="aocc-compiler-${AOCC_VERSION}.tar"
-    AOCC_FOLDER_VERSION=$(echo $AOCC_VERSION | cut -d'.' -f1-2 --output-delimiter='-')
-    AOCC_DOWNLOAD_URL=https://download.amd.com/developer/eula/aocc/aocc-${AOCC_FOLDER_VERSION}/${AOCC_TARBALL}
-    AOCC_FOLDER=$(basename $AOCC_TARBALL .tar)
-    download_and_verify $AOCC_DOWNLOAD_URL $AOCC_SHA256
-    tar -xvf ${AOCC_TARBALL}
-    pushd ${AOCC_FOLDER}
-    ./install.sh
-    popd
-    cp -r ${AOCC_FOLDER} ${INSTALL_PREFIX}
-    write_component_version "AOCC" ${AOCC_VERSION}
-
-    rm -rf *.tar *.tar.gz
-    rm -rf ${AOCL_FOLDER}
-    rm -rf ${AOCC_FOLDER}
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-amd-libs" Step (x86_64 only). The build then calls install(env)
-instead of running the bash script. Deleting `action=` runs the bash script
-again, which is why the .sh file is kept.
-
-install() returns 0 for success or 3 for failure. It logs problems and returns
-3; it does not let exceptions escape to the build loop. Like bash's `set -e`,
-it stops at the first failing step.
-
-Which commands still run as programs, and why
----------------------------------------------
-  * `tar -xvf`: the vendor archives may contain symlinks, which Python's
-    tarfile module can refuse to extract in its safe mode. The tar command
-    extracts them exactly as bash did.
-  * The two vendor `./install.sh` installers.
-  * `cp -r`: the AOCL and AOCC trees contain library symlinks (libfoo.so ->
-    libfoo.so.5). `cp -r` copies them as symlinks and merges into existing
-    folders. shutil.copytree does not behave the same way when files already
-    exist, so we keep cp.
-
-Everything else (checking folders, symlinks, the modulefile, cleanup) is plain
-Python.
-
-Deliberate differences from bash
---------------------------------
-  * A missing AOCL/AOCC version or sha256, or a missing MODULE_FILES_DIRECTORY,
-    fails the step before anything is downloaded. Bash would have built URLs
-    containing "null", installed AOCL, and only failed later at the AOCC
-    download (or written the modulefile under /amd).
-  * Bash downloads and extracts into the distro build folder, its current
-    directory. We use a dedicated work folder (_WORK_DIR) and delete it at the
-    end. Bash's `rm -rf *.tar *.tar.gz` also deleted unrelated tarballs that
-    earlier steps had left in the build folder; we only delete our own folder.
-    Any extra files the vendor installers write beside their folders are now
-    removed with the work folder instead of being left in the build folder.
-
-Rerun behavior (same as bash)
------------------------------
-The modulefile is appended to (bash's `>>`), and the `amd/aocl` symlink is
-created without replacing an existing one (bash's `ln -s` without `-f`). So a
-second run appends the modulefile text again and then fails at the symlink,
-exactly as the bash script does under `set -e`; the error log says so.
-
-If /opt/amd/lib or /opt/amd/include is already a real folder (not a symlink),
-`ln -sfn` creates the link inside it rather than replacing it. That is kept
-too, with a warning.
+Deliberate differences
+----------------------
+  * A missing AOCL/AOCC version or sha256, or MODULE_FILES_DIRECTORY, fails
+    the step before anything is downloaded. Bash would build URLs containing
+    "null", install AOCL and fail later (or write the modulefile under /amd).
+  * Downloads and extraction use a private work folder (_WORK_DIR), emptied
+    first and deleted at the end. Bash used the build folder, and its
+    `rm -rf *.tar *.tar.gz` also deleted unrelated tarballs left there by
+    earlier steps; anything the vendor installers write beside their folders
+    now goes with the work folder too.
 """
 
 from __future__ import annotations
 
 import glob
 import os
-import shutil
 
-from utils.component_config import config_for, write_component_version
-from utils.download import ChecksumError, download_and_verify
+from utils.component_config import record_version, require_config
+from utils.download import fetch_verified
+from utils.files import extract_tarball, make_dirs, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.process import exec_program
+from utils.process import run
 
-# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "install-amd-libs"
 
-# Where both packages are installed (bash's INSTALL_PREFIX).
-_INSTALL_PREFIX = "/opt/amd"
-
-# Our private download/extract folder, deleted at the end (see the docstring).
-_WORK_DIR = "/tmp/amd-libs"
+_INSTALL_PREFIX = "/opt/amd"          # bash's INSTALL_PREFIX
+_WORK_DIR = "/tmp/amd-libs"           # private download/extract folder
 
 _AOCL_URL = "https://download.amd.com/developer/eula/aocl/aocl-{folder_version}/{tarball}"
 _AOCC_URL = "https://download.amd.com/developer/eula/aocc/aocc-{folder_version}/{tarball}"
@@ -144,8 +58,7 @@ _AOCC_URL = "https://download.amd.com/developer/eula/aocc/aocc-{folder_version}/
 # The libraries and integer size passed to AOCL's installer.
 _AOCL_INSTALL_ARGS = ["-t", "amd", "-l", "blis", "fftw", "libflame", "-i", "lp64"]
 
-# The modulefile body, byte for byte what bash's heredoc writes. Each line ends
-# with "\n", including the last one, just like a heredoc.
+# Byte for byte what bash's heredoc appends.
 _AOCL_MODULEFILE = (
     "#%Module 1.0\n"
     "#\n"
@@ -156,18 +69,20 @@ _AOCL_MODULEFILE = (
 )
 
 
+# ---- Pure helpers -------------------------------------------------------------
 def folder_version(version: str) -> str:
-    """Turn a version like "5.3.0" into the download folder name part "5-3".
-
-    Mirrors bash's `echo $VERSION | cut -d'.' -f1-2 --output-delimiter='-'`:
-    keep the first two dot-separated fields and join them with "-".
-
-        "5.3.0" -> "5-3"      "5.3" -> "5-3"      "5" -> "5"
-
-    Like cut, a version with no "." at all is returned unchanged.
-    """
-    # str.split(".") gives a list of fields; [:2] keeps at most the first two.
+    """bash `cut -d'.' -f1-2 --output-delimiter='-'`: "5.3.0" -> "5-3", "5" -> "5"."""
     return "-".join(version.split(".")[:2])
+
+
+def aocl_url(version: str) -> str:
+    return _AOCL_URL.format(folder_version=folder_version(version),
+                            tarball=f"aocl-linux-aocc-{version}.tar.gz")
+
+
+def aocc_url(version: str) -> str:
+    return _AOCC_URL.format(folder_version=folder_version(version),
+                            tarball=f"aocc-compiler-{version}.tar")
 
 
 def aocl_modulefile(prefix: str) -> str:
@@ -176,179 +91,126 @@ def aocl_modulefile(prefix: str) -> str:
 
 
 def make_symlink(target: str, link_name: str, *, replace: bool) -> None:
-    """Create a symlink like `ln -sfn` (replace=True) or `ln -s` (replace=False).
+    """`ln -sfn` (replace=True) or `ln -s` (replace=False); OSError where ln fails.
 
-    The rules `ln` follows, which this mirrors:
-      * If link_name is an existing folder, ln creates the link *inside* it,
-        named after target. With -n (used together with -f here), a symlink
-        to a folder does not count; it is replaced instead.
-      * With -f, an existing file or symlink at that name is removed first.
-      * Without -f, an existing name is an error ("File exists").
+    Stays local rather than utils.files.symlink(): the kept quirks need ln's
+    link-inside-an-existing-folder behaviour, and the rerun error its own text.
 
-    Raises OSError (for example FileExistsError) when ln would fail.
+    As ln does: an existing folder at link_name gets the link *inside* it
+    (with -n, a symlink to a folder is replaced instead); -f removes an
+    existing file or symlink first; without -f an existing name is
+    "File exists" (FileExistsError).
     """
-    # os.path.isdir follows symlinks; os.path.islink checks the link itself.
     if os.path.isdir(link_name) and not (replace and os.path.islink(link_name)):
         link_name = os.path.join(link_name, os.path.basename(target))
-    # lexists is True even for a broken symlink, which exists() would miss.
-    if replace and os.path.lexists(link_name):
-        os.remove(link_name)          # refuses folders, like `ln -f`
+    if replace and os.path.lexists(link_name):    # lexists: broken links too
+        os.remove(link_name)                      # refuses folders, like `ln -f`
     os.symlink(target, link_name)
 
 
-def _run(command: list[str], env: dict[str, str], cwd: str | None = None) -> bool:
-    """Run one command; log and return False if it fails."""
-    rc = exec_program(command, _OP, cwd=cwd, env=env)
-    if rc != 0:
-        log_error(_OP, f"{' '.join(command)} failed with exit code {rc}")
-        return False
-    return True
-
-
+# ---- Steps ----------------------------------------------------------------------
 def _download_and_extract(url: str, sha256: str, env: dict[str, str]) -> bool:
-    """Download + verify `url` into _WORK_DIR, then extract it there with tar."""
-    try:
-        tarball = download_and_verify(url, sha256, dest_dir=_WORK_DIR)
-    # download() raises OSError (network/file errors); a bad hash raises ChecksumError.
-    except (OSError, ChecksumError) as exc:
-        log_error(_OP, f"download/verify of {url} failed: {exc}")
-        return False
-    # The tar command, not tarfile: see "Which commands still run" above.
-    return _run(["tar", "-xvf", str(tarball)], env, cwd=_WORK_DIR)
+    """Download + verify `url` into _WORK_DIR and unpack it there."""
+    tarball = fetch_verified(url, sha256, _OP, _WORK_DIR)
+    return tarball is not None and extract_tarball(tarball, _OP, cwd=_WORK_DIR, env=env)
 
 
-def _install_aocl(version: str, sha256: str, env: dict[str, str]) -> bool:
-    """Download, install and register AOCL. Returns True on success."""
-    tarball = f"aocl-linux-aocc-{version}.tar.gz"
-    url = _AOCL_URL.format(folder_version=folder_version(version), tarball=tarball)
-    folder = os.path.join(_WORK_DIR, f"aocl-linux-aocc-{version}")
-
-    if not _download_and_extract(url, sha256, env):
-        return False
-
-    # The installer puts its output under ./amd/<version>/aocc in its own folder.
-    if not _run(["./install.sh", *_AOCL_INSTALL_ARGS], env, cwd=folder):
-        return False
-
-    # bash: cp -r amd/<version>/aocc/* /opt/amd
-    # glob.glob, like the shell's `*`, skips names starting with "." and
-    # returns nothing when there is no match. sorted() mimics the shell's order.
+def _copy_aocl_output(folder: str, version: str, env: dict[str, str]) -> bool:
+    """bash: `cp -r amd/<version>/aocc/* /opt/amd`."""
+    # glob, like the shell's `*`, skips dotfiles; sorted() is the shell's order.
     entries = sorted(glob.glob(os.path.join(folder, "amd", version, "aocc", "*")))
     if not entries:
         log_error(_OP, f"AOCL installer produced nothing under {folder}/amd/{version}/aocc")
         return False
-    if not _run(["cp", "-r", *entries, _INSTALL_PREFIX], env):
-        return False
+    return run(["cp", "-r", *entries, _INSTALL_PREFIX], _OP, env=env)
 
+
+def _link_mt_build() -> bool:
+    """Check the MT build is complete, then `ln -sfn` /opt/amd/{lib,include} to it."""
     mt_root = os.path.join(_INSTALL_PREFIX, "MT")
-    mt_lib = os.path.join(mt_root, "lib")
-    mt_include = os.path.join(mt_root, "include")
-    if not (os.path.isdir(mt_lib) and os.path.isdir(mt_include)):
-        log_error(_OP, "AOCL MT installation is incomplete: "
-                       f"expected {mt_lib} and {mt_include}")
+    links = [(os.path.join(mt_root, name), os.path.join(_INSTALL_PREFIX, name))
+             for name in ("lib", "include")]
+    if not all(os.path.isdir(target) for target, _ in links):
+        log_error(_OP, "AOCL MT installation is incomplete: expected "
+                       f"{links[0][0]} and {links[1][0]}")
         return False
+    for target, link in links:
+        if os.path.isdir(link) and not os.path.islink(link):
+            log_warn(_OP, f"{link} is an existing folder, so `ln -sfn` creates the "
+                          "link inside it instead of replacing it, as bash does",
+                     path=link, target=target,
+                     link=os.path.join(link, os.path.basename(target)))
+        try:
+            make_symlink(target, link, replace=True)
+        except OSError as exc:
+            log_error(_OP, f"could not link {link} -> {target}: {exc}", path=link)
+            return False
+    return True
 
-    module_dir = os.path.join(env["MODULE_FILES_DIRECTORY"], "amd")
+
+def _write_aocl_module(version: str, module_root: str) -> bool:
+    """Append the aocl-<version> modulefile and link amd/aocl to it (`ln -s`)."""
+    module_dir = os.path.join(module_root, "amd")
     modulefile = os.path.join(module_dir, f"aocl-{version}")
     aocl_link = os.path.join(module_dir, "aocl")
+    if not write_file(modulefile, aocl_modulefile(_INSTALL_PREFIX), _OP, append=True):
+        return False
     try:
-        # Point the default lib/include folders at the multi-threaded build.
-        for target, link in ((mt_lib, os.path.join(_INSTALL_PREFIX, "lib")),
-                             (mt_include, os.path.join(_INSTALL_PREFIX, "include"))):
-            # BASH QUIRK (kept): if the name is a real folder (not a symlink),
-            # `ln -sfn` doesn't replace it; it puts the link INSIDE it (e.g.
-            # /opt/amd/lib/lib), so /opt/amd/lib still isn't the MT build.
-            if os.path.isdir(link) and not os.path.islink(link):
-                log_warn(_OP, f"{link} is an existing folder, so `ln -sfn` creates "
-                              f"the link inside it instead of replacing it, as bash "
-                              "does", path=link, target=target,
-                         link=os.path.join(link, os.path.basename(target)))
-            make_symlink(target, link, replace=True)
-
-        os.makedirs(module_dir, exist_ok=True)
-        # Mode "a" appends, like bash's `>>`.
-        with open(modulefile, "a", encoding="utf-8") as handle:
-            handle.write(aocl_modulefile(_INSTALL_PREFIX))
-
-        # No replace: like bash's `ln -s`, this fails if amd/aocl already exists.
-        try:
-            make_symlink(modulefile, aocl_link, replace=False)
-        except FileExistsError as exc:
-            # This is how a rerun ends, in bash too: `ln -s` has no -f, so the
-            # link left by the first run makes it fail and `set -e` stops.
-            log_error(_OP, f"could not create {aocl_link}: {exc}. It already "
-                           "exists, which happens when this step is run again: "
-                           "bash's `ln -s` (no -f) fails the same way. The "
-                           f"modulefile {modulefile} has also been appended to "
-                           "a second time.", path=aocl_link, target=modulefile)
-            return False
-
-        write_component_version("AOCL", version)
+        make_symlink(modulefile, aocl_link, replace=False)
+    except FileExistsError as exc:
+        log_error(_OP, f"could not create {aocl_link}: {exc}. It already exists, "
+                       "which happens when this step is run again: bash's `ln -s` "
+                       "(no -f) fails the same way. The modulefile "
+                       f"{modulefile} has also been appended to a second time.",
+                  path=aocl_link, target=modulefile)
+        return False
     except OSError as exc:
-        log_error(_OP, f"could not finish the AOCL install: {exc}")
+        log_error(_OP, f"could not create {aocl_link}: {exc}", path=aocl_link)
         return False
     return True
+
+
+def _install_aocl(version: str, sha256: str, env: dict[str, str]) -> bool:
+    folder = os.path.join(_WORK_DIR, f"aocl-linux-aocc-{version}")
+    return (_download_and_extract(aocl_url(version), sha256, env)
+            and run(["./install.sh", *_AOCL_INSTALL_ARGS], _OP, cwd=folder, env=env)
+            and _copy_aocl_output(folder, version, env)
+            and _link_mt_build()
+            and _write_aocl_module(version, env["MODULE_FILES_DIRECTORY"])
+            and record_version("AOCL", version, _OP))
 
 
 def _install_aocc(version: str, sha256: str, env: dict[str, str]) -> bool:
-    """Download, install and register AOCC. Returns True on success."""
-    tarball = f"aocc-compiler-{version}.tar"
-    url = _AOCC_URL.format(folder_version=folder_version(version), tarball=tarball)
     folder = os.path.join(_WORK_DIR, f"aocc-compiler-{version}")
-
-    if not _download_and_extract(url, sha256, env):
-        return False
-    if not _run(["./install.sh"], env, cwd=folder):
-        return False
-    # Copies the folder itself, giving /opt/amd/aocc-compiler-<version>.
-    if not _run(["cp", "-r", folder, _INSTALL_PREFIX], env):
-        return False
-
-    try:
-        write_component_version("AOCC", version)
-    except OSError as exc:
-        log_error(_OP, f"could not record AOCC={version}: {exc}")
-        return False
-    return True
+    return (_download_and_extract(aocc_url(version), sha256, env)
+            and run(["./install.sh"], _OP, cwd=folder, env=env)
+            # Copies the folder itself: /opt/amd/aocc-compiler-<version>.
+            and run(["cp", "-r", folder, _INSTALL_PREFIX], _OP, env=env)
+            and record_version("AOCC", version, _OP))
 
 
 def install(env: dict[str, str]) -> int:
     """Install AOCL then AOCC into /opt/amd. Returns 0 on success, 3 on failure."""
-    try:
-        os.makedirs(_INSTALL_PREFIX, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_INSTALL_PREFIX}: {exc}")
+    if not make_dirs(_INSTALL_PREFIX, op=_OP):
         return 3
-
-    # Both packages live in one "amd" entry of versions.json:
-    #   "amd": {"common": {"aocl": {"version", "sha256"}, "aocc": {...}}}
-    cfg = config_for("amd", env) or {}
-    # `or {}` turns a missing entry (None) into an empty dict, so the lookups
-    # below simply find nothing instead of raising.
-    aocl = cfg.get("aocl") or {}
-    aocc = cfg.get("aocc") or {}
-    if not (aocl.get("version") and aocl.get("sha256")
-            and aocc.get("version") and aocc.get("sha256")):
-        log_error(_OP, "could not resolve amd aocl/aocc version and sha256 "
-                       "from versions.json")
+    cfg = require_config("amd", env, _OP, "aocl.version", "aocl.sha256",
+                         "aocc.version", "aocc.sha256")
+    if cfg is None:
         return 3
     if not env.get("MODULE_FILES_DIRECTORY"):
         log_error(_OP, "MODULE_FILES_DIRECTORY is not set")
         return 3
+    aocl, aocc = cfg["aocl"], cfg["aocc"]
 
-    # Start from an empty work folder so leftovers from an earlier run can't mix in.
-    shutil.rmtree(_WORK_DIR, ignore_errors=True)
-
-    log_info(_OP, f"Installing AOCL {aocl['version']}")
+    remove_paths(_WORK_DIR, op=_OP)    # no leftovers from an earlier run
+    log_info(_OP, f"Installing AOCL {aocl['version']}", version=aocl["version"])
     if not _install_aocl(aocl["version"], aocl["sha256"], env):
         return 3
-
-    log_info(_OP, f"Installing AOCC {aocc['version']}")
+    log_info(_OP, f"Installing AOCC {aocc['version']}", version=aocc["version"])
     if not _install_aocc(aocc["version"], aocc["sha256"], env):
         return 3
+    remove_paths(_WORK_DIR, op=_OP)
 
-    # Like bash's `rm -rf`, cleanup never fails the step.
-    shutil.rmtree(_WORK_DIR, ignore_errors=True)
     log_info(_OP, f"AOCL {aocl['version']} and AOCC {aocc['version']} "
                   f"installed to {_INSTALL_PREFIX}")
     return 0

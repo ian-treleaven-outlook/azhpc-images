@@ -6,10 +6,13 @@ Two kinds of test:
     waagent.service text edits, the `waagent --version` parser) are tested
     directly with realistic inputs. Their grep/sed/awk equivalents were
     compared against real bash in WSL with the same inputs.
-  * install() is tested with exec_program, run_capture, download_and_verify,
-    write_component_version and time.sleep replaced by fakes. The conf file,
-    the service file and the work directory point into a temporary directory,
-    so the real file edits run without touching /etc, /usr or /tmp.
+  * install() is tested with exec_program (utils.process, under run(),
+    systemctl() and extract_tarball(), and utils.package_installer, under
+    update_packages()), download_and_verify, run_capture,
+    write_component_version, time.sleep and utils.logger._log replaced by
+    fakes. The conf file, the service file and the work directory point into
+    a temporary directory, so the real file edits run without touching /etc,
+    /usr or /tmp.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_waagent -v
@@ -21,11 +24,13 @@ import json
 import os
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 from unittest import mock
 
 from components.python import install_waagent
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 from utils.download import ChecksumError
 
 _OP = "install-waagent"
@@ -90,22 +95,17 @@ def _pip(python):
 # Pure helpers.
 # --------------------------------------------------------------------------- #
 class DistroHelperTests(unittest.TestCase):
-    def test_install_handler_follows_bash_patterns(self):
+    def test_install_branch_follows_bash_patterns(self):
         cases = {
+            "azurelinux3.0": "azurelinux",
             "almalinux8.10": "el8", "rocky8.10": "el8", "rhel8.10": "el8",
             "almalinux8.9": "default",          # bash's EL8 test is an exact match
             "almalinux9.6": "el9", "rocky9.7": "el9", "rhel9.4": "el9",
             "ubuntu24.04": "default", "ubuntu22.04": "default",
         }
-        for distribution, handler in cases.items():
+        for distribution, branch in cases.items():
             with self.subTest(distribution=distribution):
-                self.assertEqual(install_waagent.install_handler(distribution), handler)
-
-    def test_rhel_family_is_a_contains_test(self):
-        for distribution in ("almalinux8.10", "rocky9.7", "rhel9.4"):
-            self.assertTrue(install_waagent.is_rhel_family(distribution))
-        for distribution in ("ubuntu24.04", "azurelinux3.0"):
-            self.assertFalse(install_waagent.is_rhel_family(distribution))
+                self.assertEqual(install_waagent.install_branch(Distro(distribution)), branch)
 
     def test_setup_commands(self):
         self.assertEqual(install_waagent.setup_commands("el8"),
@@ -114,14 +114,15 @@ class DistroHelperTests(unittest.TestCase):
                          _pip("python3.12") + [["python3.12", *_SETUP]])
         self.assertEqual(install_waagent.setup_commands("default"), [["python3", *_SETUP]])
 
-    def test_version_command_and_restart_service(self):
-        self.assertEqual(install_waagent.version_command("rocky9.7"),
+    def test_version_command_and_agent_service(self):
+        self.assertEqual(install_waagent.version_command("el9"),
                          ["python3.12", "-u", "/usr/sbin/waagent", "--version"])
-        self.assertEqual(install_waagent.version_command("rocky8.10"), ["waagent", "--version"])
-        self.assertEqual(install_waagent.restart_service("ubuntu22.04"), "walinuxagent")
+        for branch in ("el8", "default", "azurelinux"):
+            self.assertEqual(install_waagent.version_command(branch), ["waagent", "--version"])
+        self.assertEqual(install_waagent.agent_service(Distro("ubuntu22.04")), "walinuxagent")
         for distribution in ("almalinux9.6", "rocky8.10", "rhel9.4", "azurelinux3.0"):
-            self.assertEqual(install_waagent.restart_service(distribution), "waagent")
-        self.assertIsNone(install_waagent.restart_service("debian12"))
+            self.assertEqual(install_waagent.agent_service(Distro(distribution)), "waagent")
+        self.assertIsNone(install_waagent.agent_service(Distro("debian12")))
 
     def test_backup_timestamp_matches_date_f_t(self):
         # `date +%F_%T` -> 2026-10-29_15:07:42
@@ -188,9 +189,10 @@ class ParseVersionTests(unittest.TestCase):
 # install(): external effects faked.
 # --------------------------------------------------------------------------- #
 class _FakeExec:
-    """Stands in for exec_program: records (command, cwd) and imitates `tar`.
+    """Stands in for utils.process.exec_program, under every run()/systemctl().
 
-    fail_at, when given, is the index of the call that should fail (exit 1).
+    Records (command, cwd) in order and imitates `tar`. fail_at, when given,
+    is the index of the call that should fail (exit 1).
     """
 
     def __init__(self, fail_at=None):
@@ -211,6 +213,22 @@ class _FakeExec:
         return [command for command, _ in self.calls]
 
 
+_Record = namedtuple("_Record", "level message fields")
+
+
+class _Logs:
+    """Stands in for utils.logger._log, so it sees every module's log lines."""
+
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, level, op, message, fields=None, detail=None):
+        self.records.append(_Record(level, message, fields or {}))
+
+    def at(self, level):
+        return [record for record in self.records if record.level == level]
+
+
 def _fake_download(url, sha256, dest_dir="."):
     """Stands in for download_and_verify: writes an empty 'tarball'."""
     os.makedirs(dest_dir, exist_ok=True)
@@ -229,6 +247,10 @@ def _env(distribution, *, sku="H100", node_type="azure_vm_regular", config=True)
         "TARGET_NODE_TYPE": node_type,
         "COMPONENT_VERSIONS": json.dumps(versions),
     }
+
+
+def _tar():
+    return ["tar", "-xf", f"v{_VERSION}.tar.gz"]
 
 
 class InstallTests(unittest.TestCase):
@@ -254,25 +276,24 @@ class InstallTests(unittest.TestCase):
         what install() did and logged.
         """
         fake = fake or _FakeExec()
+        logs = _Logs()
         download = mock.Mock(side_effect=download_error or _fake_download)
         with mock.patch.object(install_waagent, "_WAAGENT_CONF", str(self.conf)), \
              mock.patch.object(install_waagent, "_WAAGENT_SERVICE_FILE", str(self.service)), \
              mock.patch.object(install_waagent, "_WORK_DIR", str(self.work)), \
              mock.patch.object(install_waagent, "backup_timestamp", return_value=_TIMESTAMP), \
-             mock.patch.object(install_waagent, "exec_program", fake), \
-             mock.patch.object(install_waagent, "download_and_verify", download), \
+             mock.patch("utils.process.exec_program", fake), \
+             mock.patch("utils.package_installer.exec_program", fake), \
+             mock.patch("utils.download.download_and_verify", download), \
              mock.patch.object(install_waagent, "run_capture",
                                return_value=capture) as run_capture, \
-             mock.patch.object(install_waagent, "write_component_version",
-                               side_effect=write_error) as record, \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=write_error, return_value="/versions") as record, \
              mock.patch.object(install_waagent.time, "sleep") as sleep, \
-             mock.patch.object(install_waagent, "log_info") as log_info, \
-             mock.patch.object(install_waagent, "log_warn") as log_warn, \
-             mock.patch.object(install_waagent, "log_error") as log_error:
+             mock.patch("utils.logger._log", logs):
             rc = install_waagent.install(env)
         return rc, {"exec": fake, "download": download, "run_capture": run_capture,
-                    "record": record, "sleep": sleep, "log_info": log_info,
-                    "log_warn": log_warn, "log_error": log_error}
+                    "record": record, "sleep": sleep, "logs": logs}
 
     def _source_dir(self):
         return str(self.work / f"WALinuxAgent-{_VERSION}")
@@ -285,7 +306,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         m["download"].assert_called_once_with(_URL, _SHA, dest_dir=str(self.work))
         self.assertEqual(m["exec"].calls, [
-            (["tar", "-xvf", f"v{_VERSION}.tar.gz"], str(self.work)),
+            (_tar(), str(self.work)),
             (["python3", *_SETUP], self._source_dir()),
             (["systemctl", "daemon-reload"], None),
             (["systemctl", "restart", "walinuxagent"], None),
@@ -298,7 +319,14 @@ class InstallTests(unittest.TestCase):
         # Like bash: the unpacked folder is removed, the tarball is kept.
         self.assertFalse(os.path.exists(self._source_dir()))
         self.assertTrue((self.work / f"v{_VERSION}.tar.gz").exists())
-        m["log_error"].assert_not_called()
+        self.assertEqual(m["logs"].at("error"), [])
+
+    def test_work_dir_is_emptied_before_the_download(self):
+        self.work.mkdir()
+        (self.work / "leftover").write_text("x")
+        rc, _ = self._install(_env("ubuntu24.04"))
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.work / "leftover").exists())
 
     def test_targets_without_ipoib_leave_enable_rdma_alone(self):
         for sku, node_type in (("GB200", "baremetal_3p"), ("GB200", "baremetal_1p"),
@@ -335,8 +363,9 @@ class InstallTests(unittest.TestCase):
         env["COMPONENT_VERSIONS"] = json.dumps({"waagent": {"azurelinux3.0": entry}})
         rc, m = self._install(env)
         self.assertEqual(rc, 0)
-        m["log_warn"].assert_called_once()
-        self.assertEqual(m["log_warn"].call_args.kwargs["unused_entry"], entry)
+        warnings = m["logs"].at("warn")
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0].fields["unused_entry"], entry)
 
     def test_azure_linux_without_an_entry_or_with_bad_json_does_not_warn(self):
         for versions in (json.dumps({"waagent": {"common": {"version": "1"}}}),
@@ -346,7 +375,7 @@ class InstallTests(unittest.TestCase):
                 env["COMPONENT_VERSIONS"] = versions
                 rc, m = self._install(env)
                 self.assertEqual(rc, 0)
-                m["log_warn"].assert_not_called()
+                self.assertEqual(m["logs"].at("warn"), [])
 
     def test_ubuntu_ignores_the_azure_linux_entry(self):
         env = _env("ubuntu24.04")
@@ -355,20 +384,27 @@ class InstallTests(unittest.TestCase):
         env["COMPONENT_VERSIONS"] = json.dumps(versions)
         rc, m = self._install(env)
         self.assertEqual(rc, 0)
-        m["log_warn"].assert_not_called()
+        self.assertEqual(m["logs"].at("warn"), [])
 
     def test_conf_without_final_newline_warns_that_the_key_was_glued_on(self):
         self.conf.write_text(_CONF_BEFORE.rstrip("\n"), encoding="utf-8")
         rc, m = self._install(_env("ubuntu24.04"))
         self.assertEqual(rc, 0)
         # Only the first append is glued on; it adds the missing newline.
-        m["log_warn"].assert_called_once()
-        self.assertEqual(m["log_warn"].call_args.kwargs["key"],
-                         "Extensions.InitialGoalStatePeriod")
+        warnings = m["logs"].at("warn")
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0].fields["key"], "Extensions.InitialGoalStatePeriod")
         # Normal case (file ends with "\n"): no warning.
         self.conf.write_text(_CONF_BEFORE, encoding="utf-8")
         rc, m = self._install(_env("ubuntu24.04"))
-        m["log_warn"].assert_not_called()
+        self.assertEqual(m["logs"].at("warn"), [])
+
+    def test_conf_bytes_and_line_endings_round_trip(self):
+        # Like sed: "\r\n" and non-UTF-8 bytes on untouched lines stay as they were.
+        self.conf.write_bytes(b"# caf\xe9\r\nOS.EnableRDMA=n\r\n")
+        rc, _ = self._install(_env("ubuntu24.04"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.conf.read_bytes().startswith(b"# caf\xe9\r\nOS.EnableRDMA=y\n"))
 
     def test_el8_runs_the_pip_setup_twice_with_python3(self):
         rc, m = self._install(_env("almalinux8.10"))
@@ -377,7 +413,7 @@ class InstallTests(unittest.TestCase):
         src = self._source_dir()
         self.assertEqual(m["exec"].calls,
                          [(c, None) for c in _pip("python3")]
-                         + [(["tar", "-xvf", f"v{_VERSION}.tar.gz"], str(self.work))]
+                         + [(_tar(), str(self.work))]
                          + [(c, src) for c in _pip("python3") + [["python3", *_SETUP]]]
                          + [(["systemctl", "daemon-reload"], None),
                             (["systemctl", "restart", "waagent"], None)])
@@ -391,12 +427,12 @@ class InstallTests(unittest.TestCase):
         src = self._source_dir()
         self.assertEqual(m["exec"].calls,
                          [(c, None) for c in _pip("python3")]
-                         + [(["tar", "-xvf", f"v{_VERSION}.tar.gz"], str(self.work))]
+                         + [(_tar(), str(self.work))]
                          + [(c, src) for c in _pip("python3.12") + [["python3.12", *_SETUP]]]
-                         + [(["systemctl", "stop", "waagent"], src),
-                            (["systemctl", "disable", "waagent"], src),
-                            (["systemctl", "daemon-reexec"], src),
-                            (["systemctl", "enable", "waagent"], src),
+                         + [(["systemctl", "stop", "waagent"], None),
+                            (["systemctl", "disable", "waagent"], None),
+                            (["systemctl", "daemon-reexec"], None),
+                            (["systemctl", "enable", "waagent"], None),
                             (["systemctl", "daemon-reload"], None),
                             (["systemctl", "restart", "waagent"], None)])
         self.assertEqual(self.service.read_text(encoding="utf-8"), _SERVICE_AFTER)
@@ -411,8 +447,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(self.conf.read_text(encoding="utf-8").startswith(
             "Extensions.GoalStatePeriod=300\n"))
-        actions = [c.kwargs.get("action") for c in m["log_info"].call_args_list
-                   if c.kwargs.get("key")]
+        actions = [r.fields.get("action") for r in m["logs"].at("info") if r.fields.get("key")]
         self.assertEqual(actions[0], "created")
 
     # ---- failure paths -----------------------------------------------------
@@ -421,7 +456,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertEqual(m["exec"].calls, [])
         m["download"].assert_not_called()
-        m["log_error"].assert_called_once()
+        self.assertEqual(len(m["logs"].at("error")), 1)
 
     def test_each_failing_command_returns_3_and_stops(self):
         for distribution in ("ubuntu24.04", "almalinux9.6", "azurelinux3.0"):
@@ -435,14 +470,13 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual(rc, 3)
                     self.assertEqual(len(fake.calls), index + 1)
                     m["sleep"].assert_not_called()
-                    m["log_error"].assert_called()
 
     def test_download_failure_returns_3(self):
         rc, m = self._install(_env("ubuntu24.04"),
                               download_error=ChecksumError("bad sha"))
         self.assertEqual(rc, 3)
         self.assertEqual(m["exec"].calls, [])
-        self.assertIn("bad sha", m["log_error"].call_args[0][1])
+        self.assertIn("bad sha", m["logs"].at("error")[-1].message)
 
     def test_version_command_failure_or_bad_output_returns_3(self):
         for capture in ((1, ""), (0, "WALinuxAgent\n")):
@@ -456,14 +490,14 @@ class InstallTests(unittest.TestCase):
         self.conf = self.root / "missing-dir" / "waagent.conf"
         rc, m = self._install(_env("ubuntu24.04"))
         self.assertEqual(rc, 3)
-        self.assertIn("Extensions.GoalStatePeriod", m["log_error"].call_args[0][1])
+        self.assertIn(f"could not write {self.conf}", m["logs"].at("error")[-1].message)
         m["run_capture"].assert_not_called()
 
     def test_unwritable_versions_file_returns_3(self):
         rc, m = self._install(_env("ubuntu24.04"),
                               write_error=PermissionError("/opt/azurehpc: denied"))
         self.assertEqual(rc, 3)
-        self.assertIn("denied", m["log_error"].call_args[0][1])
+        self.assertIn("denied", m["logs"].at("error")[-1].message)
         m["sleep"].assert_not_called()
 
     def test_missing_service_file_on_el9_returns_3(self):
@@ -476,29 +510,28 @@ class InstallTests(unittest.TestCase):
     def test_key_log_lines(self):
         rc, m = self._install(_env("rocky9.7"))
         self.assertEqual(rc, 0)
-        calls = m["log_info"].call_args_list
-        by_message = {c.args[1]: c.kwargs for c in calls}
+        infos = m["logs"].at("info")
+        by_message = {r.message: r.fields for r in infos}
 
         start = by_message[f"Installing WALinuxAgent {_VERSION} from source"]
         self.assertEqual((start["version"], start["source"], start["handler"]),
                          (_VERSION, _URL, "el9"))
         ipoib = by_message["Target uses IPoIB: OS.EnableRDMA=y will be set"]
         self.assertEqual((ipoib["network_mode"], ipoib["uses_ipoib"]), ("standard_ib", True))
-        conf = [c.kwargs for c in calls if c.kwargs.get("key") == "OS.EnableRDMA"]
+        conf = [r.fields for r in infos if r.fields.get("key") == "OS.EnableRDMA"]
         self.assertEqual(conf[0]["action"], "replaced")
-        self.assertIn(f"{self.service}.bak.{_TIMESTAMP}",
-                      [c.kwargs.get("backup") for c in calls])
-        self.assertIn({"component": "WAAGENT", "version": "2.15.0.1"},
-                      [c.kwargs for c in calls])
-        summary = calls[-1]
-        self.assertEqual(summary.args[1], "WALinuxAgent 2.15.0.1 installed and configured")
-        self.assertEqual(summary.kwargs["waagent_extensions"], "2.15.1.3")
+        self.assertIn((str(self.service), f"{self.service}.bak.{_TIMESTAMP}"),
+                      [(r.fields.get("source"), r.fields.get("path")) for r in infos])
+        self.assertIn(("WAAGENT", "2.15.0.1"),
+                      [(r.fields.get("component"), r.fields.get("version")) for r in infos])
+        summary = infos[-1]
+        self.assertEqual(summary.message, "WALinuxAgent 2.15.0.1 installed and configured")
+        self.assertEqual(summary.fields["waagent_extensions"], "2.15.1.3")
 
     def test_no_ipoib_decision_is_logged(self):
         rc, m = self._install(_env("ubuntu24.04", sku="GB200", node_type="baremetal_1p"))
         self.assertEqual(rc, 0)
-        decision = [c.kwargs for c in m["log_info"].call_args_list
-                    if "uses_ipoib" in c.kwargs]
+        decision = [r.fields for r in m["logs"].at("info") if "uses_ipoib" in r.fields]
         self.assertEqual(decision, [{"sku": "GB200", "node_type": "baremetal_1p",
                                      "network_mode": "mrc", "uses_ipoib": False}])
 
@@ -506,7 +539,7 @@ class InstallTests(unittest.TestCase):
         self.service.write_text(_SERVICE_AFTER, encoding="utf-8")
         rc, m = self._install(_env("almalinux9.6"))
         self.assertEqual(rc, 0)
-        m["log_warn"].assert_called_once()
+        self.assertEqual(len(m["logs"].at("warn")), 1)
 
 
 # --------------------------------------------------------------------------- #

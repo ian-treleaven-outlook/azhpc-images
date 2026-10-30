@@ -39,9 +39,12 @@ the calling port returns 3. Nothing is recorded in that case.
 
 from __future__ import annotations
 
+import os
+
 from utils.component_config import write_component_version
-from utils.logger import log_info
-from utils.process import run_capture
+
+from utils.logger import log_error, log_info
+from utils.process import run, run_capture
 
 
 def _given(value: str | None) -> bool:
@@ -83,3 +86,50 @@ def write_repo_source_info(component: str, repo_dir: str, op: str, *,
     log_info(op, f"Recorded {component} source: {repo_commit} ({repo_ref})",
              component=component, repo_commit=repo_commit, repo_ref=repo_ref)
     return True
+
+
+def configured_ref(config: dict, version: str) -> str:
+    """The git ref to clone, as bash resolves it from a component's config:
+
+        REF=$(jq -r '.ref // .branch // empty' <<< $metadata)
+        REF=${REF:-v${VERSION}}
+
+    jq's `//` skips a missing (null) or false value but keeps "" (so an empty
+    "ref" hides "branch"); bash's `:-` then turns "" into v<version>.
+    """
+    ref = ""
+    for key in ("ref", "branch"):
+        value = config.get(key)
+        if value is not None and value is not False:
+            ref = str(value)
+            break
+    return ref or f"v{version}"
+
+
+def git_clone(url: str, op: str, *, ref: str | None = None, commit: str | None = None,
+              dest: str | None = None, cwd: str = ".", env=None) -> str | None:
+    """`git clone [--branch <ref>] <url> [<dest>]` in `cwd`, then `git checkout <commit>`.
+
+    Returns the checkout directory, or None if a git command failed or the
+    clone didn't create the expected directory (logged). Bash's argument
+    order varies between scripts (`git clone <url> --branch <ref>`); git
+    treats them the same.
+    """
+    command = ["git", "clone"]
+    if ref:
+        command += ["--branch", ref]
+    command.append(url)
+    if dest:
+        command.append(dest)
+    if not run(command, op, cwd=cwd, env=env):
+        return None
+    name = dest or os.path.basename(url.rstrip("/")).removesuffix(".git")
+    checkout = os.path.join(cwd, name)
+    if not os.path.isdir(checkout):
+        log_error(op, f"git clone did not create {checkout}", path=checkout, source=url)
+        return None
+    if commit and not run(["git", "checkout", commit], op, cwd=checkout, env=env):
+        return None
+    log_info(op, f"Cloned {url} into {checkout}", source=url, path=checkout,
+             ref=ref or "", commit=commit or "")
+    return checkout

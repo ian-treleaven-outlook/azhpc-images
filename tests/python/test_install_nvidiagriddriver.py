@@ -1,16 +1,18 @@
 """Unit tests for components/python/install_nvidiagriddriver.py.
 
-  * The pure helpers (gridd.conf edits, nvcc version parse, names/URLs) are
-    tested directly. Their results were also compared against real
-    grep/sed/echo and grep/awk/cut in bash (WSL), and CUDA_PROFILE_CONTENT
-    against the file the two `echo | tee` lines render.
-  * install() is tested with its external effects mocked: config_for,
-    download_and_verify, exec_program (the module's and
-    utils.package_installer's, which runs the toolkit install, share one fake
-    that performs `cp` so the licensing edits run on real temporary files),
-    run_capture (nvcc),
-    write_component_version and install_cuda_samples.install. Every path
-    constant points into a temporary directory.
+  * The pure helpers (gridd.conf edits, installer name) are tested
+    directly. Their results were also compared against real grep/sed/echo in
+    bash (WSL). The shared CUDA pieces (toolkit name, nvcc parse, cuda.sh)
+    are tested in test_cuda.py.
+  * install() is tested with its external effects mocked where they run:
+    utils.component_config.config_for, utils.download.download_and_verify,
+    exec_program (utils.process's, behind run(), and
+    utils.package_installer's, which runs the toolkit install, share one
+    fake), run_capture (nvcc), utils.component_config.write_component_version
+    and install_cuda_samples.install. The gridd.conf copy and edits run on
+    real temporary files. The module's, utils.cuda's and the toolkit's log calls
+    share one mock per level, so assertions see every message in order.
+    Every path constant points into a temporary directory.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_nvidiagriddriver -v
@@ -19,15 +21,14 @@ Run from the repo root:
 from __future__ import annotations
 
 import os
-import re
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvidiagriddriver as grid
-from utils import package_installer
+from utils import component_config, cuda, files, package_installer, process
+from utils import download as download_module
 from utils.build_config import BuildConfig, build_plan
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -74,10 +75,6 @@ class NameTests(unittest.TestCase):
     def test_installer_name(self):
         self.assertEqual(grid.driver_installer_name("595.91.07"), _INSTALLER)
 
-    def test_toolkit_package_replaces_every_dot(self):
-        self.assertEqual(grid.cuda_toolkit_package("13.2"), "cuda-toolkit-13-2")
-        self.assertEqual(grid.cuda_toolkit_package("12.9.1"), "cuda-toolkit-12-9-1")
-
 
 class GriddEditTests(unittest.TestCase):
     def test_split_lines_only_on_newline(self):
@@ -85,10 +82,12 @@ class GriddEditTests(unittest.TestCase):
         self.assertEqual(grid.split_lines(""), [])
         self.assertEqual(grid.split_lines("\n\n"), ["\n", "\n"])
 
-    def test_has_key_is_anchored_at_line_start(self):
-        self.assertTrue(grid.has_key("x\nIgnoreSP=TRUE\n", "IgnoreSP"))
-        self.assertFalse(grid.has_key("# IgnoreSP=TRUE\n IgnoreSP=1\n", "IgnoreSP"))
-        self.assertFalse(grid.has_key("IgnoreSPX=1\n", "IgnoreSP"))
+    def test_key_match_is_anchored_at_line_start_like_grep(self):
+        # 0 lines changed is `grep -q '^IgnoreSP='` finding nothing.
+        self.assertEqual(grid.set_key("x\nIgnoreSP=TRUE\n", "IgnoreSP", "FALSE")[1], 1)
+        for text in ("# IgnoreSP=TRUE\n IgnoreSP=1\n", "IgnoreSPX=1\n"):
+            with self.subTest(text=text):
+                self.assertEqual(grid.set_key(text, "IgnoreSP", "FALSE"), (text, 0))
 
     def test_set_key_rewrites_every_matching_line(self):
         text, changed = grid.set_key("IgnoreSP=TRUE\nx\nIgnoreSP=\n", "IgnoreSP", "FALSE")
@@ -109,23 +108,6 @@ class GriddEditTests(unittest.TestCase):
                          ("a\n", 1))
 
 
-class NvccVersionTests(unittest.TestCase):
-    def test_release_line(self):
-        self.assertEqual(grid.nvcc_release_version(_NVCC_OUT), "13.2.51")
-
-    def test_first_word_wins_like_bash(self):
-        out = "x release 1 2 3 Vy\n" + _NVCC_OUT
-        self.assertEqual(grid.nvcc_release_version(out), "y")
-
-    def test_short_matching_line_is_dropped_like_word_splitting(self):
-        self.assertEqual(grid.nvcc_release_version("short release\n" + _NVCC_OUT),
-                         "13.2.51")
-
-    def test_no_match_is_none(self):
-        self.assertIsNone(grid.nvcc_release_version(""))
-        self.assertIsNone(grid.nvcc_release_version("nvcc: command not found\n"))
-
-
 class BashScriptTests(unittest.TestCase):
     def test_cuda_repo_setup_moved_to_the_bootstrap(self):
         # Upstream #643: the keyring/apt-get update lines left this script for
@@ -137,17 +119,6 @@ class BashScriptTests(unittest.TestCase):
                 self.assertNotIn(gone, script)
         bootstrap = (_REPO / "distros" / "ubuntu24.04" / "install_utils.sh").read_text()
         self.assertIn("$COMPONENT_DIR/install_cuda_repo_and_dkms.sh", bootstrap)
-
-
-class CudaProfileContentTests(unittest.TestCase):
-    def test_matches_the_echo_lines_in_the_bash_script(self):
-        # Each `echo '<text>' | tee [-a] /etc/profile.d/cuda.sh` writes <text>
-        # plus a newline; read the texts from the .sh so the two can't drift.
-        script = (_REPO / "components" / "install_nvidiagriddriver.sh").read_text()
-        texts = re.findall(r"^echo '([^']*)' \| tee (?:-a )?/etc/profile\.d/cuda\.sh",
-                           script, flags=re.M)
-        self.assertEqual(len(texts), 2)
-        self.assertEqual(grid.CUDA_PROFILE_CONTENT, "".join(t + "\n" for t in texts))
 
 
 # --------------------------------------------------------------------------- #
@@ -193,33 +164,37 @@ class InstallTests(unittest.TestCase):
 
         def fake_exec(command, op, **kwargs):
             seen_work_dir.append(os.path.isdir(self.work))
-            if command[0] == fail_on:
-                return 1
-            if command[0] == "cp":
-                shutil.copyfile(command[1], command[2])
-            return 0
+            return 1 if command[0] == fail_on else 0
 
         def fake_download(url, sha256, dest_dir="."):
             return Path(dest_dir) / os.path.basename(url)
 
         exec_program = mock.Mock(side_effect=fake_exec)
-        with mock.patch.object(grid, "config_for",
+        log_info, log_warn, log_error = mock.Mock(), mock.Mock(), mock.Mock()
+        with mock.patch.object(component_config, "config_for",
                                side_effect=lambda c, e: configs.get(c)) as config_for, \
-             mock.patch.object(grid, "download_and_verify",
+             mock.patch.object(component_config, "log_error", log_error), \
+             mock.patch.object(component_config, "log_info", log_info), \
+             mock.patch.object(download_module, "download_and_verify",
                                side_effect=download or fake_download) as dl, \
-             mock.patch.object(grid, "exec_program", exec_program), \
+             mock.patch.object(download_module, "log_error", log_error), \
+             mock.patch.object(process, "exec_program", exec_program), \
              mock.patch.object(package_installer, "exec_program", exec_program), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
+             mock.patch.object(files, "log_info", log_info), \
+             mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(cuda, "log_info", log_info), \
+             mock.patch.object(cuda, "log_warn", log_warn), \
              mock.patch.object(grid, "run_capture", return_value=nvcc) as run_capture, \
-             mock.patch.object(grid, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(grid.install_cuda_samples, "install",
                                return_value=samples_rc,
                                side_effect=samples_error) as samples, \
-             mock.patch.object(grid, "log_info") as log_info, \
-             mock.patch.object(grid, "log_warn") as log_warn, \
-             mock.patch.object(grid, "log_error") as log_error:
+             mock.patch.object(grid, "log_info", log_info), \
+             mock.patch.object(grid, "log_warn", log_warn), \
+             mock.patch.object(grid, "log_error", log_error):
             rc = grid.install(env)
         return rc, {"config_for": config_for, "download": dl, "exec": exec_program,
                     "capture": run_capture, "record": record, "samples": samples,
@@ -238,7 +213,6 @@ class InstallTests(unittest.TestCase):
     def _all_commands(self):
         return [
             ["bash", _INSTALLER, "--silent", "--dkms", "--kernel-module-type=open"],
-            ["cp", self.template, self.conf],
             _TOOLKIT_INSTALL,
             [_PERSISTENCE],
         ]
@@ -267,7 +241,7 @@ class InstallTests(unittest.TestCase):
         with open(self.conf, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), _EXPECTED_CONF)
         with open(self.profile, "rb") as handle:
-            self.assertEqual(handle.read(), grid.CUDA_PROFILE_CONTENT.encode())
+            self.assertEqual(handle.read(), cuda.CUDA_PROFILE_TEXT.encode())
         self.assertEqual(os.stat(self.profile).st_mode & 0o777, 0o644)
         self.assertFalse(os.path.exists(self.work))          # cleaned up
         m["error"].assert_not_called()
@@ -281,12 +255,13 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("Installing NVIDIA GRID driver 595.91.07 and "
                             "cuda-toolkit-13-2" in msg for msg in info))
         self.assertTrue(any(msg.startswith("Set EnableUI=FALSE") for msg in info))
-        self.assertTrue(any(msg.startswith("Appended IgnoreSP=FALSE") for msg in info))
+        self.assertTrue(any(msg.startswith("Appending IgnoreSP=FALSE") for msg in info))
+        self.assertIn(f"Wrote {self.conf} (appended)", info)
         self.assertTrue(any(msg.startswith("Removed 1 line(s) starting with FeatureType=0")
                             for msg in info))
-        self.assertTrue(any(msg.startswith("Created ") and self.profile in msg
-                            for msg in info))
-        self.assertTrue(any("Recorded CUDA version 13.2.51" == msg for msg in info))
+        self.assertIn(f"Wrote {self.profile} (created)", info)
+        self.assertIn("Recorded CUDA 13.2.51", info)
+        self.assertIn(f"Copied {self.template} -> {self.conf} (created)", info)
         self.assertTrue(any(msg.startswith("NVIDIA CUDA apt source present")
                             for msg in info))
         source_log = [c for c in m["info"].call_args_list
@@ -308,9 +283,9 @@ class InstallTests(unittest.TestCase):
         rc, m = self._install()
         self.assertEqual(rc, 0)
         with open(self.profile, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), grid.CUDA_PROFILE_CONTENT)
+            self.assertEqual(handle.read(), cuda.CUDA_PROFILE_TEXT)
         self.assertEqual(os.stat(self.profile).st_mode & 0o777, 0o644)
-        self.assertTrue(any(msg.startswith("Replaced ") for msg in self._messages(m["info"])))
+        self.assertIn(f"Wrote {self.profile} (replaced)", self._messages(m["info"]))
 
     def test_stale_work_dir_is_emptied_first(self):
         os.makedirs(os.path.join(self.work, "old"))
@@ -343,7 +318,7 @@ class InstallTests(unittest.TestCase):
         rc, m = self._install(_env("almalinux9.8"))
         self.assertEqual(rc, 3)
         self.assertTrue(any("assumes Ubuntu" in msg for msg in self._messages(m["warn"])))
-        self.assertEqual(self._commands(m)[-1], ["cp", self.template, self.conf])
+        self.assertEqual(self._commands(m), self._all_commands()[:1])
         self.assertIn("installs it with apt", m["error"].call_args.args[1])
         m["samples"].assert_not_called()
         self.assertFalse(os.path.exists(self.work))
@@ -365,16 +340,16 @@ class InstallTests(unittest.TestCase):
 
     def test_failed_rewrite_appends_like_bash_or_operator(self):
         # sed fails -> `|| echo` runs: the old line stays and the key is appended.
-        real_open = open
+        real_write = Path.write_bytes
         calls = {"n": 0}
 
-        def flaky_open(path, mode="r", *args, **kwargs):
-            if path == self.conf and mode == "w" and calls["n"] == 0:
+        def flaky_write(path, data):
+            if str(path) == self.conf and calls["n"] == 0:
                 calls["n"] += 1
                 raise PermissionError("read-only")
-            return real_open(path, mode, *args, **kwargs)
+            return real_write(path, data)
 
-        with mock.patch("builtins.open", side_effect=flaky_open):
+        with mock.patch.object(Path, "write_bytes", flaky_write):
             rc, m = self._install()
         self.assertEqual(rc, 0)
         with open(self.conf, encoding="utf-8") as handle:
@@ -383,6 +358,7 @@ class InstallTests(unittest.TestCase):
                              "IgnoreSP=FALSE\nEnableUI=FALSE\n")
         self.assertTrue(any("grep && sed || echo" in msg
                             for msg in self._messages(m["warn"])))
+        self.assertIn("read-only", m["error"].call_args.args[1])     # edit_file's log
 
     # ---- missing config ----------------------------------------------------------
     def test_cuda_distribution_is_no_longer_needed(self):
@@ -428,9 +404,12 @@ class InstallTests(unittest.TestCase):
                 # The fake fails every command with that first word; "bash" is
                 # first, the persistence script last.
                 self.assertEqual(self._commands(m), expected[:index + 1])
-                # install_packages() logs its own failure.
-                errors = m["pkg_error"] if command is _TOOLKIT_INSTALL else m["error"]
-                errors.assert_called()
+                # exec_program (mocked here) and install_packages() log their
+                # own failures; the port adds nothing.
+                if command is _TOOLKIT_INSTALL:
+                    m["pkg_error"].assert_called()
+                if index == 0:           # the driver failed: nothing recorded
+                    m["record"].assert_not_called()
                 self.assertFalse(os.path.exists(self.work))
 
     def test_nvcc_failure_or_empty_version(self):
@@ -460,10 +439,13 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(len(self._commands(m)), 1)          # stopped after the driver
         self.assertIn("denied", m["error"].call_args.args[1])
 
-    def test_cp_failure_is_named(self):
-        rc, m = self._install(fail_on="cp")
+    def test_copy_failure_stops_before_editing(self):
+        os.remove(self.template)
+        rc, m = self._install()
         self.assertEqual(rc, 3)
-        self.assertIn("could not copy", m["error"].call_args.args[1])
+        self.assertEqual(self._commands(m), self._all_commands()[:1])
+        self.assertIn(f"could not copy {self.template}", m["error"].call_args.args[1])
+        self.assertFalse(os.path.exists(self.conf))
 
     def test_unwritable_profile(self):
         os.makedirs(self.profile)               # a directory: open() fails
@@ -473,21 +455,23 @@ class InstallTests(unittest.TestCase):
         m["capture"].assert_not_called()
 
     def test_unreadable_conf_when_deleting_feature_type(self):
-        real_open = open
+        real_read = Path.read_bytes
+        reads = []
 
-        def flaky_open(path, mode="r", *args, **kwargs):
-            # The third read of gridd.conf is the FeatureType=0 pass.
-            if path == self.conf and mode == "r":
-                flaky_open.reads += 1
-                if flaky_open.reads == 3:
+        def flaky_read(path):
+            # The third edit of gridd.conf is the FeatureType=0 pass.
+            if str(path) == self.conf:
+                reads.append(path)
+                if len(reads) == 3:
                     raise PermissionError("nope")
-            return real_open(path, mode, *args, **kwargs)
-        flaky_open.reads = 0
+            return real_read(path)
 
-        with mock.patch("builtins.open", side_effect=flaky_open):
+        with mock.patch.object(Path, "read_bytes", flaky_read):
             rc, m = self._install()
         self.assertEqual(rc, 3)
-        self.assertIn("FeatureType=0", m["error"].call_args.args[1])
+        self.assertIn(f"could not read {self.conf}", m["error"].call_args.args[1])
+        self.assertNotIn([_PERSISTENCE], self._commands(m))
+        m["samples"].assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

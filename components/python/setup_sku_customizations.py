@@ -1,123 +1,53 @@
 """setup_sku_customizations.py — Python port of components/setup_sku_customizations.sh.
 
-What this step does
--------------------
-Prepares a boot-time systemd service, sku-customizations.service, that tunes
+Prepares sku-customizations.service, a boot-time systemd service that tunes
 the finished image for the VM size it lands on (NCCL topology files, NVMe
-setup, and so on). The image is generic; the VM size is only known at boot.
+set-up, ...). The image is generic; the VM size is only known at boot.
 
-  1. Copy our per-SKU scripts (components/customizations/*) to
-     /opt/azurehpc/customizations, and the topology XML files (topology/*) to
-     /opt/microsoft.
-  2. Generate two scripts, which differ between NVIDIA and AMD images:
-       * /usr/sbin/setup_sku_customizations.sh asks the Azure metadata service
-         (IMDS) for the VM size and runs the matching customization script.
-         On NVIDIA, NCCL_TOPO_FAMILY can be preset to skip the IMDS lookup.
-       * /usr/sbin/remove_sku_customizations.sh undoes that when the service
-         stops (and on NVIDIA also stops fabric manager and unloads
-         nvidia_peermem).
-     Any other GPU vendor is an error.
-  3. Write /etc/systemd/system/sku-customizations.service, which runs the two
-     scripts. On NVIDIA it also orders itself after nvidia-fabricmanager.
-  4. NVIDIA only:
-       * a drop-in for openibd.service that loads nvidia-peermem after the
-         InfiniBand stack starts;
-       * if the fabric manager unit file exists, delete its
-         "After=multi-user.target" lines, so it can start automatically.
-  5. Azure Linux 3.0 on GB200 only: add kernel command line options after
-     "lockdown=integrity" in /etc/default/grub and /boot/grub2/grub.cfg, and
-     stop and disable irqbalance.
-  6. `systemctl enable sku-customizations`. It is NOT started during the
-     build: that would be pointless before the reboot and may fail on
-     general-purpose VM sizes (bash says the same in a comment).
+  1. Copy components/customizations/* to /opt/azurehpc/customizations and
+     topology/* to /opt/microsoft.
+  2. Write the vendor's (NVIDIA or AMD) /usr/sbin/setup_sku_customizations.sh,
+     which asks IMDS for the VM size and runs the matching customization,
+     and remove_sku_customizations.sh, which undoes it; both mode 755.
+  3. Write the service unit (NVIDIA also orders it after fabric manager).
+  4. NVIDIA: an openibd.service drop-in that loads nvidia-peermem, and, if
+     the fabric manager unit exists, delete its "After=multi-user.target"
+     lines so it can start automatically.
+  5. Azure Linux 3.0 on GB200 (VR200 is built as GB200, see SKU_ALIASES in
+     utils/build_config.py): add kernel options after "lockdown=integrity" in
+     /etc/default/grub and /boot/grub2/grub.cfg, and stop and disable
+     irqbalance.
+  6. `systemctl enable sku-customizations` — not started during the build
+     (pointless before the reboot, and it may fail on general-purpose sizes).
 
-The original bash, summarised (the full heredoc texts are the _..._SCRIPT,
-_SERVICE_... and _PEERMEM_DROPIN constants below):
+The generated texts are the _..._SCRIPT, _SERVICE_... and _PEERMEM_DROPIN
+constants. Bash writes them with unquoted heredocs but escapes every `$`, so
+the files hold plain `$`; the tests compare them with real bash renders in
+tests/python/fixtures/setup_sku_customizations.
 
-    mkdir -p /opt/azurehpc/customizations
-    cp $COMPONENT_DIR/customizations/* /opt/azurehpc/customizations
-    mkdir -p /opt/microsoft
-    cp $TOP_DIR/topology/* /opt/microsoft
-
-    if [ "$GPU" = "NVIDIA" ]; then
-        cat <<EOF >/usr/sbin/setup_sku_customizations.sh    ... NVIDIA text
-        chmod 755 /usr/sbin/setup_sku_customizations.sh
-        cat <<EOF >/usr/sbin/remove_sku_customizations.sh   ... NVIDIA text
-    elif [ "$GPU" = "AMD" ]; then
-        cat <<EOF >/usr/sbin/setup_sku_customizations.sh    ... AMD text
-        chmod 755 /usr/sbin/setup_sku_customizations.sh
-        cat <<EOF >/usr/sbin/remove_sku_customizations.sh   ... AMD text
-    else
-        echo "GPU is not NVIDIA or AMD, exiting"; exit 1
-    fi
-    chmod 755 /usr/sbin/remove_sku_customizations.sh
-
-    cat <<EOF >/etc/systemd/system/sku-customizations.service    ... [Unit] part
-    if NVIDIA: cat <<EOF >>... After=/Wants=nvidia-fabricmanager.service
-    cat <<EOF >>/etc/systemd/system/sku-customizations.service   ... blank line, [Service], [Install]
-
-    if NVIDIA:
-        mkdir -p /etc/systemd/system/openibd.service.d
-        cat <<EOF >/etc/systemd/system/openibd.service.d/10-nvidia-peermem.conf ...
-    if NVIDIA and [ -f /lib/systemd/system/nvidia-fabricmanager.service ]:
-        sed -i '/^After=multi-user.target/d' $FMSYSPATH
-        echo "Removed multi-user.target in Unit section"
-
-    if [[ $DISTRIBUTION == "azurelinux3.0" && "$SKU" == "GB200" ]]; then
-        sudo sed -i 's/lockdown=integrity/lockdown=integrity <options>/' /etc/default/grub
-        sudo sed -i 's/lockdown=integrity/lockdown=integrity <options>/' /boot/grub2/grub.cfg
-        sudo systemctl stop irqbalance
-        sudo systemctl disable irqbalance
-    fi
-
-    systemctl enable sku-customizations
-
-About the generated scripts: every `cat <<EOF` here is an *unquoted* heredoc,
-so bash would expand `$...`. The bash source escapes every `$` as `\\$`, so
-nothing is actually expanded and the files get the text with plain `$`. The
-constants below hold that resulting text. For both vendors, every generated
-file was rendered with real bash in WSL and compared byte for byte; the tests
-compare against those renders (tests/python/fixtures/setup_sku_customizations).
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"setup-sku-customizations" Step. The build then calls install(env) instead of
-running the bash script. Deleting `action=` runs the bash script again, which
-is why the .sh file is kept. The vendor comes from env["GPU"] ("NVIDIA" or
-"AMD"), the SKU from env["SKU"] and the distro from env["DISTRIBUTION"].
-
-install() returns 0 for success or 3 for failure. It logs problems and returns
-3; it does not let exceptions escape to the build loop. Like bash's `set -e`,
-the first failure stops the step.
-
-VR200: like bash's install.sh, the Python build treats a VR200 SKU as GB200
-(see SKU_ALIASES in utils/build_config.py), so SKU is GB200 here and the GB200
-GRUB/irqbalance changes apply to VR200 images too.
-
-Rerun behaviour (same as bash): the GB200 replacement text still contains
-"lockdown=integrity", so running the step twice adds the options twice. A
-warning is logged when the options are already in a file before the edit.
-
-Which commands still run as programs
-------------------------------------
-Only `systemctl`. Copies, file writes, chmod and the sed edits are plain
-Python. The sed edits were checked against real `sed` in WSL.
+utils/plans/steps.py makes install() the action of the
+"setup-sku-customizations" Step; deleting `action=` runs the bash again.
 
 Deliberate differences from bash
 --------------------------------
-  * The GPU vendor is checked before anything is copied. Bash copies the
-    customization and topology files first and only then exits 1 for an
-    unknown vendor. The step fails either way.
-  * The service file is built as one text (the same three parts, in the same
-    order) and written once, instead of one `>` and two `>>` writes. The file
-    content is identical.
-  * `cp` is shutil.copy(), which also copies the permission bits. For new
-    files this matches `cp`; an existing file in the destination gets the
-    source's mode, where `cp` would have kept the old one.
-  * Bash runs the GB200 commands with `sudo`. The build already runs as root
-    (this step writes /usr/sbin and /etc), so the Python port edits the files
-    directly and runs `systemctl` without sudo.
+  * The GPU vendor (and COMPONENT_DIR/TOP_DIR) are checked before anything is
+    copied; bash copies first, then exits 1 for an unknown vendor.
+  * The service file is written once, from the same three parts in the same
+    order, instead of one `>` and two `>>`. The content is identical.
+  * `cp` is copy_file() (shutil.copy), which also copies the mode: for an
+    existing file in the destination, `cp` would keep the old mode.
+  * The GB200 commands run without bash's `sudo`: the build runs as root.
+  * Bash's `$DISTRIBUTION == "azurelinux3.0"` is Distro.is_azurelinux (the
+    only Azure Linux built).
+  * Files are written with write_file, which creates a missing parent folder.
+
+Kept bash quirks
+----------------
+  * The GB200 options still start with "lockdown=integrity", so a rerun adds
+    them again (warned). A GRUB file without "lockdown=integrity" is left
+    alone, as sed does (warned); a missing one fails the step, as sed -i does.
+  * `cp src/*` skips dot files and refuses folders: the files are copied,
+    then the step fails.
 """
 
 from __future__ import annotations
@@ -125,18 +55,15 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
-import stat
 
-from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.process import exec_program
+from utils.distro import Distro
+from utils.files import copy_file, edit_file, make_dirs, write_file
+from utils.logger import log_error, log_info, log_warn
+from utils.services import systemctl
 
-# The Step's `op` label in plans/steps.py. Every log line uses it.
 _OP = "setup-sku-customizations"
 
-# Every path the step reads or writes. They are module-level "constants"
-# (capital names that the program never changes) so the tests can point them
-# at a temporary folder instead of the real /opt, /usr, /etc, /lib and /boot.
+# Module-level so the tests can point them at a temporary folder.
 _CUSTOMIZATIONS_DIR = "/opt/azurehpc/customizations"
 _TOPOLOGY_DIR = "/opt/microsoft"
 _SETUP_SCRIPT = "/usr/sbin/setup_sku_customizations.sh"
@@ -150,13 +77,11 @@ _GRUB_CFG = "/boot/grub2/grub.cfg"
 
 _SERVICE_NAME = "sku-customizations"
 
-# The GB200 GRUB edit applies only to this exact distro and SKU, as in bash.
-_GB200_DISTRO = "azurelinux3.0"
 _GB200_SKU = "GB200"
 
 # bash: sed -i 's/lockdown=integrity/lockdown=integrity <options>/' <file>
-# The pattern has no characters that are special to sed, so a plain text
-# replace of the first occurrence on each line does exactly the same.
+# Nothing in the pattern is special to sed, so a plain replace of the first
+# occurrence on each line does the same.
 _LOCKDOWN = "lockdown=integrity"
 _GB200_CMDLINE = (
     "lockdown=integrity efi_mmap_nr_slack_slots=256 numa_balancing=disable "
@@ -164,13 +89,10 @@ _GB200_CMDLINE = (
     "init_on_alloc=0 nvme_core.io_timeout=240 panic=-1")
 
 # bash: sed -i '/^After=multi-user.target/d' <fabric manager unit>
-# re.match only matches at the start of the string, like sed's "^". The "."
-# matches any character in both sed and Python, so it is left unescaped.
+# re.match anchors at the line start like "^"; "." is a wildcard in both.
 _FM_AFTER_PATTERN = re.compile(r"After=multi-user.target")
 
 # ---- Generated file texts, byte for byte what bash writes -----------------
-# A triple-quoted string ("""...""") can span several lines. The backslash
-# right after the opening quotes stops the text from starting with a newline.
 # Careful when editing: blank lines, trailing spaces and the final newlines
 # are all part of the files, and the tests check them against bash's output.
 
@@ -279,8 +201,7 @@ cat /dev/null > /etc/nccl.conf
 
 """
 
-# The vendor's (setup script, remove script) texts. A dict maps keys to values;
-# looking up a missing key with .get() returns None.
+# (setup script, remove script) per GPU vendor; any other vendor is an error.
 _SCRIPTS = {
     "NVIDIA": (_NVIDIA_SETUP_SCRIPT, _NVIDIA_REMOVE_SCRIPT),
     "AMD": (_AMD_SETUP_SCRIPT, _AMD_REMOVE_SCRIPT),
@@ -349,243 +270,142 @@ def replace_first_per_line(text: str, old: str, new: str) -> tuple[str, int]:
     match on each line. Returns the new text and how many lines changed.
     """
     lines = text.splitlines(keepends=True)
-    # str.replace(old, new, 1) replaces at most one occurrence.
     edited = [line.replace(old, new, 1) for line in lines]
     changed = sum(1 for before, after in zip(lines, edited) if before != after)
     return "".join(edited), changed
 
 
-# ---- Steps with side effects ---------------------------------------------
-def _mode(path: str) -> str:
-    """A file's permission bits as an octal string such as "0755", for logging."""
-    return f"{stat.S_IMODE(os.stat(path).st_mode):04o}"
-
-
-def _run(command: list[str], env: dict[str, str]) -> bool:
-    """Run one command; log and return False if it fails.
-
-    exec_program() already logs the command, its output and its exit code;
-    here we only add what the failure means for this step.
-    """
-    rc = exec_program(command, _OP, env=env)
-    if rc != 0:
-        log_error(_OP, f"'{' '.join(command)}' failed; SKU customizations are "
-                       f"not fully set up", command=command[0], exit_code=rc)
-        return False
-    return True
-
-
+# ---- Steps: each returns True, or False after the failure was logged -------
 def _copy_all(src_dir: str, dest_dir: str) -> bool:
     """bash: `mkdir -p <dest_dir>` then `cp <src_dir>/* <dest_dir>`."""
-    # glob.glob, like the shell's `*`, skips names starting with "."; sorted()
-    # mimics the shell's alphabetical order.
+    # Not copy_files(): `cp` without -r copies every file and only then fails
+    # on folders, where copy_files() would stop at the first folder.
+    # Like the shell's `*`: no dot files, alphabetical order.
     entries = sorted(glob.glob(os.path.join(src_dir, "*")))
     if not entries:
         # The shell would pass a literal "*" to cp, which then fails.
         log_error(_OP, f"no files to copy in {src_dir}", source=src_dir)
         return False
-
-    copied = 0
-    skipped = []
-    try:
-        os.makedirs(dest_dir, exist_ok=True)              # mkdir -p
-        for entry in entries:
-            # cp without -r copies files (following symlinks) and refuses
-            # folders: it prints "omitting directory", copies the rest and
-            # then exits with an error, which stops bash (set -e).
-            if os.path.isdir(entry):
-                skipped.append(entry)
-                continue
-            shutil.copy(entry, dest_dir)
-            copied += 1
-    except OSError as exc:
-        log_error(_OP, f"could not copy {src_dir}/* to {dest_dir}: {exc}",
-                  source=src_dir, dest=dest_dir)
+    files = [entry for entry in entries if not os.path.isdir(entry)]
+    folders = [entry for entry in entries if os.path.isdir(entry)]
+    if not (make_dirs(dest_dir, op=_OP)
+            and all(copy_file(entry, dest_dir, _OP) for entry in files)):
         return False
-
-    log_info(_OP, f"Copied {copied} files from {src_dir} to {dest_dir}",
-             source=src_dir, dest=dest_dir, count=copied)
-    log_debug(_OP, f"Copied to {dest_dir}: "
-                   f"{', '.join(os.path.basename(e) for e in entries if e not in skipped)}")
-    if skipped:
+    log_info(_OP, f"Copied {len(files)} files from {src_dir} to {dest_dir}",
+             source=src_dir, dest=dest_dir, count=len(files))
+    if folders:
         log_error(_OP, f"{src_dir} contains folders, which `cp` (no -r) refuses "
-                       f"to copy, failing the bash step too",
-                  source=src_dir, folders=", ".join(skipped))
+                       "to copy, failing the bash step too",
+                  source=src_dir, folders=", ".join(folders))
         return False
     return True
 
 
-def _write_file(path: str, text: str, mode: int | None = None) -> bool:
-    """Write `text` to `path`, replacing any old content (bash's `cat <<EOF >path`).
-
-    When `mode` is given, it is applied afterwards, like bash's `chmod 755`.
-    Returns True on success, or False after logging why it failed.
-    """
-    # Checked first only so the log can say "created" or "replaced".
-    action = "replaced" if os.path.exists(path) else "created"
-    try:
-        # Mode "w" creates the file or empties an existing one before writing.
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        if mode is not None:
-            os.chmod(path, mode)
-        actual_mode = _mode(path)
-    except OSError as exc:
-        log_error(_OP, f"could not write {path}: {exc}", path=path)
-        return False
-    log_info(_OP, f"Wrote {path}", path=path, action=action, mode=actual_mode)
-    # The full text is bulky, so it goes to DEBUG only.
-    log_debug(_OP, f"Contents of {path}:\n{text}", path=path)
-    return True
+def _copy_repo_files(env: dict[str, str]) -> bool:
+    """The customization scripts and the topology files."""
+    return (_copy_all(os.path.join(env["COMPONENT_DIR"], "customizations"),
+                      _CUSTOMIZATIONS_DIR)
+            and _copy_all(os.path.join(env["TOP_DIR"], "topology"), _TOPOLOGY_DIR))
 
 
-def _edit_in_place(path: str, edit) -> int | None:
-    """Apply `edit` (text -> (new text, lines changed)) to a file, like `sed -i`.
-
-    Returns the number of lines changed, or None after logging a failure.
-    sed -i fails when the file is missing, and so do we.
-    """
-    try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-        new_text, changed = edit(text)
-        # sed -i rewrites the file even when nothing matched; so do we.
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(new_text)
-    except OSError as exc:
-        log_error(_OP, f"could not edit {path}: {exc}", path=path)
-        return None
-    return changed
+def _write_service(gpu: str) -> bool:
+    """The vendor's setup/remove scripts (mode 755) and the service unit."""
+    setup_text, remove_text = _SCRIPTS[gpu]
+    return (write_file(_SETUP_SCRIPT, setup_text, _OP, mode=0o755)
+            and write_file(_REMOVE_SCRIPT, remove_text, _OP, mode=0o755)
+            and write_file(_SERVICE_FILE, service_unit(gpu), _OP))
 
 
 def _setup_nvidia_extras() -> bool:
     """NVIDIA only: the openibd peermem drop-in and the fabric manager fix."""
     dropin = os.path.join(_OPENIBD_DROPIN_DIR, _PEERMEM_DROPIN_NAME)
-    try:
-        os.makedirs(_OPENIBD_DROPIN_DIR, exist_ok=True)   # mkdir -p
-    except OSError as exc:
-        log_error(_OP, f"could not create {_OPENIBD_DROPIN_DIR}: {exc}",
-                  path=_OPENIBD_DROPIN_DIR)
+    if not write_file(dropin, _PEERMEM_DROPIN, _OP):
         return False
-    if not _write_file(dropin, _PEERMEM_DROPIN):
-        return False
-
-    # A workaround to make the fabric manager service start automatically.
-    # os.path.isfile is bash's `[ -f path ]` (true for a regular file, or a
-    # symlink to one).
+    # bash's `[ -f path ]`: a regular file, or a symlink to one.
     if not os.path.isfile(_FABRICMANAGER_UNIT):
         log_info(_OP, f"{_FABRICMANAGER_UNIT} not found; no fabric manager "
-                      f"ordering fix needed", path=_FABRICMANAGER_UNIT)
+                      "ordering fix needed", path=_FABRICMANAGER_UNIT)
         return True
-    removed = _edit_in_place(
-        _FABRICMANAGER_UNIT,
-        lambda text: delete_matching_lines(text, _FM_AFTER_PATTERN))
-    if removed is None:
-        return False
-    log_info(_OP, f"Edited {_FABRICMANAGER_UNIT} in place: removed "
-                  f"After=multi-user.target", path=_FABRICMANAGER_UNIT,
-             lines_removed=removed)
-    return True
+    def edit(text: str) -> str:
+        new_text, removed = delete_matching_lines(text, _FM_AFTER_PATTERN)
+        log_info(_OP, f"Removing After=multi-user.target from {_FABRICMANAGER_UNIT}",
+                 path=_FABRICMANAGER_UNIT, lines_removed=removed)
+        return new_text
+    return edit_file(_FABRICMANAGER_UNIT, edit, _OP)
 
 
-def _add_gb200_options(path: str):
-    """The edit for one GRUB file: warn on a rerun, then do bash's sed.
-
-    Returns a function (text -> (new text, lines changed)) for _edit_in_place.
-    """
-    def edit(text: str) -> tuple[str, int]:
-        # BASH QUIRK (kept): the replacement still starts with
-        # "lockdown=integrity", so a second run matches again and adds the
-        # options a second time. Warn when they are already there.
+def _add_gb200_options(path: str) -> bool:
+    """bash's GB200 sed on one GRUB file, warning on a rerun or no match."""
+    def edit(text: str) -> str:
+        # The options start with "lockdown=integrity", so a rerun adds them again.
         if _GB200_CMDLINE in text:
             log_warn(_OP, f"GB200 kernel options are already in {path}; adding "
                           "them again, as bash's sed does on a rerun", path=path)
-        return replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE)
-    return edit
+        new_text, changed = replace_first_per_line(text, _LOCKDOWN, _GB200_CMDLINE)
+        if changed == 0:
+            log_warn(_OP, f"{_LOCKDOWN} not found in {path}; GB200 kernel "
+                          "options were not added there", path=path)
+        else:
+            log_info(_OP, f"Adding GB200 kernel options after {_LOCKDOWN} in {path}",
+                     path=path, lines_changed=changed, options=_GB200_CMDLINE)
+        return new_text
+    # A missing file fails here, as bash's sed -i does.
+    return edit_file(path, edit, _OP)
 
 
 def _setup_gb200(env: dict[str, str]) -> bool:
     """Azure Linux 3.0 + GB200: GRUB kernel options, then irqbalance off."""
-    for path in (_GRUB_DEFAULT, _GRUB_CFG):
-        changed = _edit_in_place(path, _add_gb200_options(path))
-        if changed is None:
-            return False
-        if changed == 0:
-            # Bash carries on silently here; the warning makes it visible.
-            log_warn(_OP, f"{_LOCKDOWN} not found in {path}; GB200 kernel "
-                          f"options were not added there", path=path)
-        else:
-            log_info(_OP, f"Edited {path} in place: added GB200 kernel options "
-                          f"after {_LOCKDOWN}", path=path, lines_changed=changed,
-                     options=_GB200_CMDLINE)
-
-    # Recommended to disable irqbalance in GB200 images (bash comment).
-    for action in ("stop", "disable"):
-        if not _run(["systemctl", action, "irqbalance"], env):
-            return False
+    if not (_add_gb200_options(_GRUB_DEFAULT) and _add_gb200_options(_GRUB_CFG)
+            and systemctl("stop", "irqbalance", op=_OP, env=env)
+            and systemctl("disable", "irqbalance", op=_OP, env=env)):
+        return False
     log_info(_OP, "Stopped and disabled irqbalance (GB200)", service="irqbalance")
+    return True
+
+
+def _inputs_ok(env: dict[str, str]) -> bool:
+    """A known GPU vendor, and the repo folders to copy from."""
+    gpu = env.get("GPU", "")
+    if gpu not in _SCRIPTS:
+        # bash: echo "GPU is not NVIDIA or AMD, exiting"; exit 1
+        log_error(_OP, "GPU is not NVIDIA or AMD", gpu=gpu)
+        return False
+    if not env.get("COMPONENT_DIR") or not env.get("TOP_DIR"):
+        log_error(_OP, "COMPONENT_DIR and TOP_DIR must be set",
+                  component_dir=env.get("COMPONENT_DIR", ""), top_dir=env.get("TOP_DIR", ""))
+        return False
+    log_info(_OP, f"Using the {gpu} setup/remove scripts", gpu=gpu)
     return True
 
 
 def install(env: dict[str, str]) -> int:
     """Set up the boot-time SKU customization service. Returns 0 or 3."""
-    gpu = env.get("GPU", "")
-    sku = env.get("SKU", "")
-    distro = env.get("DISTRIBUTION", "")
-    component_dir = env.get("COMPONENT_DIR", "")
-    top_dir = env.get("TOP_DIR", "")
-
-    log_info(_OP, "Setting up SKU customizations", gpu=gpu, sku=sku, distro=distro,
+    gpu, sku = env.get("GPU", ""), env.get("SKU", "")
+    distro = Distro.from_env(env)
+    log_info(_OP, "Setting up SKU customizations", gpu=gpu, sku=sku, distro=str(distro),
              node_type=env.get("TARGET_NODE_TYPE", ""))
-
-    scripts = _SCRIPTS.get(gpu)
-    if scripts is None:
-        # bash: echo "GPU is not NVIDIA or AMD, exiting"; exit 1
-        log_error(_OP, "GPU is not NVIDIA or AMD", gpu=gpu)
+    if not _inputs_ok(env):
         return 3
-    if not component_dir or not top_dir:
-        log_error(_OP, "COMPONENT_DIR and TOP_DIR must be set",
-                  component_dir=component_dir, top_dir=top_dir)
+    if not _copy_repo_files(env) or not _write_service(gpu):
         return 3
-    # Unpack the (setup, remove) pair into two names.
-    setup_text, remove_text = scripts
-    log_info(_OP, f"Using the {gpu} setup/remove scripts", gpu=gpu)
-
-    # ---- 1. Customization scripts and topology files ----------------------
-    if not _copy_all(os.path.join(component_dir, "customizations"), _CUSTOMIZATIONS_DIR):
-        return 3
-    if not _copy_all(os.path.join(top_dir, "topology"), _TOPOLOGY_DIR):
-        return 3
-
-    # ---- 2. The setup/remove scripts and the service ----------------------
-    if not _write_file(_SETUP_SCRIPT, setup_text, mode=0o755):
-        return 3
-    if not _write_file(_REMOVE_SCRIPT, remove_text, mode=0o755):
-        return 3
-    if not _write_file(_SERVICE_FILE, service_unit(gpu)):
-        return 3
-
-    # ---- 3. NVIDIA extras --------------------------------------------------
     if gpu == "NVIDIA" and not _setup_nvidia_extras():
         return 3
 
-    # ---- 4. GB200 on Azure Linux 3.0 --------------------------------------
-    gb200 = distro == _GB200_DISTRO and sku == _GB200_SKU
+    # Bash: [[ $DISTRIBUTION == "azurelinux3.0" && "$SKU" == "GB200" ]]
+    gb200 = distro.is_azurelinux and sku == _GB200_SKU
     if gb200:
         log_info(_OP, "Applying GB200 GRUB options and disabling irqbalance",
-                 distro=distro, sku=sku)
+                 distro=str(distro), sku=sku)
         if not _setup_gb200(env):
             return 3
     else:
-        log_info(_OP, f"GB200 GRUB/irqbalance changes not needed (only for "
-                      f"{_GB200_SKU} on {_GB200_DISTRO})", distro=distro, sku=sku)
+        log_info(_OP, "GB200 GRUB/irqbalance changes not needed (only for "
+                      f"{_GB200_SKU} on Azure Linux)", distro=str(distro), sku=sku)
 
-    # ---- 5. Enable (but don't start) the service --------------------------
-    if not _run(["systemctl", "enable", _SERVICE_NAME], env):
+    if not systemctl("enable", _SERVICE_NAME, op=_OP, env=env):
         return 3
     log_info(_OP, f"Enabled {_SERVICE_NAME} (not started during the build; it "
-                  f"runs at boot)", service=_SERVICE_NAME)
-
-    log_info(_OP, "SKU customizations set up", gpu=gpu, sku=sku, distro=distro,
+                  "runs at boot)", service=_SERVICE_NAME)
+    log_info(_OP, "SKU customizations set up", gpu=gpu, sku=sku, distro=str(distro),
              service=_SERVICE_NAME, gb200_changes=gb200)
     return 0

@@ -12,13 +12,15 @@
     HPC-X rebuild) and Ubuntu 26.04 (no MVAPICH/Open MPI). symlinks.txt lists
     each symlink bash made as "<name> -> <target name>". The same run, with
     the Python port next to it, gave identical command sequences for 14
-    targets; the expected command lists below come from it.
+    targets; the expected command lists below come from it (with the
+    toolkit's `tar -xf` for every unpack).
   * Pure helpers are tested directly; drop_last_two's expected values come
     from bash's ${x:0:-2}, ldd_libmpi's from the real awk.
   * install() runs with every external effect mocked (config lookup,
-    download, exec_program, run_capture, versions file, dnf pinning) and every
-    path pointed into a temporary directory, so nothing touches /opt, /etc,
-    /usr or the network.
+    download, utils.process.exec_program - where run, run_all and
+    extract_tarball end up - run_capture, versions file, dnf pinning) and
+    every path pointed into a temporary directory, so nothing touches /opt,
+    /etc, /usr or the network.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_mpis -v
@@ -34,8 +36,10 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_mpis as mpis
+from utils import component_config, download, files, process
 from utils.build_config import BuildConfig, build_plan
-from utils.sku import sku_network_mode, sku_uses_ucx
+from utils.distro import Distro
+from utils.sku import sku_network_mode
 from utils.version_validate import active_hpcx_component
 
 _OP = "install-mpis"
@@ -118,26 +122,32 @@ class PureHelperTests(unittest.TestCase):
     def test_distro_predicates(self):
         for distro in ("almalinux8.10", "almalinux9.8", "rocky8.10", "rocky9.8",
                        "rhel8.10", "rhel9.6", "rhel10.0", "azurelinux3.0"):
-            self.assertTrue(mpis.is_rpm_distro(distro), distro)
+            self.assertTrue(mpis.is_rpm_distro(Distro(distro)), distro)
         for distro in ("ubuntu22.04", "ubuntu24.04", "ubuntu26.04", "azurelinux3.1", ""):
-            self.assertFalse(mpis.is_rpm_distro(distro), distro)
+            self.assertFalse(mpis.is_rpm_distro(Distro(distro)), distro)
 
-        self.assertTrue(mpis.skips_mvapich("ubuntu24.04", "gb-family"))
-        self.assertTrue(mpis.skips_mvapich("azurelinux3.0", "gb-family"))
-        self.assertTrue(mpis.skips_mvapich("ubuntu26.04", "H100"))
-        self.assertTrue(mpis.skips_mvapich("ubuntu26.04", "gb-family"))
-        self.assertFalse(mpis.skips_mvapich("ubuntu22.04", "gb-family"))
-        self.assertFalse(mpis.skips_mvapich("ubuntu24.04", "GB200"))
-        self.assertFalse(mpis.skips_mvapich("ubuntu24.04", "A100"))
+        def mvapich_skip(distro, family):
+            return mpis.mvapich_skip_reason(Distro(distro), family)
 
-        self.assertTrue(mpis.skips_ompi("ubuntu26.04"))
+        self.assertTrue(mvapich_skip("ubuntu24.04", "gb-family"))
+        self.assertTrue(mvapich_skip("azurelinux3.0", "gb-family"))
+        self.assertTrue(mvapich_skip("ubuntu26.04", "H100"))
+        self.assertTrue(mvapich_skip("ubuntu26.04", "gb-family"))
+        self.assertIsNone(mvapich_skip("ubuntu22.04", "gb-family"))
+        self.assertIsNone(mvapich_skip("ubuntu24.04", "GB200"))
+        self.assertIsNone(mvapich_skip("ubuntu24.04", "A100"))
+
+        self.assertTrue(mpis.ompi_skip_reason(Distro("ubuntu26.04")))
         for distro in ("ubuntu24.04", "ubuntu22.04", "azurelinux3.0", "rhel10.0"):
-            self.assertFalse(mpis.skips_ompi(distro), distro)
+            self.assertIsNone(mpis.ompi_skip_reason(Distro(distro)), distro)
+
+        self.assertTrue(mpis.impi_skip_reason("aarch64"))
+        self.assertIsNone(mpis.impi_skip_reason("x86_64"))
 
         for distro in ("almalinux8.10", "rocky8.10", "rhel8.10", "rhel8"):
-            self.assertTrue(mpis.is_el8(distro), distro)
+            self.assertTrue(mpis.is_el8(Distro(distro)), distro)
         for distro in ("almalinux8.9", "rocky9.8", "almalinux9.8", "ubuntu22.04"):
-            self.assertFalse(mpis.is_el8(distro), distro)
+            self.assertFalse(mpis.is_el8(Distro(distro)), distro)
 
         self.assertEqual(mpis.impi_fi_provider("no_rdma"), "tcp")
         self.assertEqual(mpis.impi_fi_provider("standard_ib"), "mlx")
@@ -147,37 +157,40 @@ class PureHelperTests(unittest.TestCase):
         for distro in ("ubuntu26.04", "azurelinux3.0", "almalinux10.0", "almalinux10",
                        "rocky10.1", "rhel10.0"):
             with self.subTest(distro=distro):
-                self.assertTrue(mpis.uses_internal_pmix(distro, "azure_vm_regular"))
-                self.assertTrue(mpis.internal_pmix_reason(distro, ""))
+                self.assertTrue(mpis.uses_internal_pmix(Distro(distro), "azure_vm_regular"))
+                self.assertTrue(mpis.internal_pmix_reason(Distro(distro), ""))
         for distro in ("ubuntu24.04", "ubuntu22.04", "almalinux9.8", "rocky8.10",
                        "rhel9.6", "almalinux1", "azurelinux3.1", "ubuntu26.10"):
             with self.subTest(distro=distro):
-                self.assertFalse(mpis.uses_internal_pmix(distro, "azure_vm_regular"))
-                self.assertIsNone(mpis.internal_pmix_reason(distro, ""))
-        self.assertTrue(mpis.uses_internal_pmix("ubuntu24.04", "baremetal_3p"))
-        self.assertIn("baremetal_3p", mpis.internal_pmix_reason("ubuntu22.04", "baremetal_3p"))
-        self.assertFalse(mpis.uses_internal_pmix("ubuntu24.04", "baremetal_1p"))
+                self.assertFalse(mpis.uses_internal_pmix(Distro(distro), "azure_vm_regular"))
+                self.assertIsNone(mpis.internal_pmix_reason(Distro(distro), ""))
+        self.assertTrue(mpis.uses_internal_pmix(Distro("ubuntu24.04"), "baremetal_3p"))
+        self.assertIn("baremetal_3p",
+                      mpis.internal_pmix_reason(Distro("ubuntu22.04"), "baremetal_3p"))
+        self.assertFalse(mpis.uses_internal_pmix(Distro("ubuntu24.04"), "baremetal_1p"))
 
     def test_ompi_deps_and_pmix_flags(self):
         internal = ["--with-pmix=internal", "--with-hwloc=internal", "--with-libevent=internal"]
+        azl3, u24 = Distro("azurelinux3.0"), Distro("ubuntu24.04")
         self.assertEqual(mpis.ompi_deps_args(True, None), internal)
         self.assertEqual(mpis.ompi_deps_args(False, "/opt/pmix/4.2.9"),
                          ["--with-pmix=/opt/pmix/4.2.9"])
-        self.assertEqual(mpis.ompi_pmix_flags(True, "azurelinux3.0", "", None), internal)
-        self.assertEqual(mpis.ompi_pmix_flags(False, "ubuntu24.04", "", "/opt/pmix/4.2.9"),
+        self.assertEqual(mpis.ompi_pmix_flags(True, azl3, "", None), internal)
+        self.assertEqual(mpis.ompi_pmix_flags(False, u24, "", "/opt/pmix/4.2.9"),
                          ["--with-pmix=/opt/pmix/4.2.9"])
         # bash's unreachable elif, mirrored (internal PMIx is checked first).
-        self.assertEqual(mpis.ompi_pmix_flags(False, "azurelinux3.0", "", "/p"), ["--with-pmix"])
-        self.assertEqual(mpis.ompi_pmix_flags(False, "ubuntu24.04", "baremetal_3p", "/p"),
+        self.assertEqual(mpis.ompi_pmix_flags(False, azl3, "", "/p"), ["--with-pmix"])
+        self.assertEqual(mpis.ompi_pmix_flags(False, u24, "baremetal_3p", "/p"),
                          ["--with-pmix"])
 
     def test_rebuild_decisions(self):
-        self.assertTrue(mpis.rebuild_ucx_reason("AMD", "almalinux8.10", True))
-        self.assertTrue(mpis.rebuild_ucx_reason("NVIDIA", "ubuntu22.04", True))
-        self.assertTrue(mpis.rebuild_ucx_reason("", "ubuntu22.04", True))
-        self.assertIsNone(mpis.rebuild_ucx_reason("AMD", "almalinux8.10", False))
-        self.assertIsNone(mpis.rebuild_ucx_reason("NVIDIA", "ubuntu22.04", False))
-        self.assertIsNone(mpis.rebuild_ucx_reason("NVIDIA", "ubuntu24.04", True))
+        el8, u22, u24 = Distro("almalinux8.10"), Distro("ubuntu22.04"), Distro("ubuntu24.04")
+        self.assertTrue(mpis.rebuild_ucx_reason("AMD", el8, True))
+        self.assertTrue(mpis.rebuild_ucx_reason("NVIDIA", u22, True))
+        self.assertTrue(mpis.rebuild_ucx_reason("", u22, True))
+        self.assertIsNone(mpis.rebuild_ucx_reason("AMD", el8, False))
+        self.assertIsNone(mpis.rebuild_ucx_reason("NVIDIA", u22, False))
+        self.assertIsNone(mpis.rebuild_ucx_reason("NVIDIA", u24, True))
 
         # Only NVIDIA + UCX + internal PMIx + no UCX rebuild keeps the vendor build.
         self.assertFalse(mpis.needs_hpcx_rebuild(rebuild_ucx=False, internal_pmix=True,
@@ -248,13 +261,13 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(mpis.ldd_libmpi(""), "")
 
     def test_configure_commands(self):
-        cmd, lib = mpis.mvapich_configure_command("ubuntu22.04", "4.1", uses_ucx=True,
+        cmd, lib = mpis.mvapich_configure_command(Distro("ubuntu22.04"), "4.1", uses_ucx=True,
                                                   ucx_path="/opt/h/ucx")
         self.assertEqual(cmd, ["./configure", "FFLAGS=-fallow-argument-mismatch",
                                "--prefix=/opt/mvapich-4.1", "--enable-g=none",
                                "--enable-fast=yes", "--with-ucx=/opt/h/ucx"])
         self.assertEqual(lib, "/opt/h/ucx/lib")
-        cmd, lib = mpis.mvapich_configure_command("rocky9.8", "4.0", uses_ucx=False,
+        cmd, lib = mpis.mvapich_configure_command(Distro("rocky9.8"), "4.0", uses_ucx=False,
                                                   ucx_path="/opt/h/ucx")
         self.assertEqual(cmd, ["./configure", "--prefix=/opt/mvapich-4.0", "--enable-g=none",
                                "--enable-fast=yes", "--with-device=ch4:ofi",
@@ -314,46 +327,33 @@ class ModulefileTests(unittest.TestCase):
     def _render(self, name):
         """Write the modulefiles in bash's order, with bash's decisions."""
         distro, arch, gpu, sku, family, node_type, hpcx_version, folder = _SCENARIOS[name]
-        uses_ucx = sku_uses_ucx(sku)
-        internal = mpis.uses_internal_pmix(distro, node_type)
-        rebuild_ucx = mpis.rebuild_ucx_reason(gpu, distro, uses_ucx) is not None
-        hpcx_path = f"/opt/{folder}"
-        hpcx = mpis._Hpcx(path=hpcx_path, hcoll=f"{hpcx_path}/hcoll",
-                          sharp=f"{hpcx_path}/sharp",
-                          ucx=f"{hpcx_path}/ucx{'/hpcx-rebuild' if rebuild_ucx else ''}")
-        mvapich = None if mpis.skips_mvapich(distro, family) else {"version": "4.1"}
-        ompi = None if mpis.skips_ompi(distro) else {"version": "5.0.10"}
-        impi = None if arch == "aarch64" else {"version": "2021.16.1"}
-        inp = mpis._Inputs(
-            distribution=distro, architecture=arch, gpu=gpu, sku=sku, sku_family=family,
-            node_type=node_type, network_mode=sku_network_mode(sku, node_type),
-            uses_ucx=uses_ucx, module_dir=os.path.join(self._tmp.name, name),
-            component_dir="", hpcx_component="", hpcx_reason="",
-            hpcx={"version": hpcx_version}, internal_pmix=internal, internal_pmix_reason=None,
-            pmix_version=None, pmix_path="/opt/pmix/4.2.9", rebuild_ucx=rebuild_ucx,
-            rebuild_ucx_reason=None,
-            rebuild_hpcx=mpis.needs_hpcx_rebuild(rebuild_ucx=rebuild_ucx, internal_pmix=internal,
-                                                 gpu=gpu, uses_ucx=uses_ucx),
-            mvapich=mvapich, ompi=ompi, impi=impi,
-            impi_2021_version="2021.16" if impi else None)
-        os.makedirs(inp.mpi_dir)
+        plan = mpis._decide({"DISTRIBUTION": distro, "ARCHITECTURE": arch, "GPU": gpu,
+                             "SKU": sku, "SKU_FAMILY": family, "TARGET_NODE_TYPE": node_type,
+                             "MODULE_FILES_DIRECTORY": os.path.join(self._tmp.name, name)})
+        plan.hpcx = {"version": hpcx_version}
+        plan.pmix_path = "/opt/pmix/4.2.9"
+        plan.impi_2021_version = "2021.16"
+        hpcx = mpis._Hpcx.at(f"/opt/{folder}", rebuilt_ucx=plan.rebuild_ucx)
+        os.makedirs(plan.mpi_dir)
         report = mpis._Report()
         with mock.patch.object(mpis, "log_info"), \
+             mock.patch.object(files, "log_info"), \
              mock.patch.object(mpis, "log_warn") as warn:
-            mpis._write_hpcx_modulefiles(inp, hpcx, report)
-            if mvapich:
-                _, lib = mpis.mvapich_configure_command(distro, "4.1", uses_ucx=uses_ucx,
+            self.assertTrue(mpis._write_hpcx_modulefiles(plan, hpcx, report))
+            if plan.mvapich_skip is None:
+                _, lib = mpis.mvapich_configure_command(plan.distro, "4.1",
+                                                        uses_ucx=plan.uses_ucx,
                                                         ucx_path=hpcx.ucx)
-                mpis._write_mvapich_modulefile(inp, "4.1", lib, report)
-            if ompi:
+                self.assertTrue(mpis._write_mvapich_modulefile(plan, "4.1", lib, report))
+            if plan.ompi_skip is None:
                 _, lib = mpis.ompi_configure_command(
-                    "5.0.10", uses_ucx=uses_ucx, pmix_flags=[], ucx_path=hpcx.ucx,
+                    "5.0.10", uses_ucx=plan.uses_ucx, pmix_flags=[], ucx_path=hpcx.ucx,
                     hcoll_path=hpcx.hcoll, ld_library_path="")
-                mpis._write_ompi_modulefile(inp, "5.0.10", hpcx, lib, report)
-            if impi:
-                mpis._write_impi_modulefile(inp, report)
+                self.assertTrue(mpis._write_ompi_modulefile(plan, "5.0.10", hpcx, lib, report))
+            if plan.impi_skip is None:
+                self.assertTrue(mpis._write_impi_modulefile(plan, report))
         warn.assert_not_called()       # first run: no rerun warnings (incl. EL8 append)
-        return inp.mpi_dir
+        return plan.mpi_dir
 
     def test_modulefiles_and_symlinks_match_bash(self):
         for name in _SCENARIOS:
@@ -405,8 +405,7 @@ class InstallTests(unittest.TestCase):
         for name, value in (("_INSTALL_PREFIX", self.opt), ("_WORK_DIR", self.work),
                             ("_ROCM_DIR", self.rocm), ("_LD_SO_CONF_DIR", self.ld_dir),
                             ("_PKGCONFIG_DIRS", (self.pc_lib,)),
-                            ("_PKGCONFIG_DIRS_RPM", (self.pc_lib, self.pc_lib64)),
-                            ("_PATCH_TMP_PARENT", self.patch_tmp)):
+                            ("_PKGCONFIG_DIRS_RPM", (self.pc_lib, self.pc_lib64))):
             patcher = mock.patch.object(mpis, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -418,10 +417,10 @@ class InstallTests(unittest.TestCase):
         if command == self.fail_on:
             return 2
         # tar creates the source folder the configure/make steps run in.
-        if command[:2] == ["tar", "-xvf"] and command[2].endswith(".tar.gz"):
+        if command[:2] == ["tar", "-xf"] and len(command) == 3 and command[2].endswith(".tar.gz"):
             os.makedirs(os.path.join(cwd, command[2][:-len(".tar.gz")]), exist_ok=True)
-        # tar -xzf <ucx tarball> -C <dir>: unpack netlink.c (buggy, fixed or absent).
-        if command[:2] == ["tar", "-xzf"] and self.netlink is not None:
+        # tar -xf <ucx tarball> -C <dir>: unpack netlink.c (buggy, fixed or absent).
+        if command[:2] == ["tar", "-xf"] and "-C" in command and self.netlink is not None:
             name = os.path.basename(command[2])[:-len(".tar.gz")]
             source = Path(command[4], name, "src", "ucs", "sys")
             source.mkdir(parents=True)
@@ -431,8 +430,6 @@ class InstallTests(unittest.TestCase):
     def _fake_capture(self, command, op, *, cwd=None, env=None, failure_is_error=True):
         self.assertEqual(op, _OP)
         self.captures.append((command, cwd, env, failure_is_error))
-        if command == ["nproc"]:
-            return self.nproc
         if command[0].endswith("/ucx_info"):
             return self.ucx_info
         if command[0] == "ldd":
@@ -447,13 +444,13 @@ class InstallTests(unittest.TestCase):
 
     def _install(self, distro="ubuntu22.04", arch="x86_64", gpu="NVIDIA", sku="A100",
                  family=None, node_type="azure_vm_regular", configs=None,
-                 fail_on=None, nproc=(0, f"{_NPROC}\n"), pin_ok=True, download_error=None,
+                 fail_on=None, pin_ok=True, download_error=None,
                  write_error=None, extra_env=None, netlink=_BUGGY_NETLINK,
                  ucx_tarballs=("ucx-1.20.0.tar.gz",), ucx_info=(0, "# Library version: 1.20.0\n"),
                  ldd=None, pkg_config=(0, f"{_PMIX_INTERNAL}\n")):
         self.calls, self.captures, self.fail_on = [], [], fail_on
         self.netlink, self.ucx_info, self.ldd, self.pkg_config = netlink, ucx_info, ldd, pkg_config
-        self.nproc = nproc
+
         self.record_points = []
         configs = dict(_CONFIGS if configs is None else configs)
         env = {"DISTRIBUTION": distro, "ARCHITECTURE": arch, "GPU": gpu, "SKU": sku,
@@ -480,30 +477,42 @@ class InstallTests(unittest.TestCase):
             if write_error:
                 raise write_error
 
-        def fake_mkdtemp(dir=None):
-            # A fixed name, so a command list from one run matches the next.
-            self.assertEqual(dir, self.patch_tmp)
-            path = os.path.join(dir, "tmp.ucx")
+        def fake_mkdtemp(prefix=None, dir=None):
+            # A fixed name under the test's own dir, so a command list from
+            # one run matches the next.
+            self.assertIsNone(dir)
+            path = os.path.join(self.patch_tmp, "tmp.ucx")
             os.mkdir(path)
             return path
 
-        with mock.patch.object(mpis.tempfile, "mkdtemp", side_effect=fake_mkdtemp), \
-             mock.patch.object(mpis, "config_for",
+        # Commands run in utils.process (run, run_all, extract_tarball), so
+        # one fake there records them all in order; every module that logs a
+        # failure shares one error mock, and write_file's "Wrote ..." lines go
+        # to the same info mock as the step's own.
+        info, warn, error, error_detail = (mock.MagicMock() for _ in range(4))
+        with mock.patch.object(files.tempfile, "mkdtemp", side_effect=fake_mkdtemp), \
+             mock.patch.object(component_config, "config_for",
                                side_effect=lambda c, e: configs.get(c)) as config, \
-             mock.patch.object(mpis, "download_and_verify",
-                               side_effect=fake_download) as download, \
-             mock.patch.object(mpis, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(download, "download_and_verify",
+                               side_effect=fake_download) as download_mock, \
+             mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(mpis, "run_capture", side_effect=self._fake_capture), \
-             mock.patch.object(mpis, "write_component_version",
+             mock.patch.object(mpis, "cpu_count", return_value=_NPROC), \
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=fake_record) as record, \
              mock.patch.object(mpis, "dnf_pin_packages", return_value=pin_ok) as pin, \
-             mock.patch.object(mpis, "log_info") as info, \
-             mock.patch.object(mpis, "log_warn") as warn, \
-             mock.patch.object(mpis, "log_error") as error, \
-             mock.patch.object(mpis, "log_error_detail") as error_detail:
+             mock.patch.object(mpis, "log_info", new=info), \
+             mock.patch.object(mpis, "log_warn", new=warn), \
+             mock.patch.object(mpis, "log_error", new=error), \
+             mock.patch.object(mpis, "log_error_detail", new=error_detail), \
+             mock.patch.object(files, "log_info", new=info), \
+             mock.patch.object(files, "log_error", new=error), \
+             mock.patch.object(component_config, "log_info", new=info), \
+             mock.patch.object(download, "log_error", new=error), \
+             mock.patch.object(component_config, "log_error", new=error):
             result = mpis.install(env)
         self.env = env
-        self.config, self.download, self.record, self.pin = config, download, record, pin
+        self.config, self.download, self.record, self.pin = config, download_mock, record, pin
         self.info, self.warn, self.error, self.error_detail = info, warn, error, error_detail
         return result
 
@@ -527,13 +536,13 @@ class InstallTests(unittest.TestCase):
 
     def _hpcx_start(self, url):
         path = self._hpcx_path(url)
-        return [["tar", "-xvf", mpis.url_basename(url)],
+        return [["tar", "-xf", mpis.url_basename(url)],
                 ["mv", mpis.url_basename(url, ".tbz"), self.opt],
                 [f"{path}/utils/hpcx_fix_ladir.sh"]]
 
     def _patch_commands(self, url):
         tarball = f"{self._hpcx_path(url)}/sources/ucx-1.20.0.tar.gz"
-        tar_x = ["tar", "-xzf", tarball, "-C"]
+        tar_x = ["tar", "-xf", tarball, "-C"]
         return tar_x, tarball
 
     def _hpcx_end(self, url):
@@ -548,14 +557,14 @@ class InstallTests(unittest.TestCase):
         return ["cp", "-r", f"{path}/ompi/tests", f"{path}/hpcx-rebuild"]
 
     def _mvapich_commands(self, configure_tail, fflags=True):
-        return [["tar", "-xvf", "mvapich-4.1.tar.gz"],
+        return [["tar", "-xf", "mvapich-4.1.tar.gz"],
                 ["./configure", *(["FFLAGS=-fallow-argument-mismatch"] if fflags else []),
                  f"--prefix={self.opt}/mvapich-4.1", "--enable-g=none", "--enable-fast=yes",
                  *configure_tail],
                 ["make", f"-j{_NPROC}"], ["make", "install"]]
 
     def _ompi_commands(self, configure):
-        return [["tar", "-xvf", "openmpi-5.0.10.tar.gz"], configure,
+        return [["tar", "-xf", "openmpi-5.0.10.tar.gz"], configure,
                 ["make", f"-j{_NPROC}"], ["make", "install"]]
 
     def _ompi_ucx_configure(self, url, ucx_sub, pmix_flags):
@@ -603,11 +612,11 @@ class InstallTests(unittest.TestCase):
                 _HPCX_URL, "ucx/hpcx-rebuild", [f"--with-pmix={pmix}"])) + self._impi_commands()
         self.assertEqual(commands, expected)
         self.assertEqual(self._captured(), [
-            ["nproc"], [f"{ucx}/bin/ucx_info", "-v"],
+            [f"{ucx}/bin/ucx_info", "-v"],
             ["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
         # ucx_info runs against the rebuilt UCX's libs only; ldd's exit code is an answer.
-        self.assertEqual(self.captures[1][2]["LD_LIBRARY_PATH"], f"{ucx}/lib")
-        self.assertFalse(self.captures[2][3])
+        self.assertEqual(self.captures[0][2]["LD_LIBRARY_PATH"], f"{ucx}/lib")
+        self.assertFalse(self.captures[1][3])
 
         # cwd: work dir for downloads/tar/scripts, source dir for the builds.
         cwds = [c[1] for c in self.calls]
@@ -677,10 +686,10 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any(m.startswith("Rebuilt ompi_info loads ") for m in messages))
         for component, version in (("HPCX", "2.25.1"), ("MVAPICH", "4.1"),
                                    ("OMPI", "5.0.10"), ("IMPI", "2021.16.1")):
-            self.assertIn(f"Recorded {component}={version}", messages)
+            self.assertIn(f"Recorded {component} {version}", messages)
         ld_conf = os.path.join(self.ld_dir, "hpcx-ucx.conf")
         self.assertIn(f"Wrote {ld_conf} (created)", messages)
-        self.assertTrue(any(m.startswith("Created symlink") and "/mpi/hpcx ->" in m
+        self.assertTrue(any(m.startswith("Linked ") and "/mpi/hpcx ->" in m
                             for m in messages))
         summary = self.info.call_args_list[-1]
         self.assertEqual(summary.args[1], "MPIs installed: HPCX=2.25.1, MVAPICH=4.1, "
@@ -708,8 +717,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(), expected)
         self.assertNotIn("CUDA_HOME", self.calls[3][2])
         # No UCX rebuild: no patch, no ucx_info.
-        self.assertEqual(self._captured(), [["nproc"],
-                                            ["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
+        self.assertEqual(self._captured(), [["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
         self.assertEqual(_read(os.path.join(self.ld_dir, "hpcx-ucx.conf")), f"{path}/ucx/lib\n")
 
     def test_ncv6_uses_inbox_hpcx_and_libfabric(self):
@@ -800,7 +808,7 @@ class InstallTests(unittest.TestCase):
     def test_amd_without_rocm_fails_after_the_patch_check(self):
         self.assertEqual(self._install(distro="almalinux8.10", gpu="AMD", sku="MI300X",
                                        netlink=_FIXED_NETLINK), 3)
-        self.assertEqual(len(self.calls), 4)          # tar, mv, fix_ladir, tar -xzf
+        self.assertEqual(len(self.calls), 4)          # tar, mv, fix_ladir, tar -xf (UCX source)
         self.record.assert_called_once_with("HPCX", "2.18")
         self.assertEqual(self.error.call_args.args[1],
                          "ROCm must be installed before rebuilding HPC-X UCX with "
@@ -828,8 +836,8 @@ class InstallTests(unittest.TestCase):
         expected = self._hpcx_start(_HPCX_URL) + self._hpcx_end(_HPCX_URL) + \
             self._ompi_commands(self._ompi_ucx_configure(_HPCX_URL, "ucx", _INTERNAL.split()))
         self.assertEqual(self._commands(), expected)
-        self.assertEqual(self._captured(), [["nproc"], ["pkg-config", "--modversion", "pmix"]])
-        self.assertEqual(self.captures[1][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
+        self.assertEqual(self._captured(), [["pkg-config", "--modversion", "pmix"]])
+        self.assertEqual(self.captures[0][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
         config_names = [c.args[0] for c in self.config.call_args_list]
         for name in ("pmix", "mvapich", "impi"):
             self.assertNotIn(name, config_names)
@@ -843,7 +851,7 @@ class InstallTests(unittest.TestCase):
         messages = self._messages(self.info)
         self.assertTrue(any(m.startswith("Skipping MVAPICH: not supported on azurelinux3.0 "
                                          "for gb-family SKUs") for m in messages))
-        self.assertIn("Skipping Intel MPI on aarch64 (x86_64 only)", messages)
+        self.assertIn("Skipping Intel MPI: Intel MPI is x86_64 only", messages)
         self.assertTrue(any(m.startswith("Not rebuilding HPC-X") for m in messages))
         self.assertTrue(any(m.startswith("Open MPI uses its internal PMIx") and
                             "azurelinux3.0" in m for m in messages))
@@ -857,7 +865,7 @@ class InstallTests(unittest.TestCase):
         path = self._hpcx_path(_HPCX_URL)
         self.assertEqual(self._commands(), self._hpcx_start(_HPCX_URL) +
                          self._hpcx_end(_HPCX_URL) + self._impi_commands())
-        self.assertEqual(self.captures[1][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
+        self.assertEqual(self.captures[0][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
         self.assertEqual(self._records(), [("HPCX", "2.25.1"), ("PMIX", _PMIX_INTERNAL),
                                            ("IMPI", "2021.16.1")])
         self.pin.assert_not_called()
@@ -867,7 +875,7 @@ class InstallTests(unittest.TestCase):
         messages = self._messages(self.info)
         self.assertTrue(any(m.startswith("Skipping MVAPICH: MVAPICH 4.1 does not build with "
                                          "ubuntu26.04's gcc 15") for m in messages))
-        self.assertTrue(any(m.startswith("Skipping the standalone Open MPI on ubuntu26.04")
+        self.assertTrue(any(m.startswith("Skipping the standalone Open MPI: ubuntu26.04")
                             for m in messages))
         self.assertEqual(self.info.call_args_list[0].kwargs["ompi_version"], "skipped")
 
@@ -911,7 +919,7 @@ class InstallTests(unittest.TestCase):
     def test_gb200_on_ubuntu22_still_builds_mvapich(self):
         self.assertEqual(self._install(distro="ubuntu22.04", arch="aarch64", sku="GB200",
                                        family="gb-family"), 0)
-        self.assertIn(["tar", "-xvf", "mvapich-4.1.tar.gz"], self._commands())
+        self.assertIn(["tar", "-xf", "mvapich-4.1.tar.gz"], self._commands())
 
     def test_empty_caller_ld_library_path(self):
         self.assertEqual(self._install(extra_env={"LD_LIBRARY_PATH": ""}), 0)
@@ -962,7 +970,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((lines[0], lines[-1]), (f"{ucx_log.name} line 10",
                                                  f"{ucx_log.name} line 49"))
         self.assertIn("hpcx_rebuild.sh failed", self.error.call_args.args[1])
-        self.assertEqual(self._captured(), [["nproc"]])
+        self.assertEqual(self._captured(), [])
 
     def test_rebuild_failure_without_logs_warns(self):
         rebuild = self._rebuild(_HPCX_URL, "--cuda", "--with-hcoll", "--ompi-extra-config",
@@ -1025,13 +1033,13 @@ class InstallTests(unittest.TestCase):
     def test_missing_netlink_source_fails(self):
         # bash's grep would fail and rebuild UCX unpatched; we stop.
         self.assertEqual(self._install(netlink=None), 3)
-        self.assertEqual(self._commands()[-1][:2], ["tar", "-xzf"])
+        self.assertEqual(self._commands()[-1][:2], ["tar", "-xf"])
         self.assertIn("can't tell whether this UCX has the netlink", self.error.call_args.args[1])
         self._assert_tmp_cleaned()
 
     def test_missing_patch_file_fails(self):
         self.assertEqual(self._install(extra_env={"COMPONENT_DIR": ""}), 3)
-        self.assertEqual(self._commands()[-1][:2], ["tar", "-xzf"])
+        self.assertEqual(self._commands()[-1][:2], ["tar", "-xf"])
         self.assertIn("UCX patch patches/ucx-netlink-dump-done.patch not found",
                       self.error.call_args.args[1])
 
@@ -1040,9 +1048,8 @@ class InstallTests(unittest.TestCase):
         patch = ["patch", "-d", f"{work_dir}/ucx-1.20.0", "-p1", "-i",
                  os.path.join(self.components, "patches", "ucx-netlink-dump-done.patch")]
         self.assertEqual(self._install(fail_on=patch), 3)
-        self.assertEqual(self._commands()[-1], patch)
-        self.assertIn("applying patches/ucx-netlink-dump-done.patch to ucx-1.20.0 failed",
-                      self.error.call_args.args[1])
+        self.assertEqual(self._commands()[-1], patch)       # no repack, no rebuild
+        self.assertEqual(self._records(), [("HPCX", "2.25.1")])
         self._assert_tmp_cleaned()
 
     # ---- reruns -------------------------------------------------------------
@@ -1062,7 +1069,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("ln -s` (without -f) fails here too", self.error.call_args.args[1])
         # bash stops at that ln -s: no hpcx link, no MVAPICH.
         self.assertFalse(os.path.lexists(os.path.join(mpi_dir, "hpcx")))
-        self.assertNotIn(["tar", "-xvf", "mvapich-4.1.tar.gz"], self._commands())
+        self.assertNotIn(["tar", "-xf", "mvapich-4.1.tar.gz"], self._commands())
         self.assertFalse(any("rm -rf -- */" in m for m in self._messages(self.warn)))
 
     # ---- missing or unusable config -------------------------------------------
@@ -1115,7 +1122,6 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual(self._commands(), commands[:index + 1])
                     self.assertEqual([c.args[0] for c in self.record.call_args_list],
                                      [k for k, n in recorded_after if n <= index])
-                    self.error.assert_called()
                     self._assert_tmp_cleaned()
                     # Modulefiles are only written after ldconfig.
                     if index <= commands.index(["ldconfig"]):
@@ -1125,7 +1131,7 @@ class InstallTests(unittest.TestCase):
     def test_download_failure_returns_3(self):
         self.assertEqual(self._install(download_error=OSError("boom")), 3)
         self.assertEqual(self.calls, [])
-        self.assertIn("download/verify of HPC-X failed", self.error.call_args.args[1])
+        self.assertIn(f"download of {_HPCX_URL} failed", self.error.call_args.args[1])
 
     def test_pin_failure_returns_3(self):
         self.assertEqual(self._install(distro="rocky9.8", pin_ok=False), 3)
@@ -1133,30 +1139,35 @@ class InstallTests(unittest.TestCase):
         self.record.assert_called_once_with("HPCX", "2.25.1")
         self.assertEqual(os.listdir(self._mpi_dir()), [])        # pin comes before the modulefile
 
-    def test_nproc_failure_returns_3(self):
-        self.assertEqual(self._install(nproc=(1, "")), 3)
-        self.assertEqual(self.calls, [])
 
     def test_missing_source_folder_returns_3(self):
         original = self._fake_exec
 
         def no_tar_output(command, op, *, cwd=None, env=None):
-            if command[:2] == ["tar", "-xvf"]:
+            if command[:2] == ["tar", "-xf"]:
                 self.calls.append((command, cwd, env))
                 return 0
             return original(command, op, cwd=cwd, env=env)
 
         self._fake_exec = no_tar_output
         self.assertEqual(self._install(distro="ubuntu24.04"), 3)
-        self.assertEqual(self._commands()[-1], ["tar", "-xvf", "mvapich-4.1.tar.gz"])
+        self.assertEqual(self._commands()[-1], ["tar", "-xf", "mvapich-4.1.tar.gz"])
         self.assertIn("was not created by tar", self.error.call_args.args[1])
 
     def test_ld_so_conf_write_error_returns_3(self):
+        # A file where the directory should be: write_file can't create it.
         os.rmdir(self.ld_dir)
+        Path(self.ld_dir).write_text("not a directory")
         self.assertEqual(self._install(), 3)
         self.assertNotIn(["ldconfig"], self._commands())
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not write", self.error.call_args.args[1])
         self._assert_tmp_cleaned()
+
+    def test_missing_ld_so_conf_dir_is_created(self):
+        # write_file creates the parent directory (bash's `cat >` would fail).
+        os.rmdir(self.ld_dir)
+        self.assertEqual(self._install(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.ld_dir, "hpcx-ucx.conf")))
 
     def test_unwritable_versions_file_returns_3(self):
         self.assertEqual(self._install(write_error=PermissionError("denied")), 3)

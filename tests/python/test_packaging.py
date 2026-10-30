@@ -20,10 +20,14 @@ import json
 import os
 import tarfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from utils import component_config
 from utils import package_manager
 from utils import package_installer
+from utils import component_config, process
+from utils import download as download_module
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
 from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_aznfs
@@ -269,13 +273,13 @@ class MpifileutilsConfigTests(unittest.TestCase):
         env = self._env({
             "mpifileutils": {"common": {"version": "0.12", "url": "u", "sha256": "s"}}
         })
-        cfg = install_mpifileutils.config_for("mpifileutils", env)
+        cfg = component_config.config_for("mpifileutils", env)
         self.assertEqual(cfg["version"], "0.12")
         self.assertEqual(cfg["url"], "u")
 
     def test_get_config_missing_component_returns_none(self):
         env = self._env({})
-        self.assertIsNone(install_mpifileutils.config_for("mpifileutils", env))
+        self.assertIsNone(component_config.config_for("mpifileutils", env))
 
 
 class MpifileutilsInstallTests(unittest.TestCase):
@@ -299,14 +303,15 @@ class MpifileutilsInstallTests(unittest.TestCase):
 
     def test_install_fails_when_no_version(self):
         env = {"COMPONENT_VERSIONS": json.dumps({})}
-        with mock.patch.object(install_mpifileutils, "log_error") as logged:
+        # require_config reports the missing version.
+        with mock.patch.object(component_config, "log_error") as logged:
             self.assertEqual(install_mpifileutils.install(env), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
     def test_install_fails_when_deps_fail(self):
         env = self._env()
         with mock.patch.object(install_mpifileutils, "install_deps", return_value=3), \
-             mock.patch.object(install_mpifileutils, "download_and_verify") as dl, \
+             mock.patch.object(install_mpifileutils, "fetch_verified") as dl, \
              mock.patch("os.makedirs"):
             rc = install_mpifileutils.install(env)
         self.assertEqual(rc, 3)
@@ -331,44 +336,80 @@ class LibfabricInstallTests(unittest.TestCase):
         }
 
     def test_get_config_resolves_version(self):
-        self.assertEqual(install_libfabric.config_for("libfabric", self._env())["version"], "2.5.0")
+        cfg = install_libfabric.require_config("libfabric", self._env(), "install-libfabric",
+                                               "version", "url", "sha256")
+        self.assertEqual(cfg["version"], "2.5.0")
+
+    _TARBALL = "/tmp/libfabric-2.5.0.tar.bz2"
+    _EXPECTED = [
+        (["tar", "-xf", "/tmp/libfabric-2.5.0.tar.bz2"], "/tmp"),
+        (["/tmp/libfabric-2.5.0/configure", "--prefix=/opt/libfabric", "--disable-psm3"],
+         "/tmp/libfabric-2.5.0"),
+        (["make", "-j", "8"], "/tmp/libfabric-2.5.0"),
+        (["make", "install"], "/tmp/libfabric-2.5.0"),
+    ]
+
+    def _install(self, rcs=None):
+        """Run install() with every command recorded (via exec_program) in order."""
+        commands = []
+        rcs = iter(rcs or [])
+
+        def record(command, op, *, cwd=None, env=None, **_):
+            commands.append((command, cwd))
+            return next(rcs, 0)
+
+        with mock.patch.object(install_libfabric, "fetch_verified",
+                               return_value=self._TARBALL) as dl, \
+             mock.patch("utils.component_config.write_component_version") as wcv, \
+             mock.patch("utils.component_config.log_info"), \
+             mock.patch.object(install_libfabric, "remove_paths") as rm, \
+             mock.patch.object(install_libfabric, "cpu_count", return_value=8), \
+             mock.patch("utils.process.exec_program", side_effect=record):
+            rc = install_libfabric.install(self._env())
+        return rc, commands, dl, wcv, rm
 
     def test_install_runs_all_build_steps(self):
-        env = self._env()
-        with mock.patch.object(install_libfabric, "download_and_verify",
-                               return_value="/tmp/libfabric-2.5.0.tar.bz2") as dl, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
-             mock.patch.object(install_libfabric, "exec_program", return_value=0) as ex, \
-             mock.patch("tarfile.open"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_libfabric.install(env)
+        rc, commands, dl, wcv, rm = self._install()
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        self.assertEqual(ex.call_count, 3)  # configure, make, make install
-        wcv.assert_called_once()
+        dl.assert_called_once_with("https://example/libfabric-2.5.0.tar.bz2", "s",
+                                   "install-libfabric", dest_dir="/tmp")
+        self.assertEqual(commands, self._EXPECTED)
+        wcv.assert_called_once_with("LIBFABRIC", "2.5.0")
+        rm.assert_called_once_with(Path("/tmp/libfabric-2.5.0"), self._TARBALL,
+                                   op="install-libfabric")
 
     def test_install_stops_on_build_failure(self):
-        env = self._env()
-        with mock.patch.object(install_libfabric, "download_and_verify",
-                               return_value="/tmp/libfabric-2.5.0.tar.bz2"), \
-             mock.patch.object(install_libfabric, "exec_program",
-                               side_effect=[0, 1]) as ex, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
-             mock.patch.object(install_libfabric, "log_error") as logged, \
-             mock.patch("tarfile.open"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_libfabric.install(env)
+        rc, commands, _, wcv, rm = self._install(rcs=[0, 0, 1])
         self.assertEqual(rc, 3)
-        self.assertEqual(ex.call_count, 2)  # stopped after make failed
+        self.assertEqual(commands, self._EXPECTED[:3])  # stopped after make failed
         wcv.assert_not_called()
-        logged.assert_called()   # build failure is reported as an error
+        rm.assert_not_called()
+
+    def test_install_stops_on_download_failure(self):
+        with mock.patch.object(install_libfabric, "fetch_verified", return_value=None), \
+             mock.patch("utils.process.exec_program") as ex, \
+             mock.patch("utils.component_config.write_component_version") as wcv:
+            self.assertEqual(install_libfabric.install(self._env()), 3)
+        ex.assert_not_called()
+        wcv.assert_not_called()
+
+    def test_install_fails_when_the_version_cannot_be_recorded(self):
+        with mock.patch.object(install_libfabric, "fetch_verified",
+                               return_value=self._TARBALL), \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=PermissionError("denied")), \
+             mock.patch("utils.component_config.log_error") as logged, \
+             mock.patch.object(install_libfabric, "remove_paths") as rm, \
+             mock.patch("utils.process.exec_program", return_value=0):
+            self.assertEqual(install_libfabric.install(self._env()), 3)
+        self.assertIn("denied", logged.call_args.args[1])
+        rm.assert_not_called()
 
     def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_libfabric, "log_error") as logged:
+        with mock.patch("utils.component_config.log_error") as logged:
             self.assertEqual(
                 install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
-
 
 class IntelLibsInstallTests(unittest.TestCase):
     def _env(self):
@@ -389,37 +430,58 @@ class IntelLibsInstallTests(unittest.TestCase):
 
     def test_get_config_resolves_version(self):
         self.assertEqual(
-            install_intel_libs.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
+            component_config.config_for("intel_one_mkl", self._env())["version"], "2025.3.1.11")
+
+    def _install(self, env, *, rc=0, write_error=None):
+        """install() with the download, commands and cleanup faked."""
+        with mock.patch.object(download_module, "download_and_verify",
+                               return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
+             mock.patch.object(process, "exec_program", return_value=rc) as ex, \
+             mock.patch.object(component_config, "write_component_version",
+                               return_value="/versions", side_effect=write_error) as wcv, \
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(install_intel_libs, "remove_paths") as rm, \
+             mock.patch.object(component_config, "log_error") as config_error:
+            result = install_intel_libs.install(env)
+        return result, dl, ex, wcv, rm, config_error
 
     def test_install_runs_installer(self):
         env = self._env()
-        with mock.patch.object(install_intel_libs, "download_and_verify",
-                               return_value="/tmp/intel-onemkl-2025.3.1.11_offline.sh") as dl, \
-             mock.patch.object(install_intel_libs, "exec_program", return_value=0) as ex, \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv:
-            rc = install_intel_libs.install(env)
+        rc, dl, ex, wcv, rm, _ = self._install(env)
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        ex.assert_called_once()
-        wcv.assert_called_once()
+        dl.assert_called_once_with("https://example/intel-onemkl-2025.3.1.11_offline.sh",
+                                   "s", dest_dir="/tmp")
+        ex.assert_called_once_with(
+            ["sh", "/tmp/intel-onemkl-2025.3.1.11_offline.sh", "-s", "-a", "-s",
+             "--eula", "accept"], "install-intel-libs", cwd=None, env=env)
+        wcv.assert_called_once_with("INTEL_ONE_MKL", "2025.3.1.11")
+        rm.assert_called_once_with("/tmp/intel-onemkl-2025.3.1.11_offline.sh",
+                                   op="install-intel-libs")
 
     def test_install_fails_when_installer_fails(self):
-        env = self._env()
-        with mock.patch.object(install_intel_libs, "download_and_verify",
-                               return_value="/tmp/x.sh"), \
-             mock.patch.object(install_intel_libs, "exec_program", return_value=1), \
-             mock.patch.object(install_intel_libs, "write_component_version") as wcv, \
-             mock.patch.object(install_intel_libs, "log_error") as logged:
-            rc = install_intel_libs.install(env)
+        rc, _, ex, wcv, rm, _ = self._install(self._env(), rc=1)
         self.assertEqual(rc, 3)
+        ex.assert_called_once()     # exec_program logs the failed command
         wcv.assert_not_called()
-        logged.assert_called()   # installer failure is reported as an error
+        rm.assert_not_called()
 
     def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_intel_libs, "log_error") as logged:
-            self.assertEqual(
-                install_intel_libs.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
+        rc, dl, ex, wcv, _, config_error = self._install(
+            {"COMPONENT_VERSIONS": json.dumps({})})
+        self.assertEqual(rc, 3)
+        dl.assert_not_called()
+        ex.assert_not_called()
+        wcv.assert_not_called()
+        config_error.assert_called_once()   # missing version is reported as an error
+
+    def test_install_fails_when_version_cannot_be_recorded(self):
+        rc, _, ex, wcv, rm, config_error = self._install(
+            self._env(), write_error=PermissionError("denied"))
+        self.assertEqual(rc, 3)
+        ex.assert_called_once()
+        wcv.assert_called_once_with("INTEL_ONE_MKL", "2025.3.1.11")
+        config_error.assert_called_once()   # record_version logs the failure
+        rm.assert_not_called()
 
 
 class HpcdiagTests(unittest.TestCase):
@@ -437,24 +499,48 @@ class HpcdiagTests(unittest.TestCase):
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch.object(download_module, "download") as dl, \
              mock.patch("tarfile.open") as taropen, \
-             mock.patch("shutil.copy") as cp, \
-             mock.patch("shutil.rmtree"), \
-             mock.patch("pathlib.Path.mkdir"), \
-             mock.patch("pathlib.Path.unlink"):
+             mock.patch.object(process, "exec_program", return_value=0) as ex, \
+             mock.patch.object(install_hpcdiag, "make_dirs", return_value=True) as mkdir, \
+             mock.patch.object(install_hpcdiag, "copy_file", return_value=True) as cp, \
+             mock.patch.object(install_hpcdiag, "remove_paths") as rm:
             taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        cp.assert_called_once()
+        dl.assert_called_once_with("https://x/tarball/hpcdiag-1", Path("/tmp/hpcdiag-1"))
+        ex.assert_called_once_with(["tar", "-xf", "/tmp/hpcdiag-1"], "install-hpcdiag",
+                                   cwd="/tmp", env={})
+        # bash: mkdir -p $DESTINATION_DIR; cp <script> $DESTINATION_DIR
+        mkdir.assert_called_once_with("/opt/azurehpc/diagnostics", op="install-hpcdiag")
+        cp.assert_called_once_with(
+            Path("/tmp/topdir/Linux/src/gather_azhpc_vm_diagnostics.sh"),
+            "/opt/azurehpc/diagnostics", "install-hpcdiag")
+        rm.assert_called_once_with(Path("/tmp/hpcdiag-1"), Path("/tmp/topdir"),
+                                   op="install-hpcdiag")
+
+    def test_install_fails_when_tar_fails(self):
+        api_json = json.dumps({"tarball_url": "https://x/tarball/hpcdiag-1"}).encode()
+        resp_cm = mock.MagicMock()
+        resp_cm.__enter__.return_value.read.return_value = api_json
+        with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
+             mock.patch.object(download_module, "download"), \
+             mock.patch("tarfile.open") as taropen, \
+             mock.patch.object(process, "exec_program", return_value=2), \
+             mock.patch.object(install_hpcdiag, "copy_file") as cp, \
+             mock.patch.object(install_hpcdiag, "remove_paths") as rm:
+            taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
+            rc = install_hpcdiag.install(env={})
+        self.assertEqual(rc, 3)
+        cp.assert_not_called()
+        rm.assert_not_called()
 
     def test_install_fails_when_no_tarball_url(self):
         api_json = json.dumps({"name": "r1"}).encode()
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch.object(download_module, "download") as dl, \
              mock.patch.object(install_hpcdiag, "log_error") as logged:
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 3)
@@ -503,14 +589,16 @@ class MonitoringToolsTests(unittest.TestCase):
 
     def _install(self, env, *, fail=None, script_mode=0o755, real_configure=False,
                  download_error=None):
-        """Run install(env) with commands faked (also those run by
-        install_packages, in the same record). The fake tar creates
+        """Run install(env) with commands faked where the toolkit runs them
+        (utils.process and utils.package_installer exec_program, one record)
+        and the download faked in utils.download. The fake tar creates
         Moneo/linux_service/configure_service.sh (mode `script_mode`).
         fail: {first word of command: exit code}. Returns (rc, calls, mocks),
         calls being [(command, cwd)]."""
+        from utils import component_config, download, files, process
         fail = fail or {}
         calls = []
-        real_exec = install_monitoring_tools.exec_program
+        real_exec = process.exec_program
 
         def fake_download(url, sha256, dest_dir="."):
             if download_error:
@@ -525,7 +613,8 @@ class MonitoringToolsTests(unittest.TestCase):
             self.assertIs(env, self.env)
             calls.append((command, cwd))
             if command[0] == "tar" and "tar" not in fail:
-                script = os.path.join(cwd, command[-1], "linux_service",
+                dest = command[command.index("-C") + 1]
+                script = os.path.join(cwd, dest, "linux_service",
                                       "configure_service.sh")
                 os.makedirs(os.path.dirname(script))
                 with open(script, "w") as handle:
@@ -536,24 +625,28 @@ class MonitoringToolsTests(unittest.TestCase):
             return fail.get(command[0], 0)
 
         self.env = env
-        with mock.patch.object(install_monitoring_tools, "download_and_verify",
-                               side_effect=fake_download) as download, \
-             mock.patch.object(install_monitoring_tools, "exec_program",
-                               side_effect=fake_exec), \
+        with mock.patch.object(download, "download_and_verify",
+                               side_effect=fake_download) as download_mock, \
+             mock.patch.object(download, "log_error"), \
+             mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
-             mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
+             mock.patch.object(files, "log_info") as files_info, \
+             mock.patch.object(component_config, "write_component_version") as wcv, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_monitoring_tools, "log_info") as info, \
              mock.patch.object(install_monitoring_tools, "log_warn") as warn, \
              mock.patch.object(install_monitoring_tools, "log_error") as error:
             rc = install_monitoring_tools.install(env)
-        return rc, calls, {"download": download, "record": wcv, "info": info,
-                           "warn": warn, "error": error}
+        return rc, calls, {"download": download_mock, "record": wcv, "info": info,
+                           "warn": warn, "error": error, "files_info": files_info,
+                           "config_error": config_error}
 
     def _expected(self, pip):
         return [(pip, None),
-                (["tar", "-xvf", "v0.3.5.tar.gz", "--strip-components=1", "-C", "Moneo"],
+                (["tar", "-xf", "v0.3.5.tar.gz", "-C", "Moneo", "--strip-components=1"],
                  self.tools),
                 (["./configure_service.sh"], self.service_dir)]
 
@@ -572,29 +665,6 @@ class MonitoringToolsTests(unittest.TestCase):
             with self.subTest(distro=distro):
                 self.assertEqual(install_monitoring_tools.pip_package_options(distro),
                                  options)
-
-    def test_ensure_line_matches_grep_qxF(self):
-        line = "alias x='y'"
-        cases = [
-            # (existing content, appended?, final content)
-            (None, True, b"alias x='y'\n"),
-            (b"alias x='y'\n", False, b"alias x='y'\n"),
-            (b"a\nalias x='y'", False, b"a\nalias x='y'"),              # no final newline
-            (b"alias x='y'\r\n", True, b"alias x='y'\r\nalias x='y'\n"),   # grep: \r is part of the line
-            (b"  alias x='y'\n", True, b"  alias x='y'\nalias x='y'\n"),   # -x: whole line
-            (b"last", True, b"lastalias x='y'\n"),                       # echo >> joins, like bash
-        ]
-        for before, appended, after in cases:
-            with self.subTest(before=before):
-                if os.path.exists(self.bashrc):
-                    os.remove(self.bashrc)
-                if before is not None:
-                    with open(self.bashrc, "wb") as handle:
-                        handle.write(before)
-                self.assertIs(install_monitoring_tools.ensure_line(self.bashrc, line),
-                              appended)
-                with open(self.bashrc, "rb") as handle:
-                    self.assertEqual(handle.read(), after)
 
     # ---- install() -------------------------------------------------------------
     def test_install_commands_per_distro(self):
@@ -629,9 +699,9 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tools, "v0.3.5.tar.gz")))  # left, as bash
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")
-        messages = [c.args[1] for c in m["info"].call_args_list]
-        self.assertIn(f"Appended the moneo alias to {self.bashrc}", messages)
-        self.assertIn("Recorded MONEO version 0.3.5", messages)
+        self.assertEqual(m["files_info"].call_args.kwargs,
+                         {"path": self.bashrc, "action": "created"})
+        m["record"].assert_called_once_with("MONEO", "0.3.5")
         self.assertEqual(m["info"].call_args_list[-1].args[1], "Moneo 0.3.5 installed")
 
     def test_rerun_keeps_existing_moneo_dir_without_extracting(self):
@@ -645,8 +715,9 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertEqual(m["warn"].call_args.kwargs, {"path": self.moneo})
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")      # not appended twice
-        self.assertIn(f"{self.bashrc} already has the moneo alias",
-                      [c.args[1] for c in m["info"].call_args_list])
+        # ensure_line logs that the line is there and writes nothing.
+        self.assertEqual([c.args[1] for c in m["files_info"].call_args_list],
+                         [f"{self.bashrc} already has the line"])
 
     @unittest.skipUnless(os.name == "posix", "runs a real script")
     def test_configure_service_runs_from_its_folder_with_the_exec_bit(self):
@@ -690,12 +761,14 @@ class MonitoringToolsTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(calls, [])
                 m["download"].assert_not_called()
-                m["error"].assert_called_once()
+                m["config_error"].assert_called_once()
 
 
 class AznfsTests(unittest.TestCase):
-    """install_aznfs.py. Commands and the download are mocked; the installer
-    is written into a temporary directory (the port's _DOWNLOAD_DIR)."""
+    """install_aznfs.py. Commands (utils.process / utils.package_installer
+    exec_program) and the download (utils.download.download_and_verify) are
+    mocked; the installer is written into a temporary directory (the port's
+    _DOWNLOAD_DIR)."""
 
     _VERSIONS = json.dumps({"aznfs": {"common": {"version": "3.0.12", "sha256": "s"}}})
     _URL = ("https://github.com/Azure/AZNFS-mount/releases/download/3.0.12/"
@@ -708,6 +781,8 @@ class AznfsTests(unittest.TestCase):
                   b"\n"
                   b"YUM yum\n"
                   b"last line yum yum")
+    _APT_INSTALL = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "aznfs"]
+    _DNF_INSTALL = ["dnf", "install", "-y", "aznfs"]
     _PATCHED = (b"dnf install -y yum-utils && yum update\n"
                 b"no match here\n"
                 b"  if command -v dnf; then yum -y install aznfs; fi\n"
@@ -754,56 +829,64 @@ class AznfsTests(unittest.TestCase):
 
         env = {"DISTRIBUTION": distribution, "ARCHITECTURE": "x86_64",
                "COMPONENT_VERSIONS": versions or self._VERSIONS}
-        with mock.patch.object(install_aznfs, "download_and_verify",
+        with mock.patch.object(download_module, "download_and_verify",
                                side_effect=fake_download) as download, \
-             mock.patch.object(install_aznfs, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_aznfs, "log_info") as info, \
              mock.patch.object(install_aznfs, "log_warn") as warn, \
-             mock.patch.object(install_aznfs, "log_error") as error:
+             mock.patch.object(install_aznfs, "log_error") as error, \
+             mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(download_module, "log_error") as download_error_log:
             rc = install_aznfs.install(env)
         for run_env in envs:
             self.assertEqual(run_env["AZNFS_NONINTERACTIVE_INSTALL"], "1")
             self.assertEqual(run_env["DISTRIBUTION"], distribution)
         self.assertNotIn("AZNFS_NONINTERACTIVE_INSTALL", env)    # caller's env untouched
         return rc, commands, {"download": download, "info": info, "warn": warn,
-                              "error": error}
+                              "error": error, "config_error": config_error,
+                              "download_error": download_error_log}
 
     # ---- pure helpers ----------------------------------------------------------
     def test_install_branch(self):
-        cases = {"ubuntu22.04": "apt", "ubuntu24.04": "apt", "ubuntu26.04": "apt",
-                 "almalinux8.10": "dnf", "almalinux9.8": "dnf", "rocky9.8": "dnf",
-                 "rhel9.8": "dnf", "rhel8.10": "dnf", "azurelinux3.0": "installer",
+        cases = {"ubuntu22.04": "pmc", "ubuntu24.04": "pmc", "ubuntu26.04": "pmc",
+                 "almalinux8.10": "pmc", "almalinux9.8": "pmc", "rocky9.8": "pmc",
+                 "rhel9.8": "pmc", "rhel8.10": "pmc", "azurelinux3.0": "installer",
                  "sles15": "installer", "": "installer"}
         for distro, branch in cases.items():
             with self.subTest(distro=distro):
                 self.assertEqual(install_aznfs.install_branch(distro), branch)
 
     def test_sed_replaces_only_the_first_yum_on_each_line(self):
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(self._INSTALLER), (self._PATCHED, 5))
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(b"yum\n"), (b"dnf\n", 1))
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(b""), (b"", 0))
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(self._INSTALLER.decode()),
+                         self._PATCHED.decode())
+        self.assertEqual(install_aznfs.sed_yum_to_dnf("yum\n"), "dnf\n")
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(""), "")
 
     # ---- PMC branches ----------------------------------------------------------
     def test_ubuntu_and_rhel_family_install_from_pmc(self):
-        cases = {"ubuntu24.04": "apt", "ubuntu26.04": "apt", "ubuntu22.04": "apt",
-                 "almalinux9.8": "dnf", "rocky8.10": "dnf", "rhel9.8": "dnf"}
-        for distro, manager in cases.items():
+        # bash's `apt install -y aznfs` runs as install_packages()'s apt-get.
+        cases = {"ubuntu24.04": self._APT_INSTALL, "ubuntu26.04": self._APT_INSTALL,
+                 "ubuntu22.04": self._APT_INSTALL, "almalinux9.8": self._DNF_INSTALL,
+                 "rocky8.10": self._DNF_INSTALL, "rhel9.8": self._DNF_INSTALL}
+        for distro, command in cases.items():
             with self.subTest(distro=distro):
                 rc, commands, m = self._install(distro)
                 self.assertEqual(rc, 0)
-                self.assertEqual(commands, [[manager, "install", "-y", "aznfs"]])
+                self.assertEqual(commands, [command])
                 m["download"].assert_not_called()
                 m["warn"].assert_not_called()
                 m["error"].assert_not_called()
                 self.assertEqual(m["info"].call_args_list[0].kwargs,
-                                 {"distro": distro, "branch": manager,
+                                 {"distro": distro, "branch": "pmc",
                                   "noninteractive": True})
 
     def test_pmc_failure_returns_3(self):
-        rc, commands, m = self._install("ubuntu24.04", rcs={"apt": 100})
+        rc, commands, m = self._install("ubuntu24.04", rcs={"apt-get": 100})
         self.assertEqual(rc, 3)
-        self.assertEqual(commands, [["apt", "install", "-y", "aznfs"]])
-        self.assertEqual(m["error"].call_args.kwargs["exit_code"], 100)
+        self.assertEqual(commands, [self._APT_INSTALL])
+        m["error"].assert_not_called()       # install_packages logs the failure
 
     # ---- installer branch ------------------------------------------------------
     def test_azurelinux_runs_the_patched_installer_and_removes_it(self):
@@ -816,8 +899,6 @@ class AznfsTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.script))           # rm -f aznfs_install.sh
         m["warn"].assert_not_called()
         m["error"].assert_not_called()
-        messages = [c.args[1] for c in m["info"].call_args_list]
-        self.assertIn(f"Removed {self.script}", messages)
         patched = [c for c in m["info"].call_args_list if c.args[1].startswith("Patched ")]
         self.assertEqual(patched[0].kwargs["lines_changed"], 5)
 
@@ -848,14 +929,14 @@ class AznfsTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, [])
                 m["download"].assert_not_called()
-                m["error"].assert_called_once()
+                m["config_error"].assert_called_once()
 
     def test_download_failure_returns_3(self):
         rc, commands, m = self._install("azurelinux3.0",
                                         download_error=OSError("404"))
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertIn("download/verify", m["error"].call_args.args[1])
+        self.assertEqual(m["download_error"].call_args.kwargs["url"], self._URL)
 
 
 if __name__ == "__main__":

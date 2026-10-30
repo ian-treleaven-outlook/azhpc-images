@@ -2,12 +2,12 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_packages, configured_ref, patch_path,
-    build_script) are tested directly. configured_ref was also compared with
-    real jq/bash in WSL on the same configs.
-  * install() is tested with exec_program (the module's and
-    utils.package_installer's, which runs the dependency installs) replaced
-    by one fake that records each command and imitates its effect on disk: `git clone` creates the source
+  * The pure helpers (dependency_packages, patch_path) are tested directly.
+    (configured_ref is utils.repo_source's; test_toolkit covers it.)
+  * install() is tested with exec_program (in utils.process, behind run and
+    run_script, and in utils.package_installer, which runs the dependency
+    installs) replaced by one fake that records each command and imitates its
+    effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvloom_cli binary. The
     install paths (_DEST_DIR, _WORK_DIR) point into a temporary directory, so
     the real file moves and cleanup run without touching /opt or /tmp, and
@@ -30,8 +30,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvloom
-from utils import package_installer
+from utils import component_config, files, package_installer, process, repo_source
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 _OP = "install-nvloom"
 _URL = "https://github.com/NVIDIA/nvloom.git"
@@ -54,6 +55,14 @@ _UBUNTU_PACKAGES = [
 _AZL_DEPS = [["dnf", "install", "-y", *p] for p in _AZL_PACKAGES]
 _UBUNTU_DEPS = [["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", *p]
                 for p in _UBUNTU_PACKAGES]
+# The one-shell build run_script() runs (bash's trailing `module unload` is
+# dropped: the shell exits).
+_BUILD_SCRIPT = ("set -e\n"
+                 "source /etc/profile.d/modules.sh\n"
+                 "module load mpi/hpcx\n"
+                 'cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc '
+                 '-DCMAKE_CUDA_ARCHITECTURES="100" .\n'
+                 "make -j $(nproc)\n")
 
 
 class _FakeExec:
@@ -125,24 +134,14 @@ def _env(distribution, sandbox, *, config=None, node_type=None):
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
     def test_dependency_packages_follow_bash_distro_tests(self):
-        packages = install_nvloom.dependency_packages
+        def packages(name):
+            return install_nvloom.dependency_packages(Distro(name))
         self.assertEqual(list(packages("azurelinux3.0")), _AZL_PACKAGES)
         self.assertEqual(list(packages("ubuntu24.04")), _UBUNTU_PACKAGES)
         self.assertEqual(list(packages("ubuntu22.04")), _UBUNTU_PACKAGES)
         for other in ("almalinux9.8", "rocky8.10", "azurelinux3.1", ""):
             with self.subTest(distribution=other):
-                self.assertIsNone(install_nvloom.dependency_packages(other))
-
-    def test_configured_ref_follows_jq_and_bash_defaults(self):
-        ref = install_nvloom.configured_ref
-        self.assertEqual(ref({}, "1.2.0"), "v1.2.0")
-        self.assertEqual(ref({"ref": "v9"}, "1.2.0"), "v9")
-        self.assertEqual(ref({"ref": "v9", "branch": "main"}, "1.2.0"), "v9")
-        self.assertEqual(ref({"branch": "main"}, "1.2.0"), "main")
-        self.assertEqual(ref({"ref": None, "branch": "main"}, "1.2.0"), "main")
-        self.assertEqual(ref({"ref": False, "branch": "main"}, "1.2.0"), "main")
-        # jq keeps "" (it hides branch); bash's ${REF:-...} then defaults it.
-        self.assertEqual(ref({"ref": "", "branch": "main"}, "1.2.0"), "v1.2.0")
+                self.assertIsNone(packages(other))
 
     def test_bash_script_still_matches(self):
         script = (_REPO_ROOT / "components" / "install_nvloom.sh").read_text(encoding="utf-8")
@@ -172,16 +171,12 @@ class HelperTests(unittest.TestCase):
     def test_the_patch_exists_in_this_repo(self):
         self.assertTrue(os.path.isfile(install_nvloom.patch_path(str(_REPO_ROOT))))
 
-    def test_build_script_loads_hpcx_then_builds_in_one_shell(self):
-        self.assertEqual(install_nvloom.build_script().splitlines(), [
-            "set -e",
-            "source /etc/profile.d/modules.sh",
-            "module load mpi/hpcx",
-            'cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc '
-            '-DCMAKE_CUDA_ARCHITECTURES="100" .',
-            "make -j $(nproc)",
-            "module unload mpi/hpcx",
-        ])
+    def test_build_lines_match_both_bash_branches(self):
+        script = (_REPO_ROOT / "components" / "install_nvloom.sh").read_text(encoding="utf-8")
+        for line in install_nvloom._BUILD_LINES:
+            with self.subTest(line=line):
+                self.assertEqual(script.count(f"    {line}\n"), 2)
+        self.assertIn("module load mpi/hpcx\n", script)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,27 +207,34 @@ class InstallTests(unittest.TestCase):
 
         with mock.patch.object(install_nvloom, "_DEST_DIR", str(self.box.dest)), \
              mock.patch.object(install_nvloom, "_WORK_DIR", str(self.box.work)), \
-             mock.patch.object(install_nvloom, "exec_program", side_effect=fake), \
+             mock.patch.object(process, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as self.pkg_error, \
              mock.patch.object(install_nvloom, "write_repo_source_info",
                                side_effect=fake_source), \
-             mock.patch.object(install_nvloom, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_nvloom, "log_info") as self.log_info, \
-             mock.patch.object(install_nvloom, "log_error") as log_error:
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(files, "log_info"), \
+             mock.patch.object(repo_source, "log_info"), \
+             mock.patch.object(component_config, "log_error") as log_error, \
+             mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(repo_source, "log_error", log_error), \
+             mock.patch.object(install_nvloom, "log_error", log_error):
             rc = install_nvloom.install(env)
         return rc, fake, record, log_error
 
     def _expected_build_calls(self, *, with_patch, ref="v1.2.0", commit=_COMMIT):
         source = str(self.box.work / "nvloom")
-        calls = [(["git", "clone", _URL, "--branch", ref], str(self.box.work)),
+        # git_clone() puts --branch first; bash has `git clone <url> --branch <ref>`.
+        calls = [(["git", "clone", "--branch", ref, _URL], str(self.box.work)),
                  (["git", "checkout", commit], source),
                  (("repo_source", "NVLOOM", commit, ref), source)]
         if with_patch:
             calls.append((["git", "apply", str(self.box.patch)], source))
-        calls.append((["bash", "-c", install_nvloom.build_script()], source))
+        calls.append((["bash", "-c", _BUILD_SCRIPT], source))
         return calls
 
     # ---- success paths -----------------------------------------------------
@@ -391,9 +393,11 @@ class InstallTests(unittest.TestCase):
                 self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.box.dest / "nvloom_cli").exists())
                 record.assert_not_called()
-                # install_packages() logs a failing dependency install itself.
-                errors = self.pkg_error if fail_at < 3 else log_error
-                errors.assert_called_once()
+                # A failed command is logged where it ran: by install_packages()
+                # for the dependencies, else by exec_program (faked here).
+                if fail_at < 3:
+                    self.pkg_error.assert_called_once()
+                log_error.assert_not_called()
 
     def test_clone_without_an_nvloom_directory_returns_3(self):
         rc, fake, record, log_error = self._install(

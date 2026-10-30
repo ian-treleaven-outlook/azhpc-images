@@ -10,6 +10,9 @@ natively in Python**, matching upstream `Azure/azhpc-images@0c2b8f9` (October
 2026; see §12). Other distros get their plans in ADO 992–997.
 Before them, the bootstrap makes `utils/set_properties.sh`'s system changes
 (`utils/system_prep.py`: apt upgrade, jq, ...) and runs `install_utils.sh`.
+The October 2026 clarity pass (ADO 1001) moved every port onto the shared
+toolkit (§4): 28% less code, no function over 40 lines, and no port
+re-implementing a toolkit job.
 Each bash script is kept as that step's fallback and parity reference: delete a
 Step's `action=`, or mark it `resync=`, and it runs the bash script again.
 
@@ -167,19 +170,77 @@ Four rules, all load-bearing:
 
 ## 4. The toolkit
 
-Everything you need exists. Use these rather than rolling your own.
+A port says **what** it does; the toolkit knows **how**. Everything below is
+shared, tested, and logs consistently, so use it rather than rolling your own.
+If a port needs the same small job twice, or two ports need it once, it
+belongs here.
 
-| Helper | Import from | Signature |
+| Job | Use | From |
 |---|---|---|
-| Resolve a component's config | `utils.component_config` | `config_for(component, env)` |
-| Record installed version | `utils.component_config` | `write_component_version(component, version)` |
-| Download + SHA256 verify | `utils.download` | `download_and_verify(url, sha256, dest_dir=".") -> Path` |
-| Run an external command | `utils.process` | `exec_program(command: list[str], op, *, cwd=None, env=None) -> int` |
-| Run and capture stdout | `utils.process` | `run_capture(command: list[str], op, *, cwd=None, env=None) -> tuple[int, str]` |
-| Install distro packages | `utils.package_installer` | `PackageInstaller().install_package(packages) -> bool` |
-| Pin packages against dnf updates (bash `dnf_pin_packages`) | `utils.package_pinning` | `dnf_pin_packages(packages, op, env=None) -> bool` |
-| SKU network mode / IPoIB (bash `sku_network_mode`, `sku_uses_ipoib`) | `utils.sku` | `sku_network_mode(sku, node_type)`, `sku_uses_ipoib(sku, node_type)`, `sku_uses_ucx(sku)` |
-| Logging | `utils.logger` | `log_info(op, msg)` · `log_warn(op, msg)` · `log_error(op, msg)` · `log_debug(op, msg)` · `log_error_detail(op, msg, detail)` |
+| Read a component's config, failing clearly if keys are missing | `require_config(component, env, op, "version", "sha256")` → dict or None | `utils.component_config` |
+| Read a config without required keys | `config_for(component, env)` | `utils.component_config` |
+| Record an installed version | `record_version(component, version, op)` → bool | `utils.component_config` |
+| Record a git checkout's commit/ref | `write_repo_source_info(component, repo_dir, op, commit=, ref=)` | `utils.repo_source` |
+| Clone at a ref, check out a commit; resolve `.ref // .branch // v<version>` | `git_clone(url, op, ref=, commit=, dest=, cwd=)` → dir or None; `configured_ref(cfg, version)` | `utils.repo_source` |
+| Which distro is this? | `Distro.from_env(env)` → `.is_ubuntu`, `.is_azurelinux`, `.is_rhel_family`, `.is_rpm`, `.major` | `utils.distro` |
+| Install distro packages | `install_packages(packages, env, op, options=, cwd=)` → bool | `utils.package_installer` |
+| Refresh / remove / upgrade packages; installed version | `refresh_package_index(env, op)`, `remove_packages(pkgs, env, op, purge=)`, `update_packages(pkgs, env, op)`, `installed_package_version(pkg, env, op)` | `utils.package_installer` |
+| Pin packages against dnf updates | `dnf_pin_packages(packages, op, env=)` → bool | `utils.package_pinning` |
+| Download + SHA256 verify | `fetch_verified(url, sha256, op, dest_dir)` → Path or None | `utils.download` |
+| Download with no checksum (only where bash has none) | `fetch(url, op, dest_dir)` → Path or None | `utils.download` |
+| Unpack a tarball (with `tar`, like bash) | `extract_tarball(tarball, op, dest=, strip_components=, cwd=)` → bool | `utils.files` |
+| Write a file (`cat >`, `>>`), logging created/replaced/appended | `write_file(path, text, op, mode=, append=)` → bool | `utils.files` |
+| `rm -rf` | `remove_paths(*paths, op=)` | `utils.files` |
+| `mkdir -p`, `rm -rf && mkdir -p`, `mktemp -d`, `touch` | `make_dirs(*paths, op=)`, `fresh_dir(path, op)`, `make_temp_dir(op)`, `touch(path, op)` | `utils.files` |
+| `cp`, `cp <glob> <dir>`, `mv`, `ln -s[f]` | `copy_file(src, dest, op, mode=)`, `copy_files(pattern, dir, op)`, `move_file(src, dest, op)`, `symlink(target, link, op, force=)` | `utils.files` |
+| `sed -i` (keeps line endings and bytes); `grep -qxF ... \|\| echo ... >>` | `edit_file(path, transform, op, create=)`; `ensure_line(path, line, op)`, `file_has_line(path, line)` | `utils.files` |
+| Run a command / several, stopping at the first failure | `run(command, op, cwd=, env=)`, `run_all(commands, op, ...)` → bool | `utils.process` |
+| Run lines in one shell (e.g. after `module load`) | `run_script(lines, op, modules=["mpi/hpcx"], cwd=)` → bool | `utils.process` |
+| Run and parse stdout | `run_capture(command, op, ...)` → (rc, stdout) | `utils.process` |
+| `command -v`, `$(command -v x)`, `$(nproc)` | `command_exists(name, env)`, `command_path(name, env)`, `cpu_count()` | `utils.process` |
+| systemd | `systemctl(verb, *units, op=)`, `service_is_active(unit, op=)` | `utils.services` |
+| DKMS module check (bash `check_dkms_status`) | `check_dkms_status(module, op, ...)` | `utils.dkms` |
+| SKU capabilities | `sku_has_infiniband`, `sku_network_mode`, `sku_uses_ipoib`, `sku_family` | `utils.sku` |
+| Logging | `log_info(op, msg, **fields)` · `log_warn` · `log_error` · `log_debug` · `log_error_detail` | `utils.logger` |
+
+### What a good port looks like
+
+The port exists to make the build easier to read and change than the bash it
+replaces. Matching bash's *behaviour* is required; copying its *structure*
+line by line is a failure, even if the tests pass.
+
+1. **`install()` reads like a summary.** A short sequence of named steps,
+   each a small function or a toolkit call:
+
+   ```python
+   def install(env):
+       distro = Distro.from_env(env)
+       cfg = require_config("mpifileutils", env, _OP, "version", "url", "sha256")
+       if cfg is None:
+           return 3
+       if not install_packages(_DEPS[distro.family], env, _OP):
+           return 3
+       ...
+   ```
+
+2. **Distro differences are data, decided once.** A table keyed by distro
+   (package lists, repo names, paths) and one `Distro` lookup, not the same
+   `if ubuntu / elif ...` repeated through the module.
+3. **No private copies of toolkit jobs.** No module-level `_run`, `_run_all`,
+   `_write`, `_command_exists`; no hand-built `apt`/`dnf`/`systemctl`/`tar`
+   commands. If the toolkit lacks something, add it there, with tests.
+4. **Small functions with one job** (roughly 40 lines at most), named for what
+   they do. A long function is a sign two steps are hiding in one.
+5. **Pure helpers for text.** Parsing and file contents are functions of their
+   inputs (`dkms_conf(version) -> str`), tested directly.
+6. **Docstrings describe; they don't transcribe.** Say what the step does, how
+   it fits, deliberate differences and kept bash quirks. Point to the bash file
+   instead of pasting it; quote only the lines a reader needs to compare.
+7. **Comments explain why**, especially for anything kept for parity that
+   looks odd. Don't narrate what the code plainly says.
+8. **Errors are logged once**, by whoever knows most. Toolkit helpers log
+   their own failures; the port adds context only when it has some, then
+   returns 3.
 
 ---
 
@@ -369,37 +430,33 @@ read it first.
 
 ```python
 def install(env: dict[str, str]) -> int:
-    # 1. resolve config; bail cleanly if the component isn't in versions.json
-    cfg = config_for("intel_one_mkl", env)
-    if not cfg or not cfg.get("version"):
-        log_error("install-intel-libs",
-                  "could not resolve intel_one_mkl version from versions.json")
+    """Download and run the Intel oneAPI MKL offline installer. Returns 0 or 3."""
+    cfg = require_config("intel_one_mkl", env, _OP, "version", "url", "sha256")
+    if cfg is None:
         return 3
     version = cfg["version"]
+    log_info(_OP, "Installing Intel oneAPI MKL", version=version, source=cfg["url"])
 
-    log_info("install-intel-libs", f"Installing Intel oneAPI MKL {version}")
-
-    # 2. download + verify — always guarded
-    try:
-        installer = download_and_verify(cfg.get("url", ""), cfg.get("sha256", ""),
-                                        dest_dir="/tmp")
-    except Exception as exc:
-        log_error("install-intel-libs", f"download/verify failed: {exc}")
+    installer = fetch_verified(cfg["url"], cfg["sha256"], _OP, _WORK_DIR)
+    if installer is None:
         return 3
-
-    # 3. run the vendor installer; check the return code explicitly
-    rc = exec_program([...], "install-intel-libs", env=env)
-    if rc != 0:
-        log_error("install-intel-libs", f"installer failed with exit code {rc}")
+    if not run(["sh", str(installer), "-s", "-a", "-s", "--eula", "accept"],
+               _OP, env=env):
         return 3
+    if not record_version("INTEL_ONE_MKL", version, _OP):
+        return 3
+    remove_paths(installer, op=_OP)
 
-    # 4. record what we installed
-    write_component_version("INTEL_ONE_MKL", version)
+    log_info(_OP, "Intel oneAPI MKL installed", version=version)
     return 0
 ```
 
+Every line says *what* happens; the toolkit handles *how* — checking the
+config keys, downloading and verifying, running the command, writing the
+versions file — and logs any failure, so the port only returns 3.
+
 That shape — *resolve → download → execute → record → clean up* — covers most
-remaining scripts.
+components.
 
 **When yours is harder, study these:**
 
@@ -445,7 +502,7 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **1089 tests, ~standard library only** — `unittest` and
+The suite is **1166 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
 the test environment and skip themselves when those tools are missing.
 

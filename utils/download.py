@@ -76,3 +76,34 @@ def download_and_verify(url, sha256, dest_dir=".") -> Path:
         raise ChecksumError(f"SHA256 verification failed for {dest}")
 
     return dest
+
+
+def fetch_verified(url, sha256, op: str, dest_dir=".") -> Path | None:
+    """download_and_verify() for ports: the file's Path, or None on failure.
+
+    Network errors, file errors and checksum mismatches are logged as an ERROR
+    under the step's `op` label (with the URL), so the caller only checks for
+    None and returns 3, instead of wrapping each download in try/except.
+    """
+    try:
+        return download_and_verify(url, sha256, dest_dir=dest_dir)
+    except (OSError, ValueError, ChecksumError) as exc:   # ValueError: malformed URL
+        log_error(op, f"download of {url} failed: {exc}", url=url)
+        return None
+
+
+def fetch(url, op: str, dest_dir=".") -> Path | None:
+    """Download `url` into `dest_dir` with no checksum: the Path, or None (logged).
+
+    Only for files bash also downloads unverified (e.g. GitHub source
+    tarballs, which have no published checksum). Prefer fetch_verified().
+    """
+    dest_dir = Path(dest_dir)
+    dest = dest_dir / Path(url).name
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        download(url, dest)
+    except (OSError, ValueError) as exc:
+        log_error(op, f"download of {url} failed: {exc}", url=url)
+        return None
+    return dest

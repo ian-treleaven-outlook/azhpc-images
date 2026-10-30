@@ -30,13 +30,14 @@ Deliberate differences
 ----------------------
   * install_packages() runs `apt-get install -y -o Dpkg::Use-Pty=0 ...`
     (the documented normalisation; same packages, same single command).
+  * write_file() creates /etc/modprobe.d if it is missing, where `tee`
+    would fail (it always exists on these images).
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from utils.logger import log_error, log_info
+from utils.files import write_file
+from utils.logger import log_info
 from utils.package_installer import install_packages
 
 RDMA_CORE_PACKAGES = ["rdma-core", "libibverbs-dev", "ibverbs-utils",
@@ -54,22 +55,12 @@ def install_rdma_core(env: dict[str, str]) -> int:
     log_info(op, "Installing rdma-core for a no-RDMA SKU (kernel-native IB "
                  "modules, mana_ib support)",
              sku=env.get("SKU", ""), packages=" ".join(RDMA_CORE_PACKAGES))
-    if not install_packages(RDMA_CORE_PACKAGES, env, op):
-        return 3
-    return 0
+    return 0 if install_packages(RDMA_CORE_PACKAGES, env, op) else 3
 
 
 def blacklist_mana_ib(env: dict[str, str]) -> int:
     """Write the mana_ib modprobe blacklist. 0, or 3 on failure."""
     op = "blacklist-mana-ib"
-    path = Path(BLACKLIST_FILE)
-    action = "replaced" if path.exists() else "created"
-    try:
-        path.write_text(BLACKLIST_TEXT, encoding="utf-8")
-    except OSError as exc:
-        log_error(op, f"could not write {path}: {exc}", path=str(path))
-        return 3
-    log_info(op, f"Wrote {path} ({action}): mana_ib exposes a non-functional "
-                 "verbs device on MANA-only hardware",
-             path=str(path), action=action, sku=env.get("SKU", ""))
-    return 0
+    log_info(op, "Blacklisting mana_ib: it exposes a non-functional verbs device "
+                 "on MANA-only hardware", sku=env.get("SKU", ""))
+    return 0 if write_file(BLACKLIST_FILE, BLACKLIST_TEXT, op) else 3

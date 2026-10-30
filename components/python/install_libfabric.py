@@ -1,78 +1,65 @@
 """install_libfabric.py — Python port of components/install_libfabric.sh.
 
-Resolve the version, download + verify the source, extract it, build it with
-configure/make, and record the version. Unlike mpifileutils, libfabric needs no
-`module load`, so the build steps run as individual commands via exec_program —
-no bash subprocess required.
+On non-InfiniBand SKUs (NCv6) libfabric replaces UCX as MPI's network layer.
+This step resolves libfabric's version, url and sha256 from versions.json,
+downloads and verifies the source tarball, builds it into /opt/libfabric with
+configure/make, and records LIBFABRIC's version. No `module load` is needed,
+so each build command runs on its own rather than in one shell.
+
+Deliberate differences from the bash
+------------------------------------
+  * The tarball is downloaded and unpacked in /tmp (bash uses its cwd), and
+    the source tree and tarball are removed afterwards (bash leaves them).
+  * `tar -xvf` becomes `tar -xf` (extract_tarball; -v only printed names).
+  * A missing version, url or sha256 fails the step up front; bash's `jq -r`
+    would carry on with "null".
+  * `make -j$(nproc)` takes its job count from cpu_count() (the same
+    CPU-affinity count nproc prints).
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import tarfile
 from pathlib import Path
 
-from utils.component_config import config_for, write_component_version
-from utils.download import download_and_verify
-from utils.process import exec_program
-from utils.logger import log_info, log_error
+from utils.component_config import record_version, require_config
+from utils.download import fetch_verified
+from utils.files import extract_tarball, remove_paths
+from utils.logger import log_info
+from utils.process import cpu_count, run_all
 
+_OP = "install-libfabric"
 _WORK_DIR = "/tmp"
 _INSTALL_PREFIX = "/opt/libfabric"
 
 
-def install(env: dict[str, str]) -> int:
-    """Download, build, and install libfabric into /opt/libfabric.
-
-    Returns 0 on success, 3 on failure.
-    """
-    cfg = config_for("libfabric", env)
-    if not cfg or not cfg.get("version"):
-        log_error("install-libfabric",
-                  "could not resolve libfabric version from versions.json")
-        return 3
-    version = cfg["version"]
-    url = cfg.get("url", "")
-    sha256 = cfg.get("sha256", "")
-
-    log_info("install-libfabric", f"Installing libfabric {version}")
-
-    # 1. download + verify
-    try:
-        tarball = download_and_verify(url, sha256, dest_dir=_WORK_DIR)
-    except Exception as exc:
-        log_error("install-libfabric", f"download/verify failed: {exc}")
-        return 3
-
-    # 2. extract (tarfile auto-detects the .tar.bz2 compression)
-    with tarfile.open(tarball) as archive:
-        archive.extractall(_WORK_DIR, filter="data")
-    folder = Path(_WORK_DIR) / Path(tarball).name.removesuffix(".tar.bz2")
-
-    # 3. build — tcp/verbs/shm providers; disable psm3 (hangs on MANA-only
-    #    systems). No module load is needed, so each step is its own command.
-    build_steps = [
-        [str(folder / "configure"), f"--prefix={_INSTALL_PREFIX}", "--disable-psm3"],
-        ["make", "-j", str(os.cpu_count() or 1)],
+def build_commands(source_dir: Path, jobs: int) -> list[list[str]]:
+    """configure/make/make install, with psm3 disabled: it hangs on MANA-only systems."""
+    return [
+        [str(source_dir / "configure"), f"--prefix={_INSTALL_PREFIX}", "--disable-psm3"],
+        ["make", "-j", str(jobs)],
         ["make", "install"],
     ]
-    for cmd in build_steps:
-        rc = exec_program(cmd, "install-libfabric", cwd=str(folder), env=env)
-        if rc != 0:
-            log_error("install-libfabric",
-                      f"build step failed: {' '.join(cmd)} (exit code {rc})")
-            return 3
 
-    # 4. record the installed version
-    write_component_version("LIBFABRIC", version)
 
-    # 5. cleanup
-    shutil.rmtree(folder, ignore_errors=True)
-    try:
-        Path(tarball).unlink()
-    except OSError:
-        pass
+def install(env: dict[str, str]) -> int:
+    """Download, build and install libfabric into /opt/libfabric. 0, or 3 on failure."""
+    cfg = require_config("libfabric", env, _OP, "version", "url", "sha256")
+    if cfg is None:
+        return 3
+    version = cfg["version"]
+    log_info(_OP, f"Installing libfabric {version}", version=version, source=cfg["url"])
 
-    log_info("install-libfabric", f"libfabric {version} installed to {_INSTALL_PREFIX}")
+    tarball = fetch_verified(cfg["url"], cfg["sha256"], _OP, dest_dir=_WORK_DIR)
+    if tarball is None or not extract_tarball(tarball, _OP, cwd=_WORK_DIR):
+        return 3
+    # bash: LIBFABRIC_FOLDER=$(basename $URL .tar.bz2)
+    source_dir = Path(_WORK_DIR) / Path(tarball).name.removesuffix(".tar.bz2")
+    if not run_all(build_commands(source_dir, cpu_count()), _OP,     # make -j$(nproc)
+                   cwd=str(source_dir), env=env):
+        return 3
+
+    if not record_version("LIBFABRIC", version, _OP):
+        return 3
+    remove_paths(source_dir, tarball, op=_OP)
+    log_info(_OP, f"libfabric {version} installed to {_INSTALL_PREFIX}", version=version)
     return 0

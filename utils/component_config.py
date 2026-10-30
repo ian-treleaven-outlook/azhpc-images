@@ -38,6 +38,8 @@ import os
 import re
 from pathlib import Path
 
+from utils.logger import log_error, log_info
+
 # The deployment targets bash understands (utils/set_properties.sh documents
 # them, and packer/variables.pkr.hcl validates against the same list). They are
 # also the keys used for node-type overrides in versions.json.
@@ -152,6 +154,60 @@ def config_for(component, env):
         sku=env.get("SKU"),
         node_type=env.get("TARGET_NODE_TYPE", DEFAULT_NODE_TYPE),
     )
+
+
+def record_version(component, version, op) -> bool:
+    """write_component_version() for ports: True, or False with the error logged.
+
+    Records `component` = `version` in /opt/azurehpc/component_versions.txt
+    (bash write_component_version) and logs it, so a port doesn't need its own
+    try/except around the file write.
+    """
+    try:
+        path = write_component_version(component, version)
+    except OSError as exc:
+        log_error(op, f"could not record {component} {version}: {exc}",
+                  component=component, version=version)
+        return False
+    log_info(op, f"Recorded {component} {version}", component=component,
+             version=version, path=str(path))
+    return True
+
+
+def require_config(component, env, op, *keys):
+    """config_for(), checking that `keys` are present: the config, or None (logged).
+
+    Bash reads each field with `jq -r '.key'`, which prints "null" or nothing
+    for a missing key and carries on (Problem 2 in docs/porting-guide.md). A
+    port asks for the keys it needs instead:
+
+        cfg = require_config("nccl", env, _OP, "version", "sha256")
+        if cfg is None:
+            return 3
+
+    A key counts as missing if it is absent, null or empty. Dotted keys reach
+    into nested objects ("driver.version"). The ERROR names the component,
+    the missing keys and the distro/SKU it was resolved for.
+    """
+    cfg = config_for(component, env)
+    missing = [key for key in keys if _lookup(cfg, key) in (None, "", "null")]
+    if cfg is None or missing:
+        log_error(op, f"versions.json has no usable '{component}' config"
+                      + (f": missing {', '.join(missing)}" if cfg is not None else ""),
+                  component=component, missing=", ".join(missing or keys),
+                  distribution=env.get("DISTRIBUTION", ""), sku=env.get("SKU", ""))
+        return None
+    return cfg
+
+
+def _lookup(cfg, dotted_key):
+    """cfg["a"]["b"] for "a.b"; None if any part is missing."""
+    node = cfg
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
 
 def write_component_version(component, version, path=_VERSIONS_FILE):
     """Record an installed component's version.

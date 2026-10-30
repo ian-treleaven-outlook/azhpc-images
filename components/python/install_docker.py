@@ -1,139 +1,54 @@
 """install_docker.py — Python port of components/install_docker.sh.
 
-What this step does
--------------------
-Installs Docker, using Microsoft's build of it ("moby"), and starts the docker
-service. On NVIDIA images it also installs the NVIDIA Container Toolkit, so
-containers can use the GPUs, and checks that containerd came back up. Finally
-it records two versions in the component-versions file:
+Installs Microsoft's Docker build ("moby"), starts the docker service and, on
+NVIDIA images, installs the NVIDIA Container Toolkit and waits for containerd
+to come back. Records DOCKER (`docker --version`, e.g. "29.1.4") and
+MOBY_ENGINE (the installed moby-engine package, e.g. "29.1.4-ubuntu24.04u1").
 
-  * DOCKER       from `docker --version`        e.g. "29.1.4"
-  * MOBY_ENGINE  the installed moby-engine package version
-                 e.g. "29.1.4-ubuntu24.04u1" (Ubuntu)
+Packages, one install command each, as in bash (_MOBY_PACKAGES):
 
-The packages differ per distro family:
+  * Ubuntu: moby-engine, moby-cli, moby-buildx. On baremetal_3p nodes,
+    moby-engine=<V> and moby-cli=<V> pinned to versions.json "moby", no
+    buildx. Ubuntu 26.04 (any node type) has no moby packages: one
+    `apt-get install docker.io docker-buildx`, and MOBY_ENGINE records the
+    docker.io version (bash `dpkg-query -W -f='${Version}' docker.io`, here
+    installed_package_version()).
+  * Azure Linux: moby-engine, moby-cli, docker-buildx.
+  * RHEL family (and, as bash's else branch, anything else): moby-engine,
+    moby-cli, moby-buildx.
 
-  * Ubuntu        apt-get install moby-engine, moby-cli, moby-buildx.
-                  On baremetal_3p nodes (TARGET_NODE_TYPE), instead install
-                  moby-engine=<V> and moby-cli=<V>, pinned to the "moby"
-                  version in versions.json, and no buildx.
-                  Ubuntu 26.04 (any node type) no longer has Microsoft's moby
-                  packages: one `apt-get install -y docker.io docker-buildx`
-                  (Canonical's Docker), and MOBY_ENGINE records the docker.io
-                  package version (`dpkg-query -W -f='${Version}' docker.io`).
-  * Azure Linux   dnf install moby-engine, moby-cli, docker-buildx.
-  * RHEL family   (AlmaLinux, Rocky, RHEL) dnf install moby-engine, moby-cli,
-                  moby-buildx.
+The toolkit is still the bash component install_nvidia_container_toolkit.sh,
+run with the build env as install_docker.sh runs it. GPU unset or empty
+counts as NVIDIA (bash's ${GPU:-NVIDIA}); AMD images get Docker only.
 
-The original bash, for comparison (comments trimmed):
-
-    INSTALL_NVIDIA_CONTAINER_TOOLKIT=false
-    if [[ "${GPU:-NVIDIA}" == "NVIDIA" ]]; then
-        INSTALL_NVIDIA_CONTAINER_TOOLKIT=true
-    fi
-
-    if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
-        if [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
-            apt-get install -y docker.io docker-buildx
-        elif [[ "${TARGET_NODE_TYPE:-azure_vm_regular}" == "baremetal_3p" ]]; then
-            moby_metadata=$(get_component_config "moby")
-            MOBY_VERSION=$(jq -r '.version' <<< $moby_metadata)
-            apt-get install -y moby-engine=${MOBY_VERSION}
-            apt-get install -y moby-cli=${MOBY_VERSION}
-        else
-            apt-get install -y moby-engine
-            apt-get install -y moby-cli
-            apt-get install -y moby-buildx
-        fi
-    elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
-        dnf install -y moby-engine
-        dnf install -y moby-cli
-        dnf install -y docker-buildx
-    else
-        dnf install -y moby-engine
-        dnf install -y moby-cli
-        dnf install -y moby-buildx
-    fi
-
-    if [[ "$INSTALL_NVIDIA_CONTAINER_TOOLKIT" == true ]]; then
-        $COMPONENT_DIR/install_nvidia_container_toolkit.sh
-    fi
-
-    systemctl enable docker
-    systemctl restart docker
-
-    if [[ "$INSTALL_NVIDIA_CONTAINER_TOOLKIT" == true ]]; then
-        systemctl restart containerd
-        for i in $(seq 1 30); do
-            if [ -S /run/containerd/containerd.sock ]; then
-                break
-            fi
-            echo "Waiting for containerd socket... ($i/30)"
-            sleep 1
-        done
-        ctr plugin ls
-    fi
-
-    docker_version=$(docker --version | awk -F' ' '{print $3}')
-    write_component_version "DOCKER" ${docker_version::-1}
-
-    if [[ $DISTRIBUTION == ubuntu* ]]; then
-        if [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
-            moby_version=$(dpkg-query -W -f='${Version}' docker.io)
-        else
-            moby_version=$(apt list --installed | grep moby-engine | awk -F' ' '{print $2}')
-        fi
-    elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
-        moby_version=$(rpm -qa | grep moby | cut -d'-' -f3,4)
-    else
-        moby_version=$(dnf list installed | grep moby-engine | awk -F' ' '{print $2}')
-    fi
-    write_component_version "MOBY_ENGINE" ${moby_version}
-
-Note the two different Ubuntu tests, mirrored here: the install uses
-*"ubuntu"* ("contains"), the version lookup uses ubuntu* ("starts with").
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"install-docker" Step. Deleting `action=` from that Step makes the build run the
-bash script again, which is why the .sh file is kept.
-
-install() receives the build environment (a dict) and returns 0 for success or
-3 for failure. It logs problems and never lets an exception escape.
-
-The NVIDIA Container Toolkit is a separate component with its own bash script
-(components/install_nvidia_container_toolkit.sh). It is still run as bash, with
-the same environment, exactly as install_docker.sh runs it.
-
-Like install.sh, build_plan runs this step for every vendor. On AMD images it
-installs Docker without the NVIDIA container toolkit, exactly as bash does.
+utils/plans/steps.py makes install() the action of the "install-docker" Step;
+deleting `action=` runs the bash again.
 
 Deliberate differences from bash
 --------------------------------
-  * An empty or unparseable DOCKER or MOBY_ENGINE version fails (returns 3)
-    instead of being recorded. Bash records "" for an empty moby version (and
-    stops with a "substring expression" error for an empty docker version).
-  * A failing `docker --version`, `apt list`, `rpm -qa` or `dnf list` fails the
-    step. Bash, without `set -o pipefail`, ignores the exit code of the first
-    command in a pipeline and parses whatever it printed. (Ubuntu 26.04's
-    `dpkg-query` is not in a pipeline, so it stops bash too.)
-  * A missing "moby" version in versions.json on baremetal_3p fails up front.
-    Bash would run `apt-get install -y moby-engine=null`, which fails anyway.
-  * The "Waiting for containerd socket" lines are logged at DEBUG, and a socket
-    that never appears is logged as a warning. Like bash, it does not fail the
-    step by itself (the following `ctr plugin ls` usually will).
-  * Package installs go through install_packages(), one call per bash command:
-    `apt-get install -y -o Dpkg::Use-Pty=0 ...` / `dnf install -y ...` (the
-    documented normalisation). On a distribution it doesn't know, bash's else
-    branch would try dnf; install_packages() logs an error and returns 3.
+  * An empty or unparseable DOCKER or MOBY_ENGINE version fails the step
+    (bash records "" or stops on `${v::-1}` of an empty string), and so does
+    a failing `docker --version`, `apt list`, `rpm -qa` or `dnf list` (bash
+    has no pipefail, so it parses whatever they printed).
+  * A missing "moby" version on Ubuntu baremetal_3p fails before installing
+    (bash runs `apt-get install moby-engine=null`, which fails anyway).
+  * The containerd socket wait logs at DEBUG and warns if the socket never
+    appears; like bash, that alone doesn't fail the step.
+  * Packages install through install_packages (`apt-get install -y -o
+    Dpkg::Use-Pty=0` / `dnf install -y`). On an unknown distro bash's else
+    branch would try dnf; install_packages fails instead.
+  * Distro tests use Distro: bash's `*"ubuntu"*` (install) and `ubuntu*`
+    (version) tests and `== azurelinux3.0` become is_ubuntu / family (the
+    same for every distro built).
 
-Bash's unquoted ${moby_version} is split into words, and write_component_version
-records only its first argument. When several lines match (e.g. on Azure Linux
-`rpm -qa | grep moby` lists moby-engine, moby-cli, moby-containerd, ...), only
-the first word is recorded. The parse helpers below reproduce that; they were
-compared against real grep/awk/cut in bash. Bash would also glob-expand such a
-word; versions never contain *, ? or [, so that is not reproduced.
+Kept bash quirks
+----------------
+  * `write_component_version "X" ${value}` is unquoted, so only the first
+    word is recorded (first_word()). On Azure Linux `rpm -qa | grep moby`
+    matches every moby-* package and the first listed wins, which may not be
+    moby-engine (warned). The parsers were compared with real grep/awk/cut.
+  * `${docker_version::-1}` trims the last character of the whole capture,
+    not of each line.
 """
 
 from __future__ import annotations
@@ -142,159 +57,117 @@ import os
 import re
 import stat
 import time
+from functools import partial
 
-from utils.component_config import DEFAULT_NODE_TYPE, config_for, write_component_version
+from utils.component_config import DEFAULT_NODE_TYPE, record_version, require_config
+from utils.distro import Distro
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.package_installer import install_packages
-from utils.process import exec_program, run_capture
+from utils.package_installer import install_packages, installed_package_version
+from utils.process import run, run_capture
+from utils.services import systemctl
 
-# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-docker"
 
-# The only distro handled by the Azure Linux branch (an exact match, as in bash).
-_AZURE_LINUX = "azurelinux3.0"
-
-# Ubuntu 26.04 installs Canonical's docker.io instead of moby (an exact match,
-# checked before the baremetal_3p test, as in bash).
+# Canonical's docker.io instead of moby, checked before baremetal_3p as in bash.
 _UBUNTU_DOCKER_IO = "ubuntu26.04"
+_UBUNTU_DOCKER_IO_PACKAGES = ["docker.io", "docker-buildx"]     # one command
 
-# The node type whose Ubuntu moby packages are pinned to a versions.json version.
+# Ubuntu nodes whose moby is pinned to versions.json.
 _BAREMETAL_3P = "baremetal_3p"
+_UBUNTU_PINNED_PACKAGES = ["moby-engine", "moby-cli"]
 
-# The socket containerd creates once it is ready, and how long bash waits for
-# it: up to 30 checks, sleeping 1 second after each failed check.
-# Module-level so the tests can point it at a temporary directory.
+# By distro family; each package is its own install command, as in bash.
+_MOBY_PACKAGES = {
+    "ubuntu": ["moby-engine", "moby-cli", "moby-buildx"],
+    "azurelinux": ["moby-engine", "moby-cli", "docker-buildx"],
+    "rhel": ["moby-engine", "moby-cli", "moby-buildx"],
+}
+
+# bash: up to 30 `[ -S socket ]` checks, sleeping 1s after each miss.
+# Module-level so the tests can point it at a temporary folder.
 _CONTAINERD_SOCKET = "/run/containerd/containerd.sock"
 _SOCKET_WAIT_TRIES = 30
 _SOCKET_WAIT_SECONDS = 1
 
-# The nested component script that installs the NVIDIA Container Toolkit.
 _TOOLKIT_SCRIPT = "install_nvidia_container_toolkit.sh"
 
-# Packages per distro family, in bash's order. Each package is installed by its
-# own command, as in bash (so one failure names one package).
-_UBUNTU_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
-_UBUNTU_PINNED_PACKAGES = ["moby-engine", "moby-cli"]          # baremetal_3p
-# Ubuntu 26.04: both packages in ONE apt-get command, as in bash.
-_UBUNTU_DOCKER_IO_PACKAGES = ["docker.io", "docker-buildx"]
-_AZURE_LINUX_PACKAGES = ["moby-engine", "moby-cli", "docker-buildx"]
-_RHEL_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
-
-# What bash's default word splitting (and awk's default field splitting) treats
-# as separators: spaces, tabs and newlines. Python's str.split() would also
-# split on a few other characters (\r, \f, \v), so we use an explicit pattern.
+# Bash word splitting and awk's default fields split on these only
+# (str.split() would also split on \r, \f and \v).
 _BLANKS = re.compile(r"[ \t\n]+")
 
 
 # --------------------------------------------------------------------------- #
-# Pure helpers: they only transform strings, so tests call them directly.
+# Pure helpers
 # --------------------------------------------------------------------------- #
 def _lines(output: str) -> list[str]:
-    """Split command output into lines the way grep/awk/cut see them.
-
-    split("\\n") (not splitlines()) because these tools only break on "\\n".
-    A final newline ends the last line; it does not start an empty extra one.
-    """
+    """Lines as grep/awk/cut see them: split on "\\n" only, no empty last line."""
     if not output:
         return []
     lines = output.split("\n")
     if output.endswith("\n"):
-        lines.pop()          # drop the "" after the last newline
+        lines.pop()
     return lines
 
 
 def _awk_field(line: str, number: int) -> str:
-    """awk's $<number> with the default field separator ("" if missing).
-
-    awk -F' ' is the same as awk's default: split on runs of blanks, ignoring
-    leading and trailing ones.
-    """
-    # A list comprehension filters out the "" pieces that leading/trailing
-    # blanks would leave behind.
+    """awk's $<number> with the default separator ("" if missing)."""
     fields = [field for field in _BLANKS.split(line) if field]
     return fields[number - 1] if len(fields) >= number else ""
 
 
 def first_word(text: str) -> str | None:
-    """The first word of an unquoted bash expansion, or None if there is none.
-
-    `write_component_version "X" ${value}` splits ${value} into words, and the
-    function records only the first one ($2). Empty words disappear entirely.
-    """
+    """The first word of an unquoted bash expansion, or None if there is none."""
     words = [word for word in _BLANKS.split(text) if word]
     return words[0] if words else None
 
 
 def docker_version(output: str) -> str | None:
-    """The DOCKER version from `docker --version` output.
+    """DOCKER from `docker --version` output.
 
-    Mirrors:
         docker_version=$(docker --version | awk -F' ' '{print $3}')
         write_component_version "DOCKER" ${docker_version::-1}
 
-    e.g. "Docker version 29.1.4, build 0e5a6ab"  ->  $3 "29.1.4,"  ->  "29.1.4"
-
-    ${v::-1} drops the last character of the whole captured text (normally the
-    comma after the version). Returns None if nothing is left, where bash would
-    fail ("substring expression < 0") or record an empty value.
+    "Docker version 29.1.4, build 0e5a6ab" -> "29.1.4,"  -> "29.1.4".
     """
-    # awk prints one line per input line; $(...) then removes trailing newlines.
+    # $(...) strips trailing newlines; ${v::-1} then drops one character.
     captured = "\n".join(_awk_field(line, 3) for line in _lines(output)).rstrip("\n")
     if not captured:
         return None
-    # A slice like captured[:-1] means "all but the last character", like ${v::-1}.
     return first_word(captured[:-1])
 
 
 def grep_awk_version(output: str, pattern: str) -> str | None:
-    """Mirrors `... | grep <pattern> | awk -F' ' '{print $2}'` + first_word().
+    """`... | grep <pattern> | awk -F' ' '{print $2}'`, first word.
 
-    Used for the moby-engine version on Ubuntu (`apt list --installed`) and the
-    RHEL family (`dnf list installed`), e.g.
-        "moby-engine/now 29.1.4-ubuntu24.04u1 amd64 [installed,local]"
-            ->  "29.1.4-ubuntu24.04u1"
-        "moby-engine.x86_64   28.5.1-1.el9   @packages-microsoft-com-prod"
-            ->  "28.5.1-1.el9"
-
-    `pattern` is a fixed string here ("moby-engine" has no regex characters
-    that matter), so a plain substring test matches grep.
+        "moby-engine/now 29.1.4-ubuntu24.04u1 amd64 [installed,local]"  (apt)
+        "moby-engine.x86_64   28.5.1-1.el9   @packages-microsoft-com-prod" (dnf)
     """
     values = [_awk_field(line, 2) for line in _lines(output) if pattern in line]
     return first_word("\n".join(values))
 
 
+def _cut_fields_3_4(line: str) -> str:
+    """`cut -d'-' -f3,4` on one line (a line without "-" passes through)."""
+    if "-" not in line:
+        return line
+    return "-".join(line.split("-")[2:4])
+
+
 def rpm_moby_version(output: str) -> str | None:
-    """Mirrors `rpm -qa | grep moby | cut -d'-' -f3,4` + first_word().
+    """`rpm -qa | grep moby | cut -d'-' -f3,4`, first word.
 
-    e.g. "moby-engine-25.0.3-11.azl3.x86_64"  ->  "25.0.3-11.azl3.x86_64"
-
-    cut keeps fields 3 and 4 (joined by "-"), prints an empty line when a line
-    has fewer fields, and prints a line with no "-" at all unchanged.
-
-    Bash quirk, mirrored: every installed package whose name contains "moby"
-    matches (moby-engine, moby-cli, moby-containerd, moby-runc, ...), and only
-    the first in rpm's listing order is recorded, which need not be moby-engine.
+    "moby-engine-25.0.3-11.azl3.x86_64" -> "25.0.3-11.azl3.x86_64". Every
+    moby-* package matches, and the first one rpm lists wins.
     """
     values = [_cut_fields_3_4(line) for line in _lines(output) if "moby" in line]
     return first_word("\n".join(values))
 
 
-def _cut_fields_3_4(line: str) -> str:
-    """`cut -d'-' -f3,4` applied to one line (see rpm_moby_version)."""
-    if "-" not in line:
-        return line
-    fields = line.split("-")
-    # fields[2:4] is the 3rd and 4th fields (Python counts from 0); a
-    # slice past the end just returns fewer items, never an error.
-    return "-".join(fields[2:4])
-
-
 def rpm_moby_source_line(output: str) -> str | None:
-    """The `rpm -qa` line that rpm_moby_version() takes its value from.
+    """The `rpm -qa` line rpm_moby_version() takes its value from.
 
-    That is the first line containing "moby" whose cut result is not blank
-    (blank results vanish in bash's word splitting). Used to warn when the
-    recorded MOBY_ENGINE value really belongs to another moby-* package.
+    The first "moby" line whose cut result isn't blank (blank results vanish
+    in bash's word splitting).
     """
     for line in _lines(output):
         if "moby" in line and first_word(_cut_fields_3_4(line)) is not None:
@@ -302,226 +175,174 @@ def rpm_moby_source_line(output: str) -> str | None:
     return None
 
 
-def moby_version_command(distribution: str) -> list[str]:
-    """The command whose output holds the installed moby-engine version
-    (docker.io's on Ubuntu 26.04)."""
-    # startswith() mirrors bash's ubuntu* pattern (the install uses "contains").
-    if distribution.startswith("ubuntu"):
-        if distribution == _UBUNTU_DOCKER_IO:
-            # Python passes '${Version}' to dpkg-query literally, as bash's
-            # single quotes do; dpkg-query fills it in.
-            return ["dpkg-query", "-W", "-f=${Version}", "docker.io"]
-        return ["apt", "list", "--installed"]
-    if distribution == _AZURE_LINUX:
-        return ["rpm", "-qa"]
-    return ["dnf", "list", "installed"]
+_apt_or_dnf_moby_version = partial(grep_awk_version, pattern="moby-engine")
+
+# How each family reports the installed moby-engine version: (command, parser).
+_MOBY_VERSION_QUERY = {
+    "ubuntu": (["apt", "list", "--installed"], _apt_or_dnf_moby_version),
+    "azurelinux": (["rpm", "-qa"], rpm_moby_version),
+    "rhel": (["dnf", "list", "installed"], _apt_or_dnf_moby_version),
+}
 
 
-def parse_moby_version(distribution: str, output: str) -> str | None:
-    """Parse the output of moby_version_command(distribution)."""
-    if distribution == _AZURE_LINUX:
-        return rpm_moby_version(output)
-    if distribution == _UBUNTU_DOCKER_IO:
-        # dpkg-query prints just the version (no newline); bash's unquoted
-        # ${moby_version} keeps its first word.
-        return first_word(output)
-    # Ubuntu and the RHEL family use the same grep | awk '{print $2}' pipeline.
-    return grep_awk_version(output, "moby-engine")
+def moby_version_query(distro: Distro):
+    """(command, parser) for the installed moby-engine version."""
+    return _MOBY_VERSION_QUERY.get(distro.family, _MOBY_VERSION_QUERY["rhel"])
 
 
 def wants_container_toolkit(env: dict[str, str]) -> bool:
-    """True when the NVIDIA Container Toolkit is installed.
-
-    Mirrors [[ "${GPU:-NVIDIA}" == "NVIDIA" ]]: an unset or empty GPU counts as
-    NVIDIA. `or` returns its right side when the left side is "" or None.
-    """
+    """bash's [[ "${GPU:-NVIDIA}" == "NVIDIA" ]] (unset or empty is NVIDIA)."""
     return (env.get("GPU") or "NVIDIA") == "NVIDIA"
 
 
 # --------------------------------------------------------------------------- #
-# Small helpers with side effects.
+# Steps: each returns a result, or False/None after the failure was logged.
 # --------------------------------------------------------------------------- #
-def _run_all(commands: list[list[str]], env: dict[str, str]) -> bool:
-    """Run commands in order, stopping at the first failure (like `set -e`)."""
-    for command in commands:
-        if exec_program(command, _OP, env=env) != 0:
-            return False
-    return True
-
-
-def _is_socket(path: str) -> bool:
-    """bash's `[ -S path ]`: True if `path` exists and is a Unix socket."""
-    try:
-        # os.stat() follows symlinks, like test -S.
-        return stat.S_ISSOCK(os.stat(path).st_mode)
-    except OSError:          # it doesn't exist (or can't be inspected)
-        return False
-
-
-def _wait_for_containerd_socket() -> int | None:
-    """Wait like bash for containerd's socket. Returns the seconds waited, or
-    None if it never appeared (bash then carries on regardless)."""
-    for attempt in range(1, _SOCKET_WAIT_TRIES + 1):
-        if _is_socket(_CONTAINERD_SOCKET):
-            return attempt - 1
-        log_debug(_OP, f"Waiting for containerd socket... ({attempt}/{_SOCKET_WAIT_TRIES})")
-        time.sleep(_SOCKET_WAIT_SECONDS)
-    return None
-
-
-def _moby_installs(env: dict[str, str]) -> list[list[str]] | None:
-    """The package lists to install for this distro/node type, one list per
-    bash install command, or None (logged) if the baremetal_3p moby version is
-    missing from versions.json."""
-    distribution = env.get("DISTRIBUTION", "")
-    # Mirrors ${TARGET_NODE_TYPE:-azure_vm_regular}: unset or empty -> default.
+def _moby_installs(env: dict[str, str], distro: Distro) -> list[list[str]] | None:
+    """The package lists to install, one per bash install command."""
     node_type = env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
-
-    if "ubuntu" in distribution:
-        if distribution == _UBUNTU_DOCKER_IO:
-            log_info(_OP, "Ubuntu 26.04: installing Canonical's docker.io and "
-                          "docker-buildx (no Microsoft moby packages), on every "
-                          "node type", distro=distribution, node_type=node_type,
-                     packages="docker.io docker-buildx")
-            return [list(_UBUNTU_DOCKER_IO_PACKAGES)]
-        if node_type == _BAREMETAL_3P:
-            cfg = config_for("moby", env)
-            # isinstance() guards against a config that isn't a JSON object.
-            if not isinstance(cfg, dict) or not cfg.get("version"):
-                log_error(_OP, "could not resolve moby version from versions.json "
-                               "(required on baremetal_3p)",
-                          distro=distribution, node_type=node_type)
-                return None
-            moby = str(cfg["version"])
-            log_info(_OP, "Ubuntu baremetal_3p: pinning moby-engine and moby-cli "
-                          "to the versions.json version (no moby-buildx)",
-                     distro=distribution, node_type=node_type, moby_version=moby)
-            return [[f"{package}={moby}"] for package in _UBUNTU_PINNED_PACKAGES]
-        log_info(_OP, "Ubuntu: installing the latest moby-engine, moby-cli and "
-                      "moby-buildx from apt", distro=distribution, node_type=node_type)
-        return [[package] for package in _UBUNTU_PACKAGES]
-
-    if distribution == _AZURE_LINUX:
-        packages = _AZURE_LINUX_PACKAGES
-        branch = "Azure Linux"
-    else:  # RHEL family: AlmaLinux, Rocky Linux, RHEL, etc.
-        packages = _RHEL_PACKAGES
-        branch = "RHEL family"
-    log_info(_OP, f"{branch}: installing {', '.join(packages)} from dnf",
-             distro=distribution)
+    if distro.name == _UBUNTU_DOCKER_IO:
+        log_info(_OP, "Ubuntu 26.04: installing Canonical's docker.io and "
+                      "docker-buildx (no Microsoft moby packages), on every "
+                      "node type", distro=str(distro), node_type=node_type,
+                 packages="docker.io docker-buildx")
+        return [list(_UBUNTU_DOCKER_IO_PACKAGES)]
+    if distro.is_ubuntu and node_type == _BAREMETAL_3P:
+        cfg = require_config("moby", env, _OP, "version")
+        if cfg is None:
+            return None
+        moby = str(cfg["version"])
+        log_info(_OP, "Ubuntu baremetal_3p: pinning moby-engine and moby-cli "
+                      "to the versions.json version (no moby-buildx)",
+                 distro=str(distro), node_type=node_type, moby_version=moby)
+        return [[f"{package}={moby}"] for package in _UBUNTU_PINNED_PACKAGES]
+    packages = _MOBY_PACKAGES.get(distro.family, _MOBY_PACKAGES["rhel"])
+    log_info(_OP, f"Installing {', '.join(packages)}", distro=str(distro),
+             family=distro.family, node_type=node_type)
     return [[package] for package in packages]
 
 
-def _record(component: str, version: str) -> bool:
-    """Write one entry to the component-versions file; False (logged) on error."""
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}",
-                  component=component, version=version)
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Orchestrator.
-# --------------------------------------------------------------------------- #
-def install(env: dict[str, str]) -> int:
-    """Install moby/Docker (+ the NVIDIA Container Toolkit on NVIDIA), start
-    the services, and record the DOCKER and MOBY_ENGINE versions. Returns 0 or 3.
-    """
-    distribution = env.get("DISTRIBUTION", "")
-    toolkit = wants_container_toolkit(env)
-    gpu = env.get("GPU") or "NVIDIA"
-    log_info(_OP, "Installing Docker (moby)", distro=distribution, gpu=gpu,
-             node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE,
-             container_toolkit=toolkit)
-
-    # ---- 1. moby packages ----------------------------------------------------
-    installs = _moby_installs(env)
-    if installs is None:
-        return 3                 # already logged by _moby_installs
-    for packages in installs:
-        if not install_packages(packages, env, _OP):
-            log_error(_OP, "moby package installation failed", distro=distribution)
-            return 3
-
-    # ---- 2. NVIDIA Container Toolkit (nested bash component) -----------------
-    if toolkit:
-        log_info(_OP, "Installing the NVIDIA Container Toolkit (GPU is NVIDIA)",
-                 gpu=gpu, script=_TOOLKIT_SCRIPT)
-        script = os.path.join(env.get("COMPONENT_DIR", ""), _TOOLKIT_SCRIPT)
-        if exec_program([script], _OP, env=env) != 0:
-            log_error(_OP, "NVIDIA Container Toolkit installation failed", script=script)
-            return 3
-    else:
+def _install_container_toolkit(env: dict[str, str], gpu: str) -> bool:
+    """The nested bash component, on NVIDIA images only."""
+    if not wants_container_toolkit(env):
         log_info(_OP, f"Skipping the NVIDIA Container Toolkit (GPU is {gpu}, "
                       "not NVIDIA)", gpu=gpu)
+        return True
+    log_info(_OP, "Installing the NVIDIA Container Toolkit (GPU is NVIDIA)",
+             gpu=gpu, script=_TOOLKIT_SCRIPT)
+    return run([os.path.join(env.get("COMPONENT_DIR", ""), _TOOLKIT_SCRIPT)], _OP, env=env)
 
-    # ---- 3. services ---------------------------------------------------------
-    log_info(_OP, "Enabling and restarting the docker service", service="docker")
-    if not _run_all([["systemctl", "enable", "docker"],
-                     ["systemctl", "restart", "docker"]], env):
-        log_error(_OP, "could not enable/restart the docker service", service="docker")
-        return 3
 
-    if toolkit:
-        log_info(_OP, "Restarting containerd to load the NVIDIA runtime config",
-                 service="containerd")
-        if exec_program(["systemctl", "restart", "containerd"], _OP, env=env) != 0:
-            log_error(_OP, "could not restart the containerd service",
-                      service="containerd")
-            return 3
-        waited = _wait_for_containerd_socket()
-        if waited is None:
-            log_warn(_OP, f"containerd socket did not appear after "
-                          f"{_SOCKET_WAIT_TRIES} checks; continuing like bash",
-                     socket=_CONTAINERD_SOCKET, waited_s=_SOCKET_WAIT_TRIES)
-        else:
-            log_info(_OP, f"containerd socket ready after {waited}s",
-                     socket=_CONTAINERD_SOCKET, waited_s=waited)
-        # Lists containerd's plugins (including snapshotters) into the log.
-        if exec_program(["ctr", "plugin", "ls"], _OP, env=env) != 0:
-            log_error(_OP, "`ctr plugin ls` failed; containerd is not usable",
-                      socket=_CONTAINERD_SOCKET)
-            return 3
+def _is_socket(path: str) -> bool:
+    """bash's `[ -S path ]` (follows symlinks)."""
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
 
-    # ---- 4. versions ---------------------------------------------------------
+
+def _wait_for_containerd_socket() -> None:
+    """bash's 30 x 1s wait for the socket; logs the outcome, never fails."""
+    for attempt in range(1, _SOCKET_WAIT_TRIES + 1):
+        if _is_socket(_CONTAINERD_SOCKET):
+            log_info(_OP, f"containerd socket ready after {attempt - 1}s",
+                     socket=_CONTAINERD_SOCKET, waited_s=attempt - 1)
+            return
+        log_debug(_OP, f"Waiting for containerd socket... ({attempt}/{_SOCKET_WAIT_TRIES})")
+        time.sleep(_SOCKET_WAIT_SECONDS)
+    log_warn(_OP, f"containerd socket did not appear after {_SOCKET_WAIT_TRIES} "
+                  "checks; continuing like bash",
+             socket=_CONTAINERD_SOCKET, waited_s=_SOCKET_WAIT_TRIES)
+
+
+def _restart_containerd(env: dict[str, str]) -> bool:
+    """NVIDIA: restart containerd for the runtime config, wait, list plugins."""
+    log_info(_OP, "Restarting containerd to load the NVIDIA runtime config",
+             service="containerd")
+    if not systemctl("restart", "containerd", op=_OP, env=env):
+        return False
+    _wait_for_containerd_socket()
+    # Lists containerd's (snapshotter) plugins into the log.
+    return run(["ctr", "plugin", "ls"], _OP, env=env)
+
+
+def _record_docker_version(env: dict[str, str]) -> str | None:
     rc, output = run_capture(["docker", "--version"], _OP, env=env)
     docker = docker_version(output) if rc == 0 else None
     if docker is None:
-        log_error(_OP, f"could not determine the docker version from "
+        log_error(_OP, "could not determine the docker version from "
                        f"`docker --version`: {output.strip()!r}", exit_code=rc)
-        return 3
-    if not _record("DOCKER", docker):
-        return 3
+        return None
+    return docker if record_version("DOCKER", docker, _OP) else None
 
-    command = moby_version_command(distribution)
-    rc, output = run_capture(command, _OP, env=env)
-    moby = parse_moby_version(distribution, output) if rc == 0 else None
-    log_debug(_OP, f"`{' '.join(command)}` output:\n{output}")
-    if moby is None:
-        log_error(_OP, f"could not determine the installed moby-engine version "
-                       f"from `{' '.join(command)}`", distro=distribution, exit_code=rc)
-        return 3
-    if distribution == _UBUNTU_DOCKER_IO:
+
+def _docker_io_version(env: dict[str, str]) -> str | None:
+    """Ubuntu 26.04's MOBY_ENGINE value: the installed docker.io version."""
+    version = installed_package_version("docker.io", env, _OP)
+    if version is not None:
         log_info(_OP, "Ubuntu 26.04: MOBY_ENGINE records the docker.io package "
-                      "version, as bash does", package="docker.io", version=moby)
-    if distribution == _AZURE_LINUX:
-        # BASH QUIRK (kept for parity): `rpm -qa | grep moby` matches every
-        # moby-* package, and the first one listed wins. If that isn't
-        # moby-engine, MOBY_ENGINE gets e.g. moby-containerd's version.
+                      "version, as bash does", package="docker.io", version=version)
+    return version
+
+
+def _moby_engine_version(env: dict[str, str], distro: Distro) -> str | None:
+    """The installed moby-engine version, parsed from the family's package listing."""
+    command, parse = moby_version_query(distro)
+    rc, output = run_capture(command, _OP, env=env)
+    log_debug(_OP, f"`{' '.join(command)}` output:\n{output}")
+    moby = parse(output) if rc == 0 else None
+    if moby is None:
+        log_error(_OP, "could not determine the installed moby-engine version "
+                       f"from `{' '.join(command)}`", distro=str(distro), exit_code=rc)
+        return None
+    if distro.is_azurelinux:
         source = rpm_moby_source_line(output) or ""
         if not source.startswith("moby-engine-"):
             log_warn(_OP, "MOBY_ENGINE is taken from the first `rpm -qa | grep "
                           "moby` match, which is not moby-engine; recording its "
                           "version anyway, like bash",
                      matched_package=source, version=moby)
-    if not _record("MOBY_ENGINE", moby):
+    return moby
+
+
+def _record_moby_version(env: dict[str, str], distro: Distro) -> str | None:
+    if distro.name == _UBUNTU_DOCKER_IO:
+        moby = _docker_io_version(env)
+    else:
+        moby = _moby_engine_version(env, distro)
+    return moby if moby is not None and record_version("MOBY_ENGINE", moby, _OP) else None
+
+
+def install(env: dict[str, str]) -> int:
+    """Install moby/Docker (+ the NVIDIA Container Toolkit on NVIDIA), start
+    the services, and record the DOCKER and MOBY_ENGINE versions."""
+    distro = Distro.from_env(env)
+    gpu = env.get("GPU") or "NVIDIA"
+    toolkit = wants_container_toolkit(env)
+    log_info(_OP, "Installing Docker (moby)", distro=str(distro), gpu=gpu,
+             node_type=env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE,
+             container_toolkit=toolkit)
+
+    installs = _moby_installs(env, distro)
+    if installs is None:
+        return 3
+    if not all(install_packages(packages, env, _OP) for packages in installs):
+        return 3
+    if not _install_container_toolkit(env, gpu):
+        return 3
+    log_info(_OP, "Enabling and restarting the docker service", service="docker")
+    if not (systemctl("enable", "docker", op=_OP, env=env)
+            and systemctl("restart", "docker", op=_OP, env=env)):
+        return 3
+    if toolkit and not _restart_containerd(env):
         return 3
 
-    log_info(_OP, "Docker installed", distro=distribution, docker_version=docker,
+    docker = _record_docker_version(env)
+    if docker is None:
+        return 3
+    moby = _record_moby_version(env, distro)
+    if moby is None:
+        return 3
+    log_info(_OP, "Docker installed", distro=str(distro), docker_version=docker,
              moby_engine_version=moby, container_toolkit=toolkit)
     return 0
