@@ -2,12 +2,13 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_packages, configured_ref, configured_commit,
-    build_script) are tested directly. configured_ref/configured_commit were
+  * The pure helpers (dependency_packages, configured_ref, configured_commit)
+    are tested directly. configured_ref/configured_commit were
     also compared with real jq/bash in WSL on the same configs.
-  * install() is tested with exec_program (the module's and
-    utils.package_installer's, which runs the dependency installs) replaced
-    by one fake that records each command and imitates its effect on disk: `git clone` creates the source
+  * install() is tested with exec_program (in utils.process, behind run and
+    run_script, and in utils.package_installer, which runs the dependency
+    installs) replaced by one fake that records each command and imitates
+    its effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvbandwidth binary.
     write_repo_source_info is mocked and recorded in the same list, so the
     order is checked. The install paths (_DEST_DIR, _WORK_DIR) point into a
@@ -31,8 +32,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvbandwidth_tool as m
-from utils import package_installer
+from utils import component_config, package_installer, process
 from utils.build_config import BuildConfig, build_plan
+from utils.distro import Distro
 
 _OP = "install-nvbandwidth"
 _URL = "https://github.com/NVIDIA/nvbandwidth"
@@ -50,6 +52,12 @@ _DNF = ["dnf", "install", "-y"]
 _UBUNTU_DEPS = [[*_APT, *p] for p in _UBUNTU_PACKAGES]
 _DNF_BOOST = [[*_DNF, *p] for p in _DNF_BOOST_PACKAGES]
 _AZL_ARM_DEPS = [[*_DNF, *p] for p in _AZL_ARM_PACKAGES]
+# The one-shell build run_script() runs: HPC-X loaded, then cmake and make.
+_BUILD_SCRIPT = ("set -e\n"
+                 "source /etc/profile.d/modules.sh\n"
+                 "module load mpi/hpcx\n"
+                 "cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DMULTINODE=1 .\n"
+                 "make\n")
 
 
 class _FakeExec:
@@ -102,7 +110,8 @@ def _env(distribution="ubuntu24.04", arch="aarch64", *, config=None, node_type=N
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
     def test_dependency_packages_follow_bash_branches(self):
-        deps = m.dependency_packages
+        def deps(name, arch):
+            return m.dependency_packages(Distro(name), arch)
         self.assertEqual(list(deps("ubuntu24.04", "aarch64")), _UBUNTU_PACKAGES)
         self.assertEqual(list(deps("ubuntu26.04", "x86_64")), _UBUNTU_PACKAGES)
         self.assertEqual(list(deps("almalinux9.8", "x86_64")), _DNF_BOOST_PACKAGES)
@@ -129,14 +138,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(m.configured_commit({"commit": None}), "")
         self.assertEqual(m.configured_commit({"commit": False}), "")
 
-    def test_build_script_loads_hpcx_then_builds_in_one_shell(self):
-        self.assertEqual(m.build_script().splitlines(), [
-            "set -e",
-            "source /etc/profile.d/modules.sh",
-            "module load mpi/hpcx",
-            "cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DMULTINODE=1 .",
-            "make",
-        ])
+    def test_build_lines_match_the_bash_script(self):
+        script = (_REPO_ROOT / "components" / "install_nvbandwidth_tool.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("module load mpi/hpcx\n" + "\n".join(m._BUILD_LINES) + "\n", script)
 
     def test_bash_script_still_matches(self):
         script = (_REPO_ROOT / "components" / "install_nvbandwidth_tool.sh").read_text(
@@ -199,7 +204,7 @@ class InstallTests(unittest.TestCase):
 
         with mock.patch.object(m, "_DEST_DIR", str(self.dest)), \
              mock.patch.object(m, "_WORK_DIR", str(self.work)), \
-             mock.patch.object(m, "exec_program", side_effect=fake), \
+             mock.patch.object(process, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
@@ -208,7 +213,8 @@ class InstallTests(unittest.TestCase):
                                side_effect=write_error) as record, \
              mock.patch.object(m, "log_info") as log_info, \
              mock.patch.object(m, "log_warn") as log_warn, \
-             mock.patch.object(m, "log_error") as log_error:
+             mock.patch.object(component_config, "log_error") as log_error, \
+             mock.patch.object(m, "log_error", log_error):
             rc = m.install(env)
         return rc, fake, {"record": record, "info": log_info, "warn": log_warn,
                           "error": log_error, "pkg_error": pkg_error}
@@ -218,7 +224,7 @@ class InstallTests(unittest.TestCase):
         if commit:
             calls.append((["git", "checkout", commit], self.source))
         calls += [(("repo_source", "NVBANDWIDTH", commit or None, ref), self.source),
-                  (["bash", "-c", m.build_script()], self.source)]
+                  (["bash", "-c", _BUILD_SCRIPT], self.source)]
         return calls
 
     @staticmethod
@@ -327,8 +333,11 @@ class InstallTests(unittest.TestCase):
                 self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.dest / "nvbandwidth").exists())
                 mocks["record"].assert_not_called()
-                # install_packages() logs a failing dependency install itself.
-                mocks["pkg_error" if fail_at < 2 else "error"].assert_called_once()
+                # A failed command is logged where it ran: by install_packages()
+                # for the dependencies, else by exec_program (faked here).
+                if fail_at < 2:
+                    mocks["pkg_error"].assert_called_once()
+                mocks["error"].assert_not_called()
 
     def test_repo_source_failure_returns_3(self):
         for result in (False, PermissionError("denied")):
