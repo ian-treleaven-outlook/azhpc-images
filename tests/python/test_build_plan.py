@@ -284,6 +284,37 @@ class GatingTests(unittest.TestCase):
                                     f"{base / step.script} does not exist")
 
 
+# The inline cleanup in install.sh, run word for word from the distro folder.
+class CleanupTests(unittest.TestCase):
+    def test_script_is_install_sh_text_word_for_word(self):
+        self.assertIn(build_config._CLEANUP_SCRIPT, _INSTALL_SH.read_text(encoding="utf-8"))
+
+    def test_runs_with_set_e_in_the_distro_folder(self):
+        cfg = _cfg("NVidia", "A100")
+        step = {s.op: s for s in build_plan(cfg)}["cleanup-downloads"]
+        with mock.patch.object(build_config, "exec_program", return_value=0) as run, \
+             mock.patch.object(build_config, "log_info"):
+            self.assertEqual(step.action({"TOP_DIR": "/repo"}), 0)
+        self.assertEqual(run.call_args.args[0], ["bash", "-ec", build_config._CLEANUP_SCRIPT])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/repo/distros/ubuntu24.04")
+
+    def test_dotglob_and_nullglob_behave_as_in_bash(self):
+        # Run just the subshell part against a scratch folder: hidden folders
+        # go too, and an empty match is not an error.
+        import shutil, subprocess, tempfile
+        if not shutil.which("bash"):
+            self.skipTest("needs bash")
+        subshell = build_config._CLEANUP_SCRIPT.split("(\n", 1)[1].rsplit(")", 1)[0]
+        subshell = subshell.replace("rm -rf -- /var/cache/* || true\n", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("visible", ".hidden"):
+                (Path(tmp) / name).mkdir()
+            (Path(tmp) / "keep.txt").write_text("x", encoding="utf-8")
+            subprocess.run(["bash", "-ec", subshell], cwd=tmp, check=True)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["keep.txt"])
+            subprocess.run(["bash", "-ec", subshell], cwd=tmp, check=True)   # nothing left
+
+
 # A component action is just a python function, so it can raise as well as return
 # a bad code (corrupt tarball, missing file, changed upstream layout...). build()
 # has to turn either one into exit code 3 — a traceback would escape as exit 1 and

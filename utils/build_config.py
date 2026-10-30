@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 from typing import Callable
 from pathlib import Path
 import json
@@ -233,22 +234,33 @@ class Step:
         """
         return "python" if self.action is not None and not self.resync else "bash"
 
-def _cleanup_downloads(env: dict[str, str]) -> int:
+_CLEANUP_SCRIPT = """\
+rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh
+rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*
+rm -rf /var/intel/
+(
+    shopt -s dotglob nullglob
+    rm -rf -- /var/cache/* || true
+    rm -Rf -- */ || true
+)
+"""
+
+
+def _cleanup_downloads(env: dict[str, str], distro_dir: str) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
 
-    Mirrors the inline cleanup in install.sh between install_intel_libs and
-    hpc-tuning. Runs the exact bash rm in the distro build dir. Destructive by
+    Runs install.sh's inline cleanup (between install_intel_libs and
+    hpc-tuning) word for word, with `bash -e` like install.sh's `set -e`, in
+    the distro folder install.sh runs from (`distro_dir`, e.g.
+    "distros/ubuntu24.04"). The subshell's `dotglob nullglob` makes the globs
+    include hidden entries and expand to nothing when nothing matches; its
+    `|| true` keeps those two removals from failing the build. Destructive by
     design; only ever runs during a real build() on the build VM.
     """
-    build_dir = Path(env.get("TOP_DIR", ".")) / "distros" / env.get("DISTRIBUTION", "")
-    cleanup = (
-        "rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh; "
-        "rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*; "
-        "rm -rf /var/intel/; "
-        "rm -rf /var/cache/* || true; "
-        "rm -Rf -- */"
-    )
-    return exec_program(["bash", "-c", cleanup], "cleanup-downloads",
+    build_dir = Path(env.get("TOP_DIR", ".")) / distro_dir
+    log_info("cleanup-downloads", f"Removing downloads and extracted folders in {build_dir}",
+             build_dir=str(build_dir))
+    return exec_program(["bash", "-ec", _CLEANUP_SCRIPT], "cleanup-downloads",
                         cwd=str(build_dir), env=env)
 
 
@@ -350,8 +362,11 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # (install_dynolog_drl.sh was removed upstream in #627.)
 
-        # free space: remove downloaded tarballs/installers (inline rm in install.sh)
-        Step("cleanup-downloads", action=_cleanup_downloads),
+        # free space: remove downloaded tarballs/installers (inline rm in install.sh).
+        # functools.partial fills in distro_dir now, so the action still takes
+        # just `env`, like every other action.
+        Step("cleanup-downloads",
+             action=functools.partial(_cleanup_downloads, distro_dir=cfg.distro_dir)),
 
         # optimizations + persistent RDMA naming
         Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install),
