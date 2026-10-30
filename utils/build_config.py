@@ -25,7 +25,9 @@ DEFAULT_MODULE_DIR = "/usr/share/Modules/modulefiles"  # alma/rocky/azure/rhel
 
 VALID_GPUS = {
     "NVidia": {"GB200", "GB300", "NCv6", "V100", "A100", "H100", "H200", "VR200"},
-    "AMD": {"MI300", "MI400", "MI500"},
+    # MI300X is the SKU Packer passes for Standard_ND96isr_MI300X_v5 (bash then
+    # exports SKU=MI300X); MI300 is kept for existing command lines.
+    "AMD": {"MI300X", "MI300", "MI400", "MI500"},
 }
 DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
 

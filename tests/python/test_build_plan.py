@@ -194,6 +194,22 @@ class GatingTests(unittest.TestCase):
             cfg = resolve_config(args)
         self.assertEqual(cfg.gpu, "H100")
         warned.assert_not_called()
+
+    def test_every_sku_packer_passes_is_accepted(self):
+        # packer/variables.pkr.hcl maps VM sizes to the SKU it hands install.sh
+        # (and would hand azhpc.py). gpu_platform is AMD only for MI300X.
+        import re
+        hcl = (_REPO_ROOT / "packer" / "variables.pkr.hcl").read_text(encoding="utf-8")
+        block = re.search(r"vm_size_gpu_sku_map\s*=\s*\{(.*?)\}", hcl, re.S).group(1)
+        skus = set(re.findall(r'=\s*"([^"]+)"', block))
+        self.assertIn("MI300X", skus)
+        for sku in sorted(skus):
+            vendor = "AMD" if sku == "MI300X" else "NVidia"
+            with self.subTest(sku=sku):
+                args = Namespace(vendor=vendor, gpu=sku, os="Ubuntu24", spec=None, fips=False)
+                with mock.patch.object(build_config, "log_warn"):
+                    cfg = resolve_config(args)
+                self.assertEqual(cfg.gpu, build_config.build_sku(sku))
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))
         self.assertIn("install_doca.sh", plan)          # IB SKU -> DOCA

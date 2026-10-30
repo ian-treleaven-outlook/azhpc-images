@@ -45,7 +45,8 @@ REQUIRED:
                                 NVidia : GB200* | GB300* | NCv6* | V100*
                                         A100 | H100 | H200 | VR200
                                         (VR200 is built as GB200, as in bash)
-                                AMD    : MI300 | MI400 | MI500
+                                AMD    : MI300X | MI300 | MI400 | MI500
+                                        (MI300X is the SKU packer passes)
     --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
                                     Alma9 | Alma8 | Rocky9 | Rocky8
 
