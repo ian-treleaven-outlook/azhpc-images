@@ -7,7 +7,8 @@
     utils.process, under run() and systemctl(), and in utils.package_installer;
     one mock so the order of all commands is kept: apt-get, dnf, systemctl,
     ctr, the nested toolkit script), run_capture (docker --version, the
-    package listings), write_component_version, config_for, time.sleep and
+    package listings, also in utils.package_installer for dpkg-query),
+    write_component_version, config_for, time.sleep and
     utils.logger._log (every log line). The containerd socket path is pointed
     at a temporary directory; one test creates a real Unix socket there.
 
@@ -47,6 +48,8 @@ _RPM_OUT = ("bash-5.2.15-3.azl3.x86_64\n"
             "moby-engine-25.0.3-11.azl3.x86_64\n"
             "moby-cli-25.0.3-11.azl3.x86_64\n")
 _DPKG_OUT = "28.2.2-0ubuntu1"
+# installed_package_version()'s form of bash's dpkg-query -W -f='${Version}'.
+_DPKG_QUERY = ["dpkg-query", "-W", "-f", "${Version}", "docker.io"]
 
 _SERVICES = [
     ["systemctl", "enable", "docker"],
@@ -138,20 +141,10 @@ class MobyVersionParseTests(unittest.TestCase):
                          ["apt", "list", "--installed"])
         self.assertEqual(_moby_command("ubuntu24.04"),
                          ["apt", "list", "--installed"])
-        # bash: dpkg-query -W -f='${Version}' docker.io (single-quoted, literal).
-        self.assertEqual(_moby_command("ubuntu26.04"),
-                         ["dpkg-query", "-W", "-f=${Version}", "docker.io"])
         self.assertEqual(_moby_command("azurelinux3.0"),
                          ["rpm", "-qa"])
         self.assertEqual(_moby_command("rocky8.10"),
                          ["dnf", "list", "installed"])
-
-    def test_dpkg_query_version(self):
-        # dpkg-query -W -f='${Version}' prints the bare version, no newline
-        # (checked in WSL).
-        self.assertEqual(_parse_moby("ubuntu26.04", _DPKG_OUT),
-                         "28.2.2-0ubuntu1")
-        self.assertIsNone(_parse_moby("ubuntu26.04", ""))
 
 
 class WantsContainerToolkitTests(unittest.TestCase):
@@ -215,15 +208,16 @@ class InstallTests(unittest.TestCase):
             return captures[command[0]]
 
         exec_program = mock.Mock(side_effect=fake_exec)
+        run_capture = mock.Mock(side_effect=fake_capture)
         logs = _Logs()
         with mock.patch("utils.process.exec_program", exec_program), \
              mock.patch("utils.package_installer.exec_program", exec_program), \
-             mock.patch.object(install_docker, "run_capture",
-                               side_effect=fake_capture) as run_capture, \
+             mock.patch.object(install_docker, "run_capture", run_capture), \
+             mock.patch("utils.package_installer.run_capture", run_capture), \
              mock.patch("utils.component_config.config_for",
                         return_value=moby_cfg) as config_for, \
-             mock.patch.object(install_docker, "write_component_version",
-                               side_effect=write_error) as record, \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=write_error, return_value="/versions") as record, \
              mock.patch.object(install_docker.time, "sleep") as sleep, \
              mock.patch("utils.logger._log", logs):
             rc = install_docker.install(env)
@@ -283,8 +277,7 @@ class InstallTests(unittest.TestCase):
                 ])
                 self.assertEqual(
                     [c.args[0] for c in m["capture"].call_args_list],
-                    [["docker", "--version"],
-                     ["dpkg-query", "-W", "-f=${Version}", "docker.io"]])
+                    [["docker", "--version"], _DPKG_QUERY])
                 self.assertEqual(m["record"].call_args_list, [
                     mock.call("DOCKER", "29.1.4"),
                     mock.call("MOBY_ENGINE", "28.2.2-0ubuntu1"),
@@ -458,10 +451,11 @@ class InstallTests(unittest.TestCase):
         messages = self._messages(m["info"])
         self.assertIn("Installing moby-engine, moby-cli, moby-buildx", messages)
         self.assertIn("Enabling and restarting the docker service", messages)
-        recorded = [r.fields for r in m["info"] if r.message.startswith("Recorded")]
+        recorded = [(r.fields["component"], r.fields["version"])
+                    for r in m["info"] if r.message.startswith("Recorded")]
         self.assertEqual(recorded, [
-            {"component": "DOCKER", "version": "29.1.4"},
-            {"component": "MOBY_ENGINE", "version": "29.1.4-ubuntu24.04u1"},
+            ("DOCKER", "29.1.4"),
+            ("MOBY_ENGINE", "29.1.4-ubuntu24.04u1"),
         ])
         summary = m["info"][-1]
         self.assertEqual(summary.message, "Docker installed")

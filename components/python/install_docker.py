@@ -11,7 +11,8 @@ Packages, one install command each, as in bash (_MOBY_PACKAGES):
     moby-engine=<V> and moby-cli=<V> pinned to versions.json "moby", no
     buildx. Ubuntu 26.04 (any node type) has no moby packages: one
     `apt-get install docker.io docker-buildx`, and MOBY_ENGINE records the
-    docker.io version (`dpkg-query -W -f='${Version}' docker.io`).
+    docker.io version (bash `dpkg-query -W -f='${Version}' docker.io`, here
+    installed_package_version()).
   * Azure Linux: moby-engine, moby-cli, docker-buildx.
   * RHEL family (and, as bash's else branch, anything else): moby-engine,
     moby-cli, moby-buildx.
@@ -58,10 +59,10 @@ import stat
 import time
 from functools import partial
 
-from utils.component_config import DEFAULT_NODE_TYPE, require_config, write_component_version
+from utils.component_config import DEFAULT_NODE_TYPE, record_version, require_config
 from utils.distro import Distro
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import install_packages, installed_package_version
 from utils.process import run, run_capture
 from utils.services import systemctl
 
@@ -182,15 +183,10 @@ _MOBY_VERSION_QUERY = {
     "azurelinux": (["rpm", "-qa"], rpm_moby_version),
     "rhel": (["dnf", "list", "installed"], _apt_or_dnf_moby_version),
 }
-# bash's '${Version}' is single-quoted: dpkg-query fills it in. It prints the
-# bare version, whose first word is recorded.
-_DOCKER_IO_VERSION_QUERY = (["dpkg-query", "-W", "-f=${Version}", "docker.io"], first_word)
 
 
 def moby_version_query(distro: Distro):
-    """(command, parser) for the installed moby-engine (or docker.io) version."""
-    if distro.name == _UBUNTU_DOCKER_IO:
-        return _DOCKER_IO_VERSION_QUERY
+    """(command, parser) for the installed moby-engine version."""
     return _MOBY_VERSION_QUERY.get(distro.family, _MOBY_VERSION_QUERY["rhel"])
 
 
@@ -270,20 +266,6 @@ def _restart_containerd(env: dict[str, str]) -> bool:
     return run(["ctr", "plugin", "ls"], _OP, env=env)
 
 
-def _record(component: str, version: str) -> bool:
-    # TODO(ADO 1001): toolkit candidate: record_version(component, version, op)
-    # -> bool — write_component_version that logs instead of raising.
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}",
-                  component=component, version=version)
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
-
-
 def _record_docker_version(env: dict[str, str]) -> str | None:
     rc, output = run_capture(["docker", "--version"], _OP, env=env)
     docker = docker_version(output) if rc == 0 else None
@@ -291,10 +273,20 @@ def _record_docker_version(env: dict[str, str]) -> str | None:
         log_error(_OP, "could not determine the docker version from "
                        f"`docker --version`: {output.strip()!r}", exit_code=rc)
         return None
-    return docker if _record("DOCKER", docker) else None
+    return docker if record_version("DOCKER", docker, _OP) else None
 
 
-def _record_moby_version(env: dict[str, str], distro: Distro) -> str | None:
+def _docker_io_version(env: dict[str, str]) -> str | None:
+    """Ubuntu 26.04's MOBY_ENGINE value: the installed docker.io version."""
+    version = installed_package_version("docker.io", env, _OP)
+    if version is not None:
+        log_info(_OP, "Ubuntu 26.04: MOBY_ENGINE records the docker.io package "
+                      "version, as bash does", package="docker.io", version=version)
+    return version
+
+
+def _moby_engine_version(env: dict[str, str], distro: Distro) -> str | None:
+    """The installed moby-engine version, parsed from the family's package listing."""
     command, parse = moby_version_query(distro)
     rc, output = run_capture(command, _OP, env=env)
     log_debug(_OP, f"`{' '.join(command)}` output:\n{output}")
@@ -303,9 +295,6 @@ def _record_moby_version(env: dict[str, str], distro: Distro) -> str | None:
         log_error(_OP, "could not determine the installed moby-engine version "
                        f"from `{' '.join(command)}`", distro=str(distro), exit_code=rc)
         return None
-    if distro.name == _UBUNTU_DOCKER_IO:
-        log_info(_OP, "Ubuntu 26.04: MOBY_ENGINE records the docker.io package "
-                      "version, as bash does", package="docker.io", version=moby)
     if distro.is_azurelinux:
         source = rpm_moby_source_line(output) or ""
         if not source.startswith("moby-engine-"):
@@ -313,7 +302,15 @@ def _record_moby_version(env: dict[str, str], distro: Distro) -> str | None:
                           "moby` match, which is not moby-engine; recording its "
                           "version anyway, like bash",
                      matched_package=source, version=moby)
-    return moby if _record("MOBY_ENGINE", moby) else None
+    return moby
+
+
+def _record_moby_version(env: dict[str, str], distro: Distro) -> str | None:
+    if distro.name == _UBUNTU_DOCKER_IO:
+        moby = _docker_io_version(env)
+    else:
+        moby = _moby_engine_version(env, distro)
+    return moby if moby is not None and record_version("MOBY_ENGINE", moby, _OP) else None
 
 
 def install(env: dict[str, str]) -> int:
