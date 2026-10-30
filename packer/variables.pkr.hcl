@@ -739,6 +739,12 @@ locals {
     "ubuntu24.04"   = "Ubuntu24"
     "ubuntu26.04"   = "Ubuntu26"
     "azurelinux3.0" = "Azure3"
+    "almalinux8.10" = "Alma8"
+    "almalinux9.x"  = "Alma9"
+    "rocky8.10"     = "Rocky8"
+    "rocky9.x"      = "Rocky9"
+    "rhel8.10"      = "RHEL8"
+    "rhel9.x"       = "RHEL9"
   }
   python_cli_os     = lookup(local.python_cli_os_by_folder, local.os_script_folder_name, "")
   python_cli_vendor = local.gpu_platform == "AMD" ? "AMD" : "NVidia"

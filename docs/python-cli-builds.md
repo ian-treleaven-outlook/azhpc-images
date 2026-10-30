@@ -11,7 +11,7 @@ with one built the usual bash way.
 |---|---|---|
 | Ubuntu 22.04, 24.04, 26.04 | yes | Ubuntu 26.04 refuses V100, GB200, VR200 and NCv6, as its install.sh does |
 | Azure Linux 3.0 | yes | |
-| AlmaLinux, Rocky, RHEL | no | Plans in ADO 995–997 (Packer already runs `azhpc.py` with a new enough Python there) |
+| AlmaLinux 8/9, Rocky 8/9, RHEL 8/9 | yes | NVIDIA only on AlmaLinux and RHEL, as their install.sh |
 | `azure_vm_regular` | yes | |
 | `baremetal_3p` | yes | |
 | `azure_vm_akshost` | no | Runs `install_aks.sh`, which has no Python plan |
@@ -39,7 +39,7 @@ Only the "Install HPC components" step changes. Instead of
 
 ```bash
 cd /home/<user>/azhpc-images; bash packer/scripts/run_python_cli.sh \
-    --vendor <NVidia|AMD> --gpu <SKU> --os <Ubuntu22|Ubuntu24|Ubuntu26|Azure3>
+    --vendor <NVidia|AMD> --gpu <SKU> --os <Ubuntu24|Azure3|Rocky9|...>
 ```
 
 `run_python_cli.sh` runs `azhpc.py` with a Python 3.10 or newer. Ubuntu and
