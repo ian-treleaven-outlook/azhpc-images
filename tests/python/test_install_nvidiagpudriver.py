@@ -11,8 +11,9 @@
   * install() runs with every external effect mocked where it happens:
     exec_program (utils.process's, behind run()/run_all()/systemctl(), and
     utils.package_installer's, which runs the installs, into one ordered
-    record), run_capture, utils.download.download_and_verify,
-    dnf_pin_packages, write_component_version and
+    record), run_capture (the module's and utils.package_installer's),
+    utils.download.download_and_verify, dnf_pin_packages,
+    utils.component_config.write_component_version and
     install_cuda_samples.install. The module's and the toolkit's log calls
     share one mock per level. System paths are redirected under a temporary
     directory (_ROOT), as is the work dir.
@@ -51,7 +52,7 @@ _NVCC_13 = ("nvcc: NVIDIA (R) Cuda compiler driver\n"
             "Cuda compilation tools, release 13.0, V13.0.88\n"
             "Build cuda_13.0.r13.0/compiler.36424714_0\n")
 _NVCC_12 = "Cuda compilation tools, release 12.9, V12.9.86\n"
-_DPKG_QUERY = ("capture", ["dpkg-query", "-W", "-f=${Version}", "nvidia-open"])
+_DPKG_QUERY = ("capture", ["dpkg-query", "-W", "-f", "${Version}", "nvidia-open"])
 _DNF_LIST = ("Installed Packages\n"
              "cuda-open.x86_64      580.126.20-1_6.6.104.2.azl3   @azurelinux-nvidia\n"
              "cuda-open-hwe.aarch64 580.159.04-1_6.6.104.2.azl3   @azurelinux-nvidia\n"
@@ -367,13 +368,15 @@ class _InstallBase(unittest.TestCase):
             (package_installer, "log_info", mock.Mock()),
             (package_installer, "log_error", pkg_error),
             (m, "run_capture", mock.Mock(side_effect=fake_capture)),
+            (package_installer, "run_capture", mock.Mock(side_effect=fake_capture)),
             (m.install_cuda_samples, "install", mock.Mock(side_effect=fake_samples)),
             (m, "dnf_pin_packages", mock.Mock(side_effect=fake_pin)),
             (download_module, "download_and_verify", mock.Mock(side_effect=fake_download)),
-            (m, "write_component_version", record),
+            (component_config, "write_component_version", record),
             (m.platform, "release", mock.Mock(return_value=_KERNEL)),
             # One recorder per level for the module and the toolkit it calls.
             (m, "log_info", log_info), (files, "log_info", log_info),
+            (component_config, "log_info", log_info),
             (m, "log_warn", log_warn),
             (cuda, "log_info", log_info), (cuda, "log_warn", log_warn),
             (m, "log_error", log_error), (files, "log_error", log_error),
@@ -563,7 +566,7 @@ class UbuntuTests(_InstallBase):
         self.assert_not_logged(mocks["warn"], "no CUDA apt source")
         self.assert_logged(mocks["info"], "Running nested script install_gdrcopy.sh")
         self.assert_logged(mocks["info"], "fabric manager (NVSwitch) instead of IMEX")
-        self.assert_logged(mocks["info"], "Recorded NVIDIA version 580.178.04")
+        self.assert_logged(mocks["info"], "Recorded NVIDIA 580.178.04")
 
     def test_v100_installs_cuda_drivers(self):
         rc, calls, mocks = self._install(_env(sku="V100"))
@@ -629,7 +632,7 @@ class UbuntuTests(_InstallBase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls[:5], [
             _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"),
-            ("exec", ["apt", "update"]),
+            ("exec", ["apt-get", "update"]),
             _apt("nvidia-driver-pinning-580.178.04"),
             _apt("nvidia-open"),
             _apt("cuda-toolkit-13-0"),
@@ -645,7 +648,7 @@ class UbuntuTests(_InstallBase):
         rc, calls, mocks = self._install(_env(node_type="baremetal_1p"))
         self.assertEqual(rc, 3)
         self.assertEqual(calls[-1], _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"))
-        self.assert_logged(mocks["error"], "no keyring matches")
+        self.assert_logged(mocks["error"], "nothing matches")
 
     def test_mrc_without_repo_file_fails_up_front(self):
         versions = json.loads(json.dumps(_VERSIONS))
@@ -705,7 +708,7 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls[:4], [
             _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"),
-            ("exec", ["apt", "update"]),
+            ("exec", ["apt-get", "update"]),
             _apt("nvidia-driver-pinning-580.178.04"),
             _apt("nvidia-open"),
         ])
@@ -782,14 +785,19 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
         self.assertEqual(last.kwargs["nvidia_version"], "610.43.02")
 
     def test_ubuntu2604_dpkg_query_failure_returns_3(self):
-        for output in [(1, ""), (0, ""), (0, "-1")]:
+        # Not installed (installed_package_version logs it), or nothing left
+        # after bash's sed 's/-.*//'.
+        for output, log, message in [((1, ""), "pkg_error", "nvidia-open is not installed"),
+                                     ((0, ""), "pkg_error", "nvidia-open is not installed"),
+                                     ((0, "-1"), "error",
+                                      "could not read the installed nvidia-open")]:
             with self.subTest(output=output):
                 rc, calls, mocks = self._install(
                     _env("ubuntu26.04"), capture={("dpkg-query", "-W"): output})
                 self.assertEqual(rc, 3)
                 self.assertEqual(calls[-1], _DPKG_QUERY)
                 self.assertEqual(self.recorded(mocks), [])
-                self.assert_logged(mocks["error"], "could not read the installed nvidia-open")
+                self.assert_logged(mocks[log], message)
                 self.assertFalse(os.path.exists(
                     self.path("/etc/modprobe.d/nvprofiling.conf")))
 

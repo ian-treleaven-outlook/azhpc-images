@@ -82,6 +82,10 @@ Deliberate differences from bash
     `apt-get install -y -o Dpkg::Use-Pty=0 pkg`). In the RHEL-family branch
     only AlmaLinux/Rocky/RHEL have a known manager; elsewhere the toolkit
     install fails (bash would try dnf).
+  * Package-manager toolkit calls: the local repo's `apt update` runs as
+    `apt-get update` (refresh_package_index); the Ubuntu 26.04 driver
+    version is read with `dpkg-query -W -f '${Version}' nvidia-open`
+    (installed_package_version; bash: -f='${Version}', same output).
   * Every versions.json value a branch needs is required before anything is
     installed (_required_keys): nvidia driver.version (Ubuntu, RHEL family),
     driver.sha256 (RHEL family), driver.repo_file (Ubuntu local repo),
@@ -101,8 +105,9 @@ Deliberate differences from bash
     without pipefail).
   * A failing curl leaves the repo file untouched; bash's `>` has already
     emptied it.
-  * The local-repo keyring glob is expanded in Python; no match fails with a
-    clear message (bash's `cp` fails on the literal pattern).
+  * The local-repo keyrings are copied with copy_files, which expands the
+    glob in Python; no match fails with a clear message (bash's `cp` fails
+    on the literal pattern).
   * `rm -f` of the kms modprobe file goes through remove_paths, which logs
     but never fails the build.
   * Files are written with write_file, which creates missing parent
@@ -132,24 +137,23 @@ Bash quirks, kept and warned about (log_warn when they apply)
 
 from __future__ import annotations
 
-import glob
 import os
 import platform
 import re
-import shutil
 from dataclasses import dataclass
 
 from components.python import install_cuda_samples
-from utils.component_config import (DEFAULT_NODE_TYPE, config_for, require_config,
-                                    write_component_version)
+from utils.component_config import (DEFAULT_NODE_TYPE, config_for, record_version,
+                                    require_config)
 from utils.cuda import (APT_SOURCES_DIR, CUDA_PROFILE, CUDA_PROFILE_TEXT,
                         NVCC_VERSION_COMMAND, check_cuda_apt_source, cuda_toolkit_package,
                         nvcc_cuda_version)
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import remove_paths, write_file
+from utils.files import copy_files, file_has_line, fresh_dir, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import (install_packages, installed_package_version,
+                                     refresh_package_index)
 from utils.package_pinning import dnf_pin_packages
 from utils.process import run, run_all, run_capture
 from utils.services import systemctl
@@ -483,56 +487,22 @@ def _resolve(env: dict[str, str]) -> _Inputs | None:
 # --------------------------------------------------------------------------- #
 # Small jobs shared by the steps. Each returns False (or None) after logging.
 # --------------------------------------------------------------------------- #
-def _fresh_work_dir() -> bool:
-    # TODO(ADO 1001): toolkit candidate: fresh_dir(path, op) -> bool
-    # (rm -rf, then mkdir -p; three driver/samples ports do this).
-    remove_paths(_WORK_DIR, op=_OP)
-    try:
-        os.makedirs(_WORK_DIR, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_WORK_DIR}: {exc}", path=_WORK_DIR)
-        return False
-    return True
-
-
 def _append_line(path: str, line: str) -> bool:
     """bash's `echo <line> >> <path>`.
 
     BASH QUIRK (kept): the append is not rerun-safe; a line already in the
     file is added again. Warned about when that happens.
     """
-    try:
-        with open(path, encoding="utf-8") as handle:
-            if line in handle.read().split("\n"):
-                log_warn(_OP, f"{path} already contains {line!r}; appending it "
-                              "again, as bash does (the append is not rerun-safe)",
-                         path=path, line=line)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        log_error(_OP, f"could not read {path}: {exc}", path=path)
-        return False
+    if file_has_line(path, line):
+        log_warn(_OP, f"{path} already contains {line!r}; appending it "
+                      "again, as bash does (the append is not rerun-safe)",
+                 path=path, line=line)
     return write_file(path, line + "\n", _OP, append=True)
-
-
-def _record(component: str, version: str) -> bool:
-    # TODO(ADO 1001): toolkit candidate: record_component_version(component,
-    # version, op) -> bool (write_component_version that logs instead of raising).
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}",
-                  component=component, version=version)
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
 
 
 def _nested(script: str, env: dict[str, str], why: str) -> bool:
     """Run a nested component script with bash's environment, from _WORK_DIR."""
-    # TODO(ADO 1001): toolkit candidate: run_component_script(script, env, op,
-    # cwd=) -> bool ($COMPONENT_DIR/<script>, as the bash components do).
+    # Local: the toolkit has no nested-script runner; this is one run() call.
     path = os.path.join(env.get("COMPONENT_DIR", ""), script)
     log_info(_OP, f"Running nested script {script}: {why}", script=script)
     if not run([path], _OP, cwd=_WORK_DIR, env=env):
@@ -597,26 +567,6 @@ def _driver_azurelinux(env: dict[str, str], p: _Inputs) -> str | None:
     return version
 
 
-def _copy_local_repo_keyrings(p: _Inputs) -> bool:
-    """cp /var/<repo dir>/nvidia-driver-local-*-keyring.gpg /usr/share/keyrings/"""
-    # TODO(ADO 1001): toolkit candidate: copy_files(pattern, dest_dir, op) -> bool
-    # (bash `cp <glob> <dir>`, failing when nothing matches).
-    pattern = _host(f"/var/{local_repo_dir(p.repo_file)}/nvidia-driver-local-*-keyring.gpg")
-    keyrings = sorted(glob.glob(pattern))
-    if not keyrings:
-        log_error(_OP, f"no keyring matches {pattern}", path=pattern)
-        return False
-    for keyring in keyrings:
-        try:
-            copied = shutil.copy(keyring, _host(_KEYRINGS_DIR))
-        except OSError as exc:
-            log_error(_OP, f"could not copy {keyring}: {exc}", path=keyring)
-            return False
-        log_info(_OP, f"Copied {keyring} to {copied}", source=keyring, path=copied,
-                 action="copied")
-    return True
-
-
 def _add_local_repo(env: dict[str, str], p: _Inputs) -> bool:
     """bash's install_from_nvidia_local_repo: install the local NVIDIA driver
     repo and prefer it over every other source."""
@@ -627,11 +577,13 @@ def _add_local_repo(env: dict[str, str], p: _Inputs) -> bool:
                   "over every other source (the CUDA toolkit still comes from the "
                   "online CUDA repo)", repo_file=deb, node_type=p.node_type,
              driver_source=p.driver_source or "(not set)", mrc_network=p.mrc)
+    # bash: cp /var/<repo dir>/nvidia-driver-local-*-keyring.gpg /usr/share/keyrings/
+    keyrings = _host(f"/var/{local_repo_dir(p.repo_file)}/nvidia-driver-local-*-keyring.gpg")
     # The preference is written before `apt update` so it applies to the refresh.
     return (install_packages([deb], env, _OP)
-            and _copy_local_repo_keyrings(p)
+            and copy_files(keyrings, _host(_KEYRINGS_DIR), _OP)
             and write_file(_host(_APT_PREFERENCES), _APT_PREFERENCES_TEXT, _OP)
-            and run(["apt", "update"], _OP, env=env))
+            and refresh_package_index(env, _OP))
 
 
 def _driver_ubuntu(env: dict[str, str], p: _Inputs) -> str | None:
@@ -677,14 +629,15 @@ def _dpkg_driver_version(env: dict[str, str], p: _Inputs, branch: str) -> str | 
                       f"{_DPKG_VERSION_PACKAGE} although the {branch} branch was "
                       "installed (bash behaviour, kept)",
                  distro=p.distro.name, branch=branch)
-    rc, output = run_capture(["dpkg-query", "-W", "-f=${Version}", _DPKG_VERSION_PACKAGE],
-                             _OP, env=env)
-    version = dpkg_driver_version(output) if rc == 0 else None
+    installed = installed_package_version(_DPKG_VERSION_PACKAGE, env, _OP)
+    if installed is None:
+        return None
+    version = dpkg_driver_version(installed)
     if not version:
         log_error(_OP, f"could not read the installed {_DPKG_VERSION_PACKAGE} version "
-                       f"with dpkg-query (parsed {version!r}); bash would record an "
-                       "empty NVIDIA version", package=_DPKG_VERSION_PACKAGE,
-                  exit_code=rc, distro=p.distro.name)
+                       f"from {installed!r} (bash's sed 's/-.*//' leaves nothing); bash "
+                       "would record an empty NVIDIA version",
+                  package=_DPKG_VERSION_PACKAGE, distro=p.distro.name)
         return None
     if not looks_like_version(version, r"[0-9]+(\.[0-9]+)*"):
         log_warn(_OP, f"{_DPKG_VERSION_PACKAGE} version {version!r} doesn't look like "
@@ -783,7 +736,7 @@ def _install_toolkit(env: dict[str, str], p: _Inputs) -> str | None:
     if not write_file(_host(CUDA_PROFILE), CUDA_PROFILE_TEXT, _OP, mode=0o644):
         return None
     cuda = _nvcc_cuda_version(env)
-    if cuda is None or not _record("CUDA", cuda):
+    if cuda is None or not record_version("CUDA", cuda, _OP):
         return None
     log_info(_OP, "Building the CUDA samples (install_cuda_samples)")
     if install_cuda_samples.install(env) != 0:
@@ -810,7 +763,7 @@ def _install_imex(env: dict[str, str], p: _Inputs) -> bool:
                  imex_version=p.imex_version)
     package = _IMEX_PACKAGE[p.family].format(version=p.imex_version)
     if not (install_packages([package], env, _OP)
-            and _record("IMEX", p.imex_version)
+            and record_version("IMEX", p.imex_version, _OP)
             and _append_line(_host(_NVIDIA_CONF), _IMEX_CHANNEL_LINE)):
         return False
 
@@ -840,7 +793,7 @@ def _install_all(env: dict[str, str], p: _Inputs) -> dict[str, str] | None:
     if driver is None:
         log_error(_OP, "NVIDIA driver installation failed", distro=p.distro.name)
         return None
-    if not (_record("NVIDIA", driver) and _queue_peermem(p)):
+    if not (record_version("NVIDIA", driver, _OP) and _queue_peermem(p)):
         return None
     versions = {"NVIDIA": driver}
 
@@ -865,7 +818,7 @@ def _install_all(env: dict[str, str], p: _Inputs) -> dict[str, str] | None:
 def install(env: dict[str, str]) -> int:
     """Install the NVIDIA driver, CUDA and the related tools. Returns 0 or 3."""
     p = _resolve(env)
-    if p is None or not _fresh_work_dir():
+    if p is None or not fresh_dir(_WORK_DIR, _OP):
         return 3
     try:
         versions = _install_all(env, p)
