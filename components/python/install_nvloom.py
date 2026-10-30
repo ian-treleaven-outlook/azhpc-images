@@ -32,6 +32,9 @@ Deliberate differences from bash
 --------------------------------
   * The dependency installs go through install_packages(), which normalises
     `apt install -y` to `apt-get install -y -o Dpkg::Use-Pty=0`.
+  * git_clone() puts --branch before the url (`git clone --branch <ref>
+    <url>`); bash has `git clone <url> --branch <ref>`, which git treats the
+    same.
   * Patch path: bash applies the patch from /home/hpcuser/azhpc-images/...,
     which only exists when the repo is checked out in that one user's home.
     We use <TOP_DIR>/distros/azurelinux3.0/azurelinux_nvloom.patch, and fail
@@ -57,15 +60,14 @@ Deliberate differences from bash
 from __future__ import annotations
 
 import os
-import shutil
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
-from utils.files import remove_paths
+from utils.files import fresh_dir, make_dirs, move_file, remove_paths
 from utils.logger import log_error, log_info
 from utils.package_installer import install_packages
 from utils.process import run, run_script
-from utils.repo_source import write_repo_source_info
+from utils.repo_source import configured_ref, git_clone, write_repo_source_info
 
 _OP = "install-nvloom"
 
@@ -118,85 +120,10 @@ def dependency_packages(distro: Distro) -> tuple[list[str], ...] | None:
     return None
 
 
-# TODO(ADO 1001): toolkit candidate: configured_ref(cfg, version) -> str
-# (bash `jq -r '.ref // .branch // empty'` then `${REF:-v${VERSION}}`; the same
-# code is in install_nvbandwidth_tool.py).
-def configured_ref(config: dict, version: str) -> str:
-    """The git ref to clone, as bash resolves it:
-
-        NVLOOM_REF=$(jq -r '.ref // .branch // empty' <<< $nvloom_metadata)
-        NVLOOM_REF=${NVLOOM_REF:-v${NVLOOM_VERSION}}
-
-    jq's `//` skips a missing (null) or false value, but keeps "" (so an empty
-    "ref" hides "branch"); bash's `:-` then turns "" into v<version>.
-    """
-    ref = ""
-    for key in ("ref", "branch"):
-        value = config.get(key)
-        if value is not None and value is not False:
-            ref = str(value)
-            break
-    return ref or f"v{version}"
-
-
 def patch_path(top_dir: str) -> str:
     """The Azure Linux nvloom patch in this repo checkout (bash hardcodes
     /home/hpcuser/azhpc-images/...)."""
     return os.path.join(top_dir, _PATCH_IN_REPO)
-
-
-# --------------------------------------------------------------------------- #
-# Small jobs the toolkit doesn't cover yet. Each returns a result, or
-# False/None after logging why.
-# --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: make_dirs(*paths, op) -> bool (bash
-# `mkdir -p`, logging an OSError).
-def _make_dir(path: str) -> bool:
-    """bash `mkdir -p <path>`."""
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {path}: {exc}", path=path)
-        return False
-    return True
-
-
-# TODO(ADO 1001): toolkit candidate: git_clone(url, parent_dir, op, *, branch,
-# dir_name, env) -> str | None (fresh parent dir, clone, check the checkout
-# exists; the same code is in install_nvbandwidth_tool.py, with --branch
-# before the url).
-def _clone(url: str, ref: str, env: dict[str, str]) -> str | None:
-    """Clone nvloom at `ref` into a fresh _WORK_DIR; the source directory, or None."""
-    remove_paths(_WORK_DIR, op=_OP)
-    if not _make_dir(_WORK_DIR):
-        return None
-    # The same arguments, in the same order, as bash's git clone.
-    if not run(["git", "clone", url, "--branch", ref], _OP, cwd=_WORK_DIR, env=env):
-        return None
-    source_dir = os.path.join(_WORK_DIR, _SOURCE_DIR_NAME)
-    # Bash's `pushd nvloom` would fail here if the URL named another repo.
-    if not os.path.isdir(source_dir):
-        log_error(_OP, f"git clone did not create {source_dir}", path=source_dir)
-        return None
-    return source_dir
-
-
-# TODO(ADO 1001): toolkit candidate: move_file(src, dest_dir, op) -> bool
-# (bash `mv <file> <dir>`, logging created/replaced; the same code is in
-# install_nvbandwidth_tool.py).
-def _install_binary(source_dir: str) -> bool:
-    """bash `mv nvloom_cli $dest_dir`: into the directory, replacing any copy."""
-    built = os.path.join(source_dir, _BINARY)
-    target = os.path.join(_DEST_DIR, _BINARY)
-    action = "replaced" if os.path.lexists(target) else "created"
-    try:
-        shutil.move(built, target)
-    except OSError as exc:
-        log_error(_OP, f"could not move {built} to {target}: {exc}",
-                  source=built, path=target)
-        return False
-    log_info(_OP, f"Installed {target}", path=target, action=action)
-    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +156,18 @@ def _azure_linux_patch(env: dict[str, str]) -> str | None:
     return patch
 
 
+def _clone(url: str, ref: str, env: dict[str, str]) -> str | None:
+    """Clone nvloom at `ref` into a fresh _WORK_DIR; the source directory, or None."""
+    if not fresh_dir(_WORK_DIR, _OP):
+        return None
+    source_dir = git_clone(url, _OP, ref=ref, cwd=_WORK_DIR, env=env)
+    # Bash's `pushd nvloom` fails if the URL named another repo.
+    if source_dir is not None and os.path.basename(source_dir) != _SOURCE_DIR_NAME:
+        log_error(_OP, f"git clone did not create {_SOURCE_DIR_NAME}", path=source_dir)
+        return None
+    return source_dir
+
+
 def _checkout_and_record(source_dir: str, commit: str, ref: str,
                          env: dict[str, str]) -> bool:
     """git checkout <commit>, then write_repo_source_info (bash's order)."""
@@ -257,18 +196,6 @@ def _build(source_dir: str, patch: str | None, env: dict[str, str]) -> bool:
                       env=env)
 
 
-def _record_version(version: str) -> bool:
-    """write_component_version("NVLOOM", ...), logging a file error."""
-    try:
-        write_component_version("NVLOOM", version)
-    except OSError as exc:
-        log_error(_OP, f"could not record NVLOOM={version}: {exc}")
-        return False
-    log_info(_OP, f"Recorded NVLOOM version {version}", component="NVLOOM",
-             version=version)
-    return True
-
-
 def install(env: dict[str, str]) -> int:
     """Build nvloom from source, install nvloom_cli, record its version. 0 or 3."""
     cfg = require_config("nvloom", env, _OP, "version", "url", "commit")
@@ -287,17 +214,19 @@ def install(env: dict[str, str]) -> int:
              source=url, ref=ref, commit=commit, distro=distro.name,
              node_type=env.get("TARGET_NODE_TYPE", ""), dest=_DEST_DIR,
              patch=patch or "(none)", work_dir=_WORK_DIR)
-    if not _make_dir(_DEST_DIR):
+    if not make_dirs(_DEST_DIR, op=_OP):
         return 3
     if not all(install_packages(packages, env, _OP) for packages in deps):
         return 3
     source_dir = _clone(url, ref, env)
     if source_dir is None or not _checkout_and_record(source_dir, commit, ref, env):
         return 3
-    if not _build(source_dir, patch, env) or not _install_binary(source_dir):
+    if not _build(source_dir, patch, env):
+        return 3
+    if not move_file(os.path.join(source_dir, _BINARY), _DEST_DIR, _OP):
         return 3
     remove_paths(_WORK_DIR, op=_OP)          # bash: rm -rf ./nvloom
-    if not _record_version(version):
+    if not record_version("NVLOOM", version, _OP):
         return 3
     log_info(_OP, f"nvloom {version} installed to {_DEST_DIR}", version=version,
              commit=commit, ref=ref, dest=_DEST_DIR)

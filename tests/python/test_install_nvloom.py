@@ -2,9 +2,8 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_packages, configured_ref, patch_path) are
-    tested directly. configured_ref was also compared with real jq/bash in
-    WSL on the same configs.
+  * The pure helpers (dependency_packages, patch_path) are tested directly.
+    (configured_ref is utils.repo_source's; test_toolkit covers it.)
   * install() is tested with exec_program (in utils.process, behind run and
     run_script, and in utils.package_installer, which runs the dependency
     installs) replaced by one fake that records each command and imitates its
@@ -31,7 +30,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvloom
-from utils import component_config, package_installer, process
+from utils import component_config, files, package_installer, process, repo_source
 from utils.build_config import BuildConfig, build_plan
 from utils.distro import Distro
 
@@ -144,17 +143,6 @@ class HelperTests(unittest.TestCase):
             with self.subTest(distribution=other):
                 self.assertIsNone(packages(other))
 
-    def test_configured_ref_follows_jq_and_bash_defaults(self):
-        ref = install_nvloom.configured_ref
-        self.assertEqual(ref({}, "1.2.0"), "v1.2.0")
-        self.assertEqual(ref({"ref": "v9"}, "1.2.0"), "v9")
-        self.assertEqual(ref({"ref": "v9", "branch": "main"}, "1.2.0"), "v9")
-        self.assertEqual(ref({"branch": "main"}, "1.2.0"), "main")
-        self.assertEqual(ref({"ref": None, "branch": "main"}, "1.2.0"), "main")
-        self.assertEqual(ref({"ref": False, "branch": "main"}, "1.2.0"), "main")
-        # jq keeps "" (it hides branch); bash's ${REF:-...} then defaults it.
-        self.assertEqual(ref({"ref": "", "branch": "main"}, "1.2.0"), "v1.2.0")
-
     def test_bash_script_still_matches(self):
         script = (_REPO_ROOT / "components" / "install_nvloom.sh").read_text(encoding="utf-8")
         for line in [
@@ -225,17 +213,23 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_error") as self.pkg_error, \
              mock.patch.object(install_nvloom, "write_repo_source_info",
                                side_effect=fake_source), \
-             mock.patch.object(install_nvloom, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_nvloom, "log_info") as self.log_info, \
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(files, "log_info"), \
+             mock.patch.object(repo_source, "log_info"), \
              mock.patch.object(component_config, "log_error") as log_error, \
+             mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(repo_source, "log_error", log_error), \
              mock.patch.object(install_nvloom, "log_error", log_error):
             rc = install_nvloom.install(env)
         return rc, fake, record, log_error
 
     def _expected_build_calls(self, *, with_patch, ref="v1.2.0", commit=_COMMIT):
         source = str(self.box.work / "nvloom")
-        calls = [(["git", "clone", _URL, "--branch", ref], str(self.box.work)),
+        # git_clone() puts --branch first; bash has `git clone <url> --branch <ref>`.
+        calls = [(["git", "clone", "--branch", ref, _URL], str(self.box.work)),
                  (["git", "checkout", commit], source),
                  (("repo_source", "NVLOOM", commit, ref), source)]
         if with_patch:
