@@ -14,10 +14,16 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from components.python import disable_auto_upgrade
 from utils.build_config import BuildConfig, build_plan
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+# The only disable_auto_upgrade.sh left upstream (#623 deleted the 22.04 and
+# 24.04 copies, which were byte-identical to it).
+_BASH_SCRIPT = _REPO_ROOT / "distros" / "ubuntu26.04" / "disable_auto_upgrade.sh"
 
 # What Ubuntu ships in /etc/apt/apt.conf.d/20auto-upgrades.
 _UBUNTU_FILE = ('APT::Periodic::Update-Package-Lists "1";\n'
@@ -95,7 +101,7 @@ class InstallTests(unittest.TestCase):
         if contents is not None:
             with open(self.path, "w", encoding="utf-8", newline="") as f:
                 f.write(contents)
-        env = {"DISTRIBUTION": "ubuntu24.04"}
+        env = {"DISTRIBUTION": "ubuntu26.04"}
         with mock.patch.object(disable_auto_upgrade, "_AUTO_UPGRADES_FILE",
                                self.path), \
              mock.patch.object(disable_auto_upgrade, "exec_program",
@@ -166,9 +172,44 @@ class InstallTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Bash parity: the port mirrors distros/ubuntu26.04/disable_auto_upgrade.sh,
+# the only copy left upstream.
+# --------------------------------------------------------------------------- #
+class BashSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.script = _BASH_SCRIPT.read_text(encoding="utf-8")
+
+    def test_docstring_quotes_the_ubuntu2604_script(self):
+        # Every non-blank line of the script after the shebang appears, indented
+        # by four spaces, in the module docstring.
+        doc = disable_auto_upgrade.__doc__
+        for line in self.script.splitlines()[1:]:
+            if line.strip():
+                with self.subTest(line=line):
+                    self.assertIn("    " + line + "\n", doc)
+
+    def test_constants_match_the_script(self):
+        self.assertIn(
+            "sed -i 's/APT::Periodic::Unattended-Upgrade \".*/"
+            f"{disable_auto_upgrade._SETTING_OFF}/' "
+            f"{disable_auto_upgrade._AUTO_UPGRADES_FILE}\n", self.script)
+        self.assertEqual(disable_auto_upgrade._SETTING_PATTERN.pattern,
+                         'APT::Periodic::Unattended-Upgrade ".*')
+        for call in _SYSTEMCTL_CALLS:
+            with self.subTest(verb=call.args[0][1]):
+                self.assertIn(" ".join(call.args[0]) + "\n", self.script)
+
+    def test_ubuntu2604_install_sh_still_runs_it(self):
+        install_sh = (_REPO_ROOT / "distros" / "ubuntu26.04" / "install.sh")
+        self.assertIn("\n./disable_auto_upgrade.sh\n",
+                      install_sh.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------- #
 # Wiring: upstream removed disable_auto_upgrade.sh from Ubuntu 22.04 and 24.04
 # (#623; Packer handles it now), so the build plan no longer runs this module.
-# Only Ubuntu 26.04 still runs the script; ADO 989 decides the module's future.
+# Only Ubuntu 26.04 still runs the script; the module is kept for the future
+# Ubuntu 26.04 build plan (ADO 993).
 # --------------------------------------------------------------------------- #
 class BuildPlanWiringTests(unittest.TestCase):
     def test_step_is_no_longer_in_the_build_plan(self):

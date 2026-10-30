@@ -1,4 +1,4 @@
-"""disable_auto_upgrade.py — Python port of distros/<distro>/disable_auto_upgrade.sh.
+"""disable_auto_upgrade.py — Python port of distros/ubuntu26.04/disable_auto_upgrade.sh.
 
 What this step does
 -------------------
@@ -13,8 +13,9 @@ step turns it off in two ways:
   2. It stops, disables, and masks unattended-upgrades.service, so the
      service is not running now and cannot be started later.
 
-The original bash, for comparison (the same file exists for ubuntu24.04 and
-ubuntu22.04):
+The original bash, for comparison (distros/ubuntu26.04/disable_auto_upgrade.sh;
+it is byte-identical to the ubuntu22.04 and ubuntu24.04 copies that upstream
+deleted in #623, which this module was first ported from):
 
     set -e
 
@@ -33,21 +34,30 @@ set_unattended_upgrade_off() below does the same text transformation in Python.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
-"disable-auto-upgrade" Step. When a Step has an action, the build calls the
-Python function instead of running the bash script. Deleting `action=` from that
-Step makes the build run the bash script again. That is why the .sh file is kept.
+Currently this module is NOT wired into any build plan. Upstream PR #623
+deleted disable_auto_upgrade.sh from distros/ubuntu22.04 and
+distros/ubuntu24.04 and removed the calls from their install.sh scripts: the
+Packer prerequisites script (packer/scripts/prerequisites.sh) now turns off
+background apt activity earlier in the build. So the Ubuntu 22.04 and 24.04
+build plans no longer have a "disable-auto-upgrade" step.
+
+Ubuntu 26.04 still runs it: distros/ubuntu26.04/install.sh calls
+./disable_auto_upgrade.sh near the end (after trivy_scan.sh). The module is
+kept for the future Ubuntu 26.04 build plan (ADO 993), which will add a
+"disable-auto-upgrade" Step with this module's install() as its `action=`.
+When a Step has an action, the build calls the Python function instead of
+running the bash script; deleting `action=` makes the build run the bash
+script again.
 
 Like every action, install() receives the build environment (a dict of
 environment variables) and returns 0 for success or 3 for failure.
 
 Ubuntu only, as in bash
 -----------------------
-The bash script exists only in distros/ubuntu24.04 and distros/ubuntu22.04, and
-only those install.sh scripts run it. build_plan does the same: on other
-distros the step is skipped and the build log shows a warning saying why.
+The bash script now exists only in distros/ubuntu26.04, and only that
+install.sh runs it.
 
-If install() is called on an RPM distro anyway (outside build_plan), it fails
+If install() is called on an RPM distro anyway (outside a build plan), it fails
 for the closest equivalent reason to the missing bash script: the apt file
 /etc/apt/apt.conf.d/20auto-upgrades does not exist, so it logs an error and
 returns 3 before running systemctl.
