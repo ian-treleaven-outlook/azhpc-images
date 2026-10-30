@@ -27,7 +27,7 @@ from components.python import (
     install_mpifileutils, install_mpis, install_nccl, install_nvbandwidth_tool,
     install_nvidiagpudriver, install_nvidiagriddriver, install_nvloom, install_nvshmem,
     install_pmix, install_rccl, install_rocm, install_waagent, no_rdma_network,
-    setup_sku_customizations, trivy_scan, write_kernel_os_version,
+    remove_unused_packages, setup_sku_customizations, trivy_scan, write_kernel_os_version,
 )
 from utils.logger import log_info
 from utils.plans.step import Step
@@ -220,3 +220,8 @@ def predictive_interface_renaming(**kw):
     return Step("disable-predictive-interface-renaming",
                 "disable_predictive_interface_renaming.sh", base="distro",
                 action=disable_predictive_interface_renaming.install, **kw)
+
+def unused_packages(**kw):
+    """./remove_unused_packages.sh (Ubuntu 22.04 only; runs before install_utils.sh)."""
+    return Step("remove-unused-packages", "remove_unused_packages.sh", base="distro",
+                action=remove_unused_packages.install, **kw)
