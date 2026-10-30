@@ -23,8 +23,8 @@ from __future__ import annotations
 
 import platform
 
-from utils.component_config import write_component_version
-from utils.logger import log_error, log_info
+from utils.component_config import record_version
+from utils.logger import log_error
 from utils.process import run_capture
 
 _OP = "write-kernel-os-version"
@@ -49,23 +49,12 @@ def azure_linux_os_version(rpm_output: str) -> str | None:
     return package[:-_RPM_SUFFIX_LENGTH]
 
 
-def _record(component: str, version: str) -> bool:
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}")
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
-
-
 def _record_kernel() -> bool:
     kernel = platform.release()                     # bash `uname -r`
     if not kernel:
         log_error(_OP, "could not determine the running kernel version")
         return False
-    return _record("KERNEL", kernel)
+    return record_version("KERNEL", kernel, _OP)
 
 
 def _record_os(env: dict[str, str]) -> bool:
@@ -79,7 +68,7 @@ def _record_os(env: dict[str, str]) -> bool:
         log_error(_OP, f"unexpected rpm output for {_OS_RELEASE_FILE}: "
                        f"{output.strip()!r}")
         return False
-    return _record("OS", os_version)
+    return record_version("OS", os_version, _OP)
 
 
 def install(env: dict[str, str]) -> int:

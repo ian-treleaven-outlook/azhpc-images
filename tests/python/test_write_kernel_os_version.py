@@ -12,7 +12,10 @@ Two kinds of test:
 How the mocking works: `mock.patch.object(module, "name")` temporarily replaces
 `module.name` with a fake object, only inside the `with` block. We patch the
 names as seen *inside* write_kernel_os_version (for example its imported
-`run_capture`), because that is the name install() actually calls.
+`run_capture`), because that is the name install() actually calls. Recording
+goes through utils.component_config.record_version, so the versions-file
+writer and its error logger are patched there; one log_error mock stands in
+for both modules.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -24,6 +27,7 @@ import unittest
 from unittest import mock
 
 from components.python import write_kernel_os_version
+from utils import component_config
 from utils.build_config import BuildConfig, build_plan
 
 _KERNEL = "6.6.64.2-1.azl3"
@@ -71,9 +75,11 @@ class InstallTests(unittest.TestCase):
                                return_value=kernel), \
              mock.patch.object(write_kernel_os_version, "run_capture",
                                return_value=rpm_result) as rpm, \
-             mock.patch.object(write_kernel_os_version, "write_component_version",
-                               side_effect=write_error) as record, \
-             mock.patch.object(write_kernel_os_version, "log_error") as log_error:
+             mock.patch.object(component_config, "write_component_version",
+                               side_effect=write_error, return_value="/versions") as record, \
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(write_kernel_os_version, "log_error") as log_error, \
+             mock.patch.object(component_config, "log_error", log_error):
             rc = write_kernel_os_version.install(env)
         return rc, record, rpm, log_error
 
