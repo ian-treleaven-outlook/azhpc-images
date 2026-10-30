@@ -98,13 +98,26 @@ class ResolveConfigTests(unittest.TestCase):
         return resolve_config(Namespace(vendor=vendor, gpu=gpu, os=os_name,
                                         spec=None, fips=False))
 
+    def _without_a_plan(self, os_name, ticket):
+        """Patches that make os_name an OS still waiting for its plan (`ticket`).
+
+        Every --os has a plan today, so the refusal path is tested this way.
+        patch.dict puts both dicts back as they were afterwards; clear=True
+        empties PLANS first, then fills it with every plan but os_name's.
+        """
+        others = {name: plan for name, plan in PLANS.items() if name != os_name}
+        return (mock.patch.dict(build_config.PLANS, others, clear=True),
+                mock.patch.dict(build_config.PENDING, {os_name: ticket}))
+
     def test_an_os_without_a_plan_is_rejected_with_its_ticket(self):
-        for os_name, ticket in PENDING.items():
-            with self.subTest(os=os_name):
-                with self.assertRaises(ConfigError) as caught:
-                    self._resolve(os_name)
-                self.assertEqual(caught.exception.code, 1)
-                self.assertIn(ticket, str(caught.exception))
+        plans, pending = self._without_a_plan("RHEL9", "ADO 999")
+        with plans, pending:
+            with self.assertRaises(ConfigError) as caught:
+                self._resolve("RHEL9")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("ADO 999", str(caught.exception))
+        self.assertIn("distros/rhel9.x/install.sh", str(caught.exception))
+        self.assertIn("RHEL9", PLANS)                      # restored
 
     def test_a_vendor_the_install_sh_rejects_is_rejected(self):
         # e.g. AlmaLinux's install.sh: "AMD GPU support is not implemented yet".
@@ -117,10 +130,13 @@ class ResolveConfigTests(unittest.TestCase):
                              "AMD GPU support is not implemented yet for X.")
             self.assertEqual(self._resolve("Ubuntu24").vendor, "NVidia")
 
-    @unittest.skipUnless(PENDING, "every --os has a plan")
     def test_build_plan_refuses_an_os_without_a_plan(self):
-        with self.assertRaises(ConfigError):
-            build_plan(_cfg(next(iter(PENDING)), "NVidia", "A100"))
+        # resolve_config() refuses it first; this guards direct callers.
+        plans, pending = self._without_a_plan("Alma8", "ADO 999")
+        with plans, pending:
+            with self.assertRaises(ConfigError) as caught:
+                build_plan(_cfg("Alma8", "NVidia", "A100"))
+        self.assertIn("ADO 999", str(caught.exception))
 
 
 class InstallShParityTests(unittest.TestCase):

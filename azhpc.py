@@ -50,8 +50,8 @@ REQUIRED:
                                         (MI300X is the SKU packer passes)
     --os <OS>               Target OS: Ubuntu22 | Ubuntu24 | Ubuntu26 | Azure3 |
                                     Alma8 | Alma9 | Rocky8 | Rocky9 | RHEL8 | RHEL9
-                            Building needs a Python plan for the OS (today:
-                            Ubuntu24); versions/validate accept them all.
+                            AlmaLinux and RHEL build NVidia only, as their
+                            install.sh does.
 
 OPTIONS:
     --spec <PATH>           Path to versions.json

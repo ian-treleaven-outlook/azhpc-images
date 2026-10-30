@@ -28,7 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from utils.plans import almalinux, azurelinux3_0, rocky, ubuntu22_04, ubuntu24_04, ubuntu26_04
+from utils.plans import (almalinux, azurelinux3_0, rhel, rocky, ubuntu22_04, ubuntu24_04,
+                         ubuntu26_04)
 
 if TYPE_CHECKING:
     from utils.build_config import BuildConfig
@@ -102,10 +103,12 @@ PLANS: dict[str, DistroPlan] = {
                         vendor_error=almalinux.VENDOR_ERROR),
     "Rocky8": DistroPlan(build=rocky.build),
     "Rocky9": DistroPlan(build=rocky.build),
+    "RHEL8": DistroPlan(build=rhel.build, vendors=frozenset({"NVidia"}),
+                        vendor_error=rhel.VENDOR_ERROR),
+    "RHEL9": DistroPlan(build=rhel.build, vendors=frozenset({"NVidia"}),
+                        vendor_error=rhel.VENDOR_ERROR),
 }
 
-# The --os values still waiting for one, and the ticket adding it.
-PENDING: dict[str, str] = {
-    "RHEL8": "ADO 997",
-    "RHEL9": "ADO 997",
-}
+# The --os values still waiting for one, and the ticket adding it. Every --os
+# has a plan today; a new distro folder is listed here until its plan lands.
+PENDING: dict[str, str] = {}
