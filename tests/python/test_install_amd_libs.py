@@ -5,8 +5,10 @@ Two kinds of test:
   * The pure helpers (folder_version, aocl_modulefile) and the small symlink
     helper (make_symlink) run for real; make_symlink works in a temporary folder.
   * install() runs with its external effects replaced. The downloads, tar, the
-    vendor installers and cp are faked by FakeCommands below, which records each
-    command and creates the files the real command would have created. The
+    vendor installers and cp are faked by FakeCommands below (patched where
+    the toolkit runs them: utils.download.download_and_verify and
+    utils.process.exec_program), which records each command and creates the
+    files the real command would have created. The
     install folder (/opt/amd), the work folder and the modulefile folder are all
     pointed at a temporary folder, so the tests never touch /opt or the network.
 
@@ -25,6 +27,8 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_amd_libs
+from utils import component_config, files, process
+from utils import download as download_module
 from utils.build_config import BuildConfig, build_plan
 from utils.download import ChecksumError
 
@@ -119,7 +123,7 @@ class FakeCommands:
     Records every command and, so the following steps have something to work
     with, imitates what the real command would leave behind:
       * download: returns <dest_dir>/<file name from the URL>
-      * tar -xvf X.tar[.gz]: creates the folder X in the work folder
+      * tar -xf X.tar[.gz]: creates the folder X in the work folder
       * AOCL ./install.sh: creates amd/<version>/aocc/{MT,ST}/{lib,include}
       * cp -r: copies for real (shutil.copytree into the destination)
 
@@ -137,7 +141,7 @@ class FakeCommands:
         self.downloads.append((url, sha256, dest_dir))
         return Path(dest_dir) / os.path.basename(url)
 
-    def run(self, command, op, *, cwd=None, env=None):
+    def run(self, command, op, *, cwd=None, env=None, **_):
         self.commands.append((command, cwd))
         if len(self.commands) - 1 == self.fail_at:
             return 1
@@ -187,11 +191,15 @@ class InstallTests(unittest.TestCase):
                 return Path(dest_dir) / os.path.basename(url)
         with mock.patch.object(install_amd_libs, "_INSTALL_PREFIX", self.prefix), \
              mock.patch.object(install_amd_libs, "_WORK_DIR", self.work), \
-             mock.patch.object(install_amd_libs, "exec_program", side_effect=fake.run), \
-             mock.patch.object(install_amd_libs, "download_and_verify",
+             mock.patch.object(process, "exec_program", side_effect=fake.run), \
+             mock.patch.object(download_module, "download_and_verify",
                                side_effect=download), \
+             mock.patch.object(download_module, "log_error"), \
+             mock.patch.object(component_config, "log_error"), \
+             mock.patch.object(files, "log_info"), \
              mock.patch.object(install_amd_libs, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(install_amd_libs, "log_info"), \
              mock.patch.object(install_amd_libs, "log_warn") as log_warn, \
              mock.patch.object(install_amd_libs, "log_error") as log_error:
             rc = install_amd_libs.install(env or self.env)
@@ -203,12 +211,12 @@ class InstallTests(unittest.TestCase):
         aocc = os.path.join(self.work, "aocc-compiler-5.2.0")
         aocl_out = os.path.join(aocl, "amd", _AOCL, "aocc")
         return [
-            (["tar", "-xvf", f"{self.work}/aocl-linux-aocc-5.3.0.tar.gz"], self.work),
+            (["tar", "-xf", f"{self.work}/aocl-linux-aocc-5.3.0.tar.gz"], self.work),
             (["./install.sh", "-t", "amd", "-l", "blis", "fftw", "libflame",
               "-i", "lp64"], aocl),
             # The glob's matches, sorted, as the shell would pass them.
             (["cp", "-r", f"{aocl_out}/MT", f"{aocl_out}/ST", self.prefix], None),
-            (["tar", "-xvf", f"{self.work}/aocc-compiler-5.2.0.tar"], self.work),
+            (["tar", "-xf", f"{self.work}/aocc-compiler-5.2.0.tar"], self.work),
             (["./install.sh"], aocc),
             (["cp", "-r", aocc, self.prefix], None),
         ]
