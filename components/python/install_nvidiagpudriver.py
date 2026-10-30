@@ -14,13 +14,20 @@ Installs the NVIDIA data-center GPU driver for every NVIDIA SKU except NCv6
                             V100     -> "cuda"           (proprietary modules)
                             aarch64  -> "cuda-open-hwe"
                             else     -> "cuda-open"
-       * Ubuntu           add NVIDIA's CUDA apt repo (cuda-keyring); on the MRC
-                          network (baremetal_1p) also the local driver repo from
-                          $TOP_DIR/internal_bits, preferred over every other
-                          source; install nvidia-driver-pinning-<version>, then
-                          cuda-drivers (V100), the -open dkms/driver packages of
-                          the major version (NVLINK_RACKSCALE=true) or
-                          nvidia-open; drop the kms modprobe file and write
+       * Ubuntu           NVIDIA's CUDA apt repo is already there: the
+                          bootstrap (distros/<distro>/install_utils.sh) runs
+                          install_cuda_repo_and_dkms.sh before any component.
+                          On the MRC network (baremetal_1p) or when the nvidia
+                          driver.source is "private", first `apt install` the
+                          local driver repo .deb (driver.repo_file) from
+                          $TOP_DIR/internal_bits and prefer it over every other
+                          source. Then install nvidia-driver-pinning-<version>
+                          and cuda-drivers (V100), the -open dkms/driver
+                          packages of the major version (NVLINK_RACKSCALE=true)
+                          or nvidia-open. On Ubuntu 26.04 the driver version
+                          to record is read back from the installed nvidia-open
+                          package (versions.json only names the branch, e.g.
+                          "610"). Drop the kms modprobe file and write
                           /etc/modprobe.d/nvprofiling.conf.
        * anything else    (RHEL family) download NVIDIA's .run installer and run
                           it (proprietary modules for V100, open otherwise);
@@ -34,6 +41,9 @@ Installs the NVIDIA data-center GPU driver for every NVIDIA SKU except NCv6
      (cuda-toolkit-<major>-<minor>), write /etc/profile.d/cuda.sh, record the
      version nvcc reports as CUDA, and build the CUDA samples
      (install_cuda_samples.install, the Python port of install_cuda_samples.sh).
+     The RHEL family first adds NVIDIA's CUDA dnf repo and excludes mft (and,
+     for CUDA 12, cccl) from it; on RHEL itself, CUDA 12 also excludes cccl
+     from the rhel-<major>-for-<arch>-supplementary-rhui-rpms repo.
   4. Nested bash: install_gdrcopy.sh.
   5. Not rackscale: nested install_nvidia_fabric_manager.sh.
      Rackscale (NVLINK_RACKSCALE=true, any case): nvprofiling and CDMM
@@ -53,13 +63,25 @@ build run the bash script again, which is why the .sh file is kept.
 install() returns 0 for success or 3 for failure, logs problems and never lets
 an exception escape.
 
+Synced with upstream 0c2b8f9: local driver repo for driver.source "private"
+and `apt install` of local .debs (#626, #622), CUDA keyring + DKMS moved to the
+bootstrap (#643), Ubuntu 26.04 driver version (#614), RHEL supplementary-repo
+cccl exclude (#620).
+
+The public versions.json has no nvidia driver.repo_file or driver.source; the
+MRC (baremetal_1p) and "private" paths need them from the out-of-repo 1P
+overlay. Without driver.repo_file those builds fail up front (see below).
+
 Parity notes
 ------------
-  * The version parsers (dnf list | grep | sed, nvcc | grep | awk | cut, and
-    bash's unquoted ${VAR} keeping only the first word) were compared against
-    the real tools in WSL. The generated files were rendered with real bash;
-    the tests compare against those renders (tests/python/fixtures/
-    install_nvidiagpudriver/).
+  * The version parsers (dnf list | grep | sed, nvcc | grep | awk | cut,
+    dpkg-query | sed 's/-.*//', and bash's unquoted ${VAR} keeping only the
+    first word) and the RHEL supplementary repo id (${DISTRIBUTION#rhel},
+    ${v%%.*}) were compared against the real tools in WSL. The generated files
+    were rendered with real bash; the tests compare against those renders
+    (tests/python/fixtures/install_nvidiagpudriver/).
+  * `dnf config-manager --save ... >/dev/null`: the output goes to the debug
+    log instead of being discarded.
   * `curl URL > file` is run as `curl URL`, with Python writing its output to
     the file.
   * /etc/profile.d/cuda.sh is written once with both lines; bash writes the
@@ -71,11 +93,16 @@ Deliberate differences from bash
 --------------------------------
   * Every versions.json value a branch needs is checked before anything is
     installed, and a missing one fails the step: nvidia driver.version (Ubuntu,
-    RHEL family), driver.sha256 (RHEL family), driver.repo_file (Ubuntu MRC),
-    driver.major_version (Ubuntu rackscale, non-V100), imex.version
-    (rackscale); cuda driver.version (toolkit) and driver.distribution (Ubuntu,
-    and RHEL family toolkit). Bash would carry on with "null" in package
-    names, URLs and recorded versions.
+    RHEL family), driver.sha256 (RHEL family), driver.repo_file (Ubuntu MRC or
+    driver.source "private"), driver.major_version (Ubuntu rackscale,
+    non-V100), imex.version (rackscale); cuda driver.version (toolkit) and
+    driver.distribution (RHEL family toolkit). Bash would carry on with "null"
+    in package names, URLs and recorded versions.
+  * Ubuntu 26.04: an empty driver version from `dpkg-query ... nvidia-open`
+    (e.g. nvidia-open not installed) fails the step; bash records NVIDIA="".
+  * Ubuntu: before installing, the port logs whether a CUDA apt source
+    (/etc/apt/sources.list.d/cuda-*) exists and warns if not. Bash doesn't
+    check; apt then fails to find the packages.
   * Rackscale on a distro other than Azure Linux 3.0 or Ubuntu fails up front.
     Bash installs the driver, toolkit and gdrcopy first, then exits 1 at the
     IMEX step.
@@ -85,8 +112,8 @@ Deliberate differences from bash
     bash ignores because it doesn't set pipefail).
   * A failing curl leaves the repo file untouched; bash's `>` has already
     emptied it before curl fails.
-  * The MRC keyring glob is expanded in Python; no match fails with a clear
-    message (bash's `cp` fails on the literal pattern).
+  * The local-repo keyring glob is expanded in Python; no match fails with a
+    clear message (bash's `cp` fails on the literal pattern).
   * Downloads and nested scripts use _WORK_DIR, emptied first and removed at
     the end. Bash ends with `rm -rf *.run *.tar.gz *.rpm` and `rm -rf -- */`
     in the distro build dir, deleting every subdirectory there, including ones
@@ -104,6 +131,9 @@ Bash quirks, kept and warned about (log_warn when they apply)
     version, without checking that apt installed that version.
   * The RHEL-family .run installer and CUDA repo URLs hard-code x86_64.
     Warned when ARCHITECTURE is something else.
+  * Ubuntu 26.04 always reads the driver version from the nvidia-open
+    package, even when the V100 (cuda-drivers) or rackscale branch installed
+    other packages. Warned on those branches.
   * The final build-dir cleanup (see above).
 """
 
@@ -161,18 +191,25 @@ _AZL_REPO_FILES = {
 _REPO_SECTION = re.compile(r"^\[[^]\n]+\][ \t]*$", re.MULTILINE)
 
 # ---- Ubuntu -----------------------------------------------------------------
-_KEYRING_DEB = "cuda-keyring_1.1-1_all.deb"
-_KEYRING_URL = ("https://developer.download.nvidia.com/compute/cuda/repos/"
-                "{distribution}/{arch}/" + _KEYRING_DEB)
+# A driver.source with this value also uses the local driver repo (as MRC does).
+_PRIVATE_SOURCE = "private"
 _APT_PREFERENCES = "/etc/apt/preferences.d/00-nvidia-prefer"
 _APT_PREFERENCES_TEXT = 'Package: *\nPin: origin ""\nPin-Priority: 1001\n'
 _KEYRINGS_DIR = "/usr/share/keyrings"
 _KMS_CONF = "/etc/modprobe.d/nvidia-graphics-drivers-kms.conf"
+# Where the bootstrap's cuda-keyring install puts NVIDIA's CUDA apt source.
+_APT_SOURCES_DIR = "/etc/apt/sources.list.d"
+_CUDA_APT_SOURCE_GLOB = "cuda-*"
+# The one Ubuntu release whose recorded driver version comes from dpkg-query.
+_UBUNTU_DPKG_VERSION = "ubuntu26.04"
+_DPKG_VERSION_PACKAGE = "nvidia-open"
 
 # ---- RHEL family ------------------------------------------------------------
 _RUN_URL = "https://us.download.nvidia.com/tesla/{v}/NVIDIA-Linux-x86_64-{v}.run"
 _RHEL_CUDA_REPO = ("https://developer.download.nvidia.com/compute/cuda/repos/"
                    "{d}/x86_64/cuda-{d}.repo")
+# RHEL (not Alma/Rocky) with CUDA 12 also excludes cccl from this RHUI repo.
+_RHEL_SUPPLEMENTARY_REPO = "rhel-{major}-for-{arch}-supplementary-rhui-rpms"
 
 # ---- Files written on every distro --------------------------------------------
 _NVPROFILING_CONF = "/etc/modprobe.d/nvprofiling.conf"
@@ -274,9 +311,21 @@ def nvcc_cuda_version(nvcc_output: str) -> str | None:
     return first_word("\n".join(values))
 
 
-def mrc_repo_dir(repo_file: str) -> str:
-    """bash: echo $FILE | awk -F'_' '{print $1}' (everything before the first _)."""
+def local_repo_dir(repo_file: str) -> str:
+    """bash: ${repo_file%%_*} (everything before the first _)."""
     return repo_file.split("_")[0]
+
+
+def dpkg_driver_version(dpkg_query_output: str) -> str | None:
+    """The driver version from `dpkg-query -W -f='${Version}' nvidia-open`, or None.
+
+    Mirrors  dpkg-query ... | sed 's/-.*//'  and the unquoted
+    ${NVIDIA_DRIVER_VERSION} (first word only):
+
+        "610.43.02-0ubuntu1"  ->  "610.43.02"
+    """
+    edited = [re.sub(r"-.*", "", line, count=1) for line in dpkg_query_output.split("\n")]
+    return first_word("\n".join(edited))
 
 
 def cuda_toolkit_package(cuda_version: str) -> str:
@@ -290,6 +339,17 @@ def rhel_cuda_excludes(cuda_version: str) -> str:
     if cuda_version.startswith("12."):      # [[ $V == 12.* ]]
         excludes += " cccl-*"
     return excludes
+
+
+def rhel_supplementary_repo(distribution: str, arch: str) -> str:
+    """The RHUI supplementary repo id bash excludes cccl from on RHEL + CUDA 12.
+
+    bash: rhel_version=${DISTRIBUTION#rhel}
+          rhel-${rhel_version%%.*}-for-${ARCHITECTURE}-supplementary-rhui-rpms
+    "rhel9.8", "x86_64" -> "rhel-9-for-x86_64-supplementary-rhui-rpms"
+    """
+    version = distribution[len("rhel"):] if distribution.startswith("rhel") else distribution
+    return _RHEL_SUPPLEMENTARY_REPO.format(major=version.split(".")[0], arch=arch)
 
 
 def _host(path: str) -> str:
@@ -310,6 +370,7 @@ class _Inputs:
     rackscale: bool
     mrc: bool
     toolkit: bool
+    driver_source: str = ""        # nvidia driver.source ("private" -> local repo)
     driver_version: str = ""       # Ubuntu/RHEL: versions.json; Azure Linux: dnf
     driver_sha256: str = ""
     driver_major: str = ""
@@ -325,6 +386,11 @@ class _Inputs:
         if "ubuntu" in self.distribution:      # bash: == *"ubuntu"*
             return "ubuntu"
         return "rhel"
+
+    @property
+    def local_repo(self) -> bool:
+        """bash: _is_mrc_network || [ "$NVIDIA_DRIVER_SOURCE" = "private" ]"""
+        return self.mrc or self.driver_source == _PRIVATE_SOURCE
 
 
 def _value(cfg, *keys) -> str:
@@ -354,9 +420,9 @@ def _resolve(env: dict[str, str]) -> _Inputs | None:
 
     needed = {}                    # "<component> <key>" -> resolved value
     if p.family == "ubuntu":
+        p.driver_source = _value(nvidia, "driver", "source")
         needed["nvidia driver.version"] = _value(nvidia, "driver", "version")
-        needed["cuda driver.distribution"] = _value(cuda, "driver", "distribution")
-        if p.mrc:
+        if p.local_repo:
             needed["nvidia driver.repo_file"] = _value(nvidia, "driver", "repo_file")
         if p.rackscale and p.sku != "V100":
             needed["nvidia driver.major_version"] = _value(nvidia, "driver", "major_version")
@@ -378,7 +444,8 @@ def _resolve(env: dict[str, str]) -> _Inputs | None:
     missing = [name for name, value in needed.items() if not value]
     if missing:
         log_error(_OP, f"could not resolve {', '.join(missing)} from versions.json",
-                  distro=p.distribution, arch=p.arch, sku=p.sku, node_type=p.node_type)
+                  distro=p.distribution, arch=p.arch, sku=p.sku, node_type=p.node_type,
+                  driver_source=p.driver_source or "(not set)")
         return None
 
     p.driver_version = needed.get("nvidia driver.version", "")
@@ -520,42 +587,66 @@ def _driver_azurelinux(env, p: _Inputs) -> str | None:
     return version
 
 
-def _driver_ubuntu(env, p: _Inputs) -> str | None:
-    cuda_arch = "sbsa" if p.arch == "aarch64" else "x86_64"
-    keyring_url = _KEYRING_URL.format(distribution=p.cuda_distribution, arch=cuda_arch)
-    log_info(_OP, f"Ubuntu: installing NVIDIA driver {p.driver_version} from the "
-                  "NVIDIA CUDA apt repo", driver_version=p.driver_version,
-             version_source="versions.json", source=keyring_url)
-    if not _run_all([["wget", keyring_url],
-                     ["dpkg", "-i", f"./{_KEYRING_DEB}"],
-                     ["apt-get", "update"]], env, cwd=_WORK_DIR):
-        log_error(_OP, "could not add the NVIDIA CUDA apt repo", url=keyring_url)
-        return None
+def _check_cuda_apt_source() -> None:
+    """Log whether NVIDIA's CUDA apt source is configured (bash doesn't check).
 
-    if p.mrc:
-        if not _add_mrc_local_repo(env, p):
+    install_cuda_repo_and_dkms.sh adds it during the bootstrap (upstream #643);
+    without it apt can't find the driver or toolkit packages.
+    """
+    sources = sorted(glob.glob(_host(os.path.join(_APT_SOURCES_DIR,
+                                                  _CUDA_APT_SOURCE_GLOB))))
+    if sources:
+        log_info(_OP, "NVIDIA CUDA apt source present (added by "
+                      "install_cuda_repo_and_dkms.sh in the bootstrap)",
+                 cuda_apt_sources=", ".join(sources))
+    else:
+        log_warn(_OP, f"no CUDA apt source ({_CUDA_APT_SOURCE_GLOB}) in "
+                      f"{_APT_SOURCES_DIR}: the bootstrap's install_cuda_repo_and_dkms.sh "
+                      "should have added it; continuing, as bash does",
+                 path=_host(_APT_SOURCES_DIR))
+
+
+def _driver_ubuntu(env, p: _Inputs) -> str | None:
+    log_info(_OP, f"Ubuntu: installing NVIDIA driver {p.driver_version} from apt "
+                  "(CUDA apt repo set up by install_cuda_repo_and_dkms.sh in the "
+                  "bootstrap)", driver_version=p.driver_version,
+             version_source="versions.json")
+    _check_cuda_apt_source()
+
+    if p.local_repo:
+        if not _add_local_repo(env, p):
             return None
     else:
-        log_info(_OP, "Not the MRC network: driver packages come from the CUDA repo",
-                 node_type=p.node_type)
+        log_info(_OP, "Not the MRC network and driver.source is not \"private\": "
+                      "driver packages come from the CUDA repo",
+                 node_type=p.node_type, driver_source=p.driver_source or "(not set)")
 
     commands = [["apt", "install", f"nvidia-driver-pinning-{p.driver_version}", "-y"]]
     if p.sku == "V100":
         log_info(_OP, "V100: installing cuda-drivers (proprietary kernel modules)")
         commands.append(["apt", "install", "cuda-drivers", "-y"])
+        branch = "cuda-drivers"
     elif p.rackscale:
         major = p.driver_major
         log_info(_OP, f"NVLINK_RACKSCALE=true: installing the {major} open dkms/driver "
                       "packages and nvidia-modprobe", driver_major=major)
         commands.append(["apt", "install", f"nvidia-dkms-{major}-open",
                          f"nvidia-driver-{major}-open", "nvidia-modprobe", "-y"])
+        branch = "rackscale"
     else:
         log_info(_OP, "Installing nvidia-open (open kernel modules)")
         commands.append(["apt", "install", "nvidia-open", "-y"])
+        branch = "nvidia-open"
     if not _run_all(commands, env):
         log_error(_OP, "NVIDIA driver package installation failed",
                   driver_version=p.driver_version)
         return None
+
+    version = p.driver_version
+    if p.distribution == _UBUNTU_DPKG_VERSION:
+        version = _dpkg_driver_version(env, p, branch)
+        if version is None:
+            return None
 
     # Remove an unused configuration file the driver package may create.
     kms = _host(_KMS_CONF)
@@ -572,20 +663,53 @@ def _driver_ubuntu(env, p: _Inputs) -> str | None:
         return None
     # nvidia-peermem is not loaded at build time; it is queued for first boot
     # (see the modules-load file written later and setup_sku_customizations).
-    return p.driver_version
+    return version
 
 
-def _add_mrc_local_repo(env, p: _Inputs) -> bool:
-    """MRC network: install the local NVIDIA driver repo and prefer it."""
+def _dpkg_driver_version(env, p: _Inputs, branch: str) -> str | None:
+    """Ubuntu 26.04: the installed nvidia-open version, without the revision."""
+    if branch != "nvidia-open":
+        # BASH QUIRK (kept): bash asks for nvidia-open's version whatever was
+        # installed; on these branches it may not be installed at all.
+        log_warn(_OP, f"{p.distribution}: reading the driver version from "
+                      f"{_DPKG_VERSION_PACKAGE} although the {branch} branch was "
+                      "installed (bash behaviour, kept)",
+                 distro=p.distribution, branch=branch)
+    rc, output = run_capture(["dpkg-query", "-W", "-f=${Version}", _DPKG_VERSION_PACKAGE],
+                             _OP, env=env)
+    version = dpkg_driver_version(output) if rc == 0 else None
+    if not version:
+        log_error(_OP, f"could not read the installed {_DPKG_VERSION_PACKAGE} version "
+                       f"with dpkg-query (parsed {version!r}); bash would record an "
+                       "empty NVIDIA version", package=_DPKG_VERSION_PACKAGE,
+                  exit_code=rc, distro=p.distribution)
+        return None
+    if not looks_like_version(version, r"[0-9]+(\.[0-9]+)*"):
+        log_warn(_OP, f"{_DPKG_VERSION_PACKAGE} version {version!r} doesn't look like "
+                      "a driver version; recording it anyway, as bash does",
+                 package=_DPKG_VERSION_PACKAGE, driver_version=version)
+    log_info(_OP, f"{p.distribution}: installed driver version is {version} "
+                  f"(versions.json driver.version {p.driver_version} only picks the "
+                  "pinning package)", driver_version=version,
+             pinning_version=p.driver_version, version_source="dpkg-query nvidia-open")
+    return version
+
+
+def _add_local_repo(env, p: _Inputs) -> bool:
+    """bash's install_from_nvidia_local_repo: install the local NVIDIA driver
+    repo and prefer it over every other source."""
     deb = os.path.join(env.get("TOP_DIR", ""), "internal_bits", p.repo_file)
-    log_info(_OP, "MRC network (baremetal_1p): adding the local NVIDIA driver repo and "
-                  "preferring it over every other source", repo_file=deb,
-             node_type=p.node_type)
-    if not _run(["dpkg", "-i", deb], env):
+    reason = ("MRC network (baremetal_1p)" if p.mrc
+              else f'driver.source is "{_PRIVATE_SOURCE}"')
+    log_info(_OP, f"{reason}: adding the local NVIDIA driver repo and preferring it "
+                  "over every other source (the CUDA toolkit still comes from the "
+                  "online CUDA repo)", repo_file=deb, node_type=p.node_type,
+             driver_source=p.driver_source or "(not set)", mrc_network=p.mrc)
+    if not _run(["apt", "install", "-y", deb], env):
         log_error(_OP, f"could not install the local driver repo {deb}", path=deb)
         return False
 
-    pattern = _host(f"/var/{mrc_repo_dir(p.repo_file)}/nvidia-driver-local-*-keyring.gpg")
+    pattern = _host(f"/var/{local_repo_dir(p.repo_file)}/nvidia-driver-local-*-keyring.gpg")
     keyrings = sorted(glob.glob(pattern))
     if not keyrings:
         log_error(_OP, f"no keyring matches {pattern}", path=pattern)
@@ -645,7 +769,7 @@ def _install_toolkit(env, p: _Inputs) -> str | None:
     log_info(_OP, f"Installing CUDA toolkit {p.cuda_version} ({package})",
              cuda_version=p.cuda_version, package=package)
     if p.family == "ubuntu":
-        commands = [["apt", "install", "-y", package]]   # repo added with the driver
+        commands = [["apt", "install", "-y", package]]   # repo added by the bootstrap
     elif p.family == "azurelinux":
         commands = [["dnf", "install", "-y", package]]
     else:
@@ -656,8 +780,14 @@ def _install_toolkit(env, p: _Inputs) -> str | None:
         # that CUDA 12 still needs (see the bash comments).
         log_info(_OP, f"Adding CUDA repo {repo} with excludepkgs={excludes}",
                  source=repo, excludepkgs=excludes)
-        commands = [
-            ["dnf", "config-manager", "--add-repo", repo],
+        commands = [["dnf", "config-manager", "--add-repo", repo]]
+        if p.cuda_version.startswith("12.") and p.distribution.startswith("rhel"):
+            supplementary = rhel_supplementary_repo(p.distribution, p.arch)
+            log_info(_OP, f"RHEL with CUDA 12: also excluding cccl-* from {supplementary}",
+                     repo=supplementary, excludepkgs="cccl-*", distro=p.distribution)
+            commands.append(["dnf", "config-manager", "--save",
+                             f"--setopt={supplementary}.excludepkgs=cccl-*"])
+        commands += [
             ["dnf", "config-manager", "--save",
              f"--setopt=cuda-{p.cuda_distribution}-x86_64.excludepkgs={excludes}"],
             ["dnf", "clean", "expire-cache"],
@@ -809,6 +939,8 @@ def install(env: dict[str, str]) -> int:
     log_info(_OP, "Installing the NVIDIA GPU driver", distro=p.distribution,
              arch=p.arch, sku=p.sku, node_type=p.node_type, rackscale=p.rackscale,
              nvlink_rackscale=env.get("NVLINK_RACKSCALE", ""), mrc_network=p.mrc,
+             driver_source=p.driver_source or "(not set)",
+             local_driver_repo=p.local_repo if p.family == "ubuntu" else False,
              cuda_toolkit=p.toolkit, driver_version=p.driver_version or "(from dnf)",
              cuda_version=p.cuda_version, imex_version=p.imex_version,
              work_dir=_WORK_DIR)

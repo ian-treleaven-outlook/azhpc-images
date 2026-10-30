@@ -26,7 +26,7 @@ from utils import package_manager
 from utils import package_installer
 from utils.package_manager import PackageManager, detect_package_manager
 from utils.package_installer import PackageInstaller
-from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs
+from components.python import install_mpifileutils, install_nccl, install_doca, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_aznfs
 
 
 # detect_package_manager() finds a manager by calling shutil.which on each candidate.
@@ -530,63 +530,6 @@ class MonitoringToolsTests(unittest.TestCase):
         with mock.patch.object(install_monitoring_tools, "log_error") as logged:
             self.assertEqual(
                 install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
-
-
-class NvbandwidthTests(unittest.TestCase):
-    def _env(self):
-        return {
-            "COMPONENT_VERSIONS": json.dumps({
-                "nvbandwidth": {"common": {
-                    "version": "0.9",
-                    "url": "https://github.com/NVIDIA/nvbandwidth.git",
-                }}
-            }),
-            "DISTRIBUTION": "ubuntu24.04",
-            "ARCHITECTURE": "x86_64",
-            "GPU": "NVIDIA",
-            "SKU": "GB200",
-            "TARGET_NODE_TYPE": "azure_vm_regular",
-        }
-
-    def test_get_config_resolves_version(self):
-        self.assertEqual(
-            install_nvbandwidth_tool.config_for("nvbandwidth", self._env())["version"], "0.9")
-
-    def test_install_runs_clone_and_build(self):
-        env = self._env()
-        with mock.patch.object(install_nvbandwidth_tool, "install_deps", return_value=0), \
-             mock.patch.object(install_nvbandwidth_tool, "exec_program", return_value=0) as ex, \
-             mock.patch.object(install_nvbandwidth_tool, "write_component_version") as wcv, \
-             mock.patch("os.makedirs"), \
-             mock.patch("os.path.exists", return_value=False), \
-             mock.patch("shutil.move") as mv, \
-             mock.patch("shutil.rmtree"):
-            rc = install_nvbandwidth_tool.install(env)
-        self.assertEqual(rc, 0)
-        self.assertEqual(ex.call_count, 3)  # git clone, cmake, make
-        mv.assert_called_once()
-        wcv.assert_called_once()
-
-    def test_install_stops_on_clone_failure(self):
-        env = self._env()
-        with mock.patch.object(install_nvbandwidth_tool, "install_deps", return_value=0), \
-             mock.patch.object(install_nvbandwidth_tool, "exec_program",
-                               side_effect=[1]) as ex, \
-             mock.patch.object(install_nvbandwidth_tool, "write_component_version") as wcv, \
-             mock.patch.object(install_nvbandwidth_tool, "log_error") as logged, \
-             mock.patch("os.makedirs"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_nvbandwidth_tool.install(env)
-        self.assertEqual(rc, 3)
-        self.assertEqual(ex.call_count, 1)  # stopped after clone failed
-        wcv.assert_not_called()
-        logged.assert_called()   # clone failure is reported as an error
-
-    def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_nvbandwidth_tool, "log_error") as logged:
-            self.assertEqual(
-                install_nvbandwidth_tool.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
 

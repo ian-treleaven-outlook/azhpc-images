@@ -40,8 +40,14 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(m.samples_url("13.0"), _URL)
         self.assertEqual(m.samples_destination("12.9"), "/usr/local/cuda-12.9/samples")
 
-    @unittest.skip("install_cuda_samples.sh changed upstream (CMake install "
-                   "path for newer samples); port resync in ADO 985")
+    def test_cmake_options(self):
+        dest = "/usr/local/cuda-13.0/samples"
+        self.assertEqual(m.cmake_options(dest, False),
+                         ["-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"])
+        self.assertEqual(m.cmake_options(dest, True),
+                         ["-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
+                          f"-DCUDA_SAMPLES_INSTALL_DIR={dest}"])
+
     def test_bash_script_still_matches(self):
         script = (Path(__file__).resolve().parents[2] / "components"
                   / "install_cuda_samples.sh").read_text(encoding="utf-8")
@@ -51,12 +57,18 @@ class HelperTests(unittest.TestCase):
             "tar -xvf ${TARBALL}",
             "pushd ./cuda-samples-${CUDA_SAMPLES_VERSION}",
             "mkdir build && cd build",
-            "cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc ..",
+            "CMAKE_OPTIONS=(-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc)",
+            "if [[ -f ../cmake/InstallSamples.cmake ]]; then",
+            "\tCMAKE_OPTIONS+=(-DCUDA_SAMPLES_INSTALL_DIR=/usr/local/cuda-${CUDA_DRIVER_VERSION}/samples)",
+            'cmake "${CMAKE_OPTIONS[@]}" ..',
             "make -j $(nproc)",
-            "mv -vT ./Samples /usr/local/cuda-${CUDA_DRIVER_VERSION}/samples",
+            "\tcmake --install .",
+            "\tmv -vT ./Samples /usr/local/cuda-${CUDA_DRIVER_VERSION}/samples",
         ]:
             with self.subTest(line=line):
                 self.assertIn(line, script)
+        # The InstallSamples.cmake test appears twice: before cmake and after make.
+        self.assertEqual(script.count("if [[ -f ../cmake/InstallSamples.cmake ]]; then"), 2)
 
 
 class InstallTests(unittest.TestCase):
@@ -70,7 +82,12 @@ class InstallTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _install(self, env, *, fail_on=None, nproc=(0, "8\n"), download_error=None):
+    def _install(self, env, *, fail_on=None, nproc=(0, "8\n"), download_error=None,
+                 cmake_install=False):
+        """Run install(env) with the externals mocked.
+
+        cmake_install: the extracted source ships cmake/InstallSamples.cmake.
+        """
         calls = []
 
         def fake_download(url, sha256, dest_dir="."):
@@ -84,7 +101,10 @@ class InstallTests(unittest.TestCase):
             calls.append(("exec", command, kwargs.get("cwd")))
             if command[0] == "tar":
                 # What the real tar would extract: the source directory.
-                os.makedirs(os.path.join(self.work, "cuda-samples-13.0"))
+                source = os.path.join(self.work, "cuda-samples-13.0")
+                os.makedirs(os.path.join(source, "cmake"))
+                if cmake_install:
+                    Path(source, "cmake", "InstallSamples.cmake").write_text("")
             return 1 if command == fail_on else 0
 
         def fake_capture(command, op, **kwargs):
@@ -120,6 +140,53 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(logs["info"].call_args_list[-1].args[1],
                          "CUDA samples 13.0 installed")
         logs["warn"].assert_not_called()
+
+    def test_install_samples_cmake_uses_cmake_install(self):
+        rc, calls, logs = self._install(_env(), cmake_install=True)
+        self.assertEqual(rc, 0)
+        build = os.path.join(self.work, "cuda-samples-13.0", "build")
+        dest = f"{self.prefix}/cuda-13.0/samples"
+        self.assertEqual(calls, [
+            ("download", _URL, _SHA, self.work),
+            ("exec", ["tar", "-xvf", "v13.0.tar.gz"], self.work),
+            ("exec", ["cmake", "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
+                      f"-DCUDA_SAMPLES_INSTALL_DIR={dest}", ".."], build),
+            ("capture", ["nproc"]),
+            ("exec", ["make", "-j", "8"], build),
+            ("exec", ["cmake", "--install", "."], build),
+        ])
+        self.assertFalse(os.path.exists(self.work))
+        decision = [c for c in logs["info"].call_args_list
+                    if c.kwargs.get("install_method")]
+        self.assertEqual(len(decision), 1)
+        self.assertEqual(decision[0].kwargs["install_method"], "cmake --install")
+        self.assertEqual(decision[0].kwargs["dest"], dest)
+        self.assertIn(f"Installed the built CUDA samples to {dest} (cmake --install)",
+                      [c.args[1] for c in logs["info"].call_args_list])
+        logs["warn"].assert_not_called()
+
+    def test_without_install_samples_cmake_logs_mv_method(self):
+        _, _, logs = self._install(_env())
+        decision = [c for c in logs["info"].call_args_list
+                    if c.kwargs.get("install_method")]
+        self.assertEqual([c.kwargs["install_method"] for c in decision], ["mv -vT"])
+
+    def test_cmake_install_rerun_does_not_warn(self):
+        # cmake --install overwrites in place; only the mv -T path can't rerun.
+        os.makedirs(f"{self.prefix}/cuda-13.0/samples")
+        rc, _, logs = self._install(_env(), cmake_install=True)
+        self.assertEqual(rc, 0)
+        logs["warn"].assert_not_called()
+
+    def test_cmake_install_failure(self):
+        rc, calls, logs = self._install(_env(), cmake_install=True,
+                                        fail_on=["cmake", "--install", "."])
+        self.assertEqual(rc, 3)
+        self.assertEqual(calls[-1][1], ["cmake", "--install", "."])
+        dest = f"{self.prefix}/cuda-13.0/samples"
+        self.assertIn(f"cmake --install of the CUDA samples to {dest} failed",
+                      [c.args[1] for c in logs["error"].call_args_list])
+        self.assertFalse(os.path.exists(self.work))
 
     def test_v100_override_versions(self):
         cuda = {"driver": {"version": "12.9"}, "samples": {"version": "12.9", "sha256": "s"}}

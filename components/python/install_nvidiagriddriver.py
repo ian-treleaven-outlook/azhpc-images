@@ -13,9 +13,13 @@ Fabric Manager. In order:
   2. Configure GRID licensing, per Azure's documentation: copy
      /etc/nvidia/gridd.conf.template to /etc/nvidia/gridd.conf, make sure
      IgnoreSP=FALSE and EnableUI=FALSE are set, and delete FeatureType=0 lines.
-  3. Add NVIDIA's CUDA apt repository (cuda-keyring) and install the CUDA
-     toolkit whose version "cuda" -> driver.version gives (NCv6 has its own
-     entry in versions.json; config_for resolves it).
+  3. Install the CUDA toolkit whose version "cuda" -> driver.version gives
+     (NCv6 has its own entry in versions.json; config_for resolves it) from
+     NVIDIA's CUDA apt repository. Since upstream #643 this step no longer
+     adds that repository: the bootstrap (distros/<distro>/install_utils.sh)
+     runs components/install_cuda_repo_and_dkms.sh, which installs the
+     cuda-keyring and DKMS before any component runs. We log a warning if no
+     CUDA apt source is configured (bash doesn't check; apt then fails).
   4. Write /etc/profile.d/cuda.sh, which puts /usr/local/cuda/bin on PATH and
      /usr/local/cuda/lib64 on LD_LIBRARY_PATH for login shells.
   5. Ask nvcc (via /etc/profile) for the installed CUDA version and record it
@@ -42,10 +46,6 @@ The original bash, for comparison (comments trimmed):
 
     cuda_metadata=$(get_component_config "cuda")
     CUDA_DRIVER_VERSION=$(jq -r '.driver.version' <<< $cuda_metadata)
-    CUDA_DRIVER_DISTRIBUTION=$(jq -r '.driver.distribution' <<< $cuda_metadata)
-    wget https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_DRIVER_DISTRIBUTION}/x86_64/cuda-keyring_1.1-1_all.deb
-    dpkg -i ./cuda-keyring_1.1-1_all.deb
-    apt-get update
     apt install -y cuda-toolkit-${CUDA_DRIVER_VERSION//./-}
 
     echo 'export PATH="${PATH:+$PATH:}/usr/local/cuda/bin"' | tee /etc/profile.d/cuda.sh > /dev/null
@@ -92,16 +92,16 @@ Behaviour kept from bash
     checked against the real tools in WSL.
   * /etc/profile.d/cuda.sh gets exactly the bytes the two echo | tee lines
     write (checked against bash in WSL; a test also compares it with the .sh).
-  * Nothing checks the distro, like bash. The dpkg/apt commands only work on
-    Ubuntu, so on any other distro we log a warning and carry on; the dpkg or
-    apt command then fails the step, as it would fail the bash script.
+  * Nothing checks the distro, like bash. The apt command only works on
+    Ubuntu, so on any other distro we log a warning and carry on; apt then
+    fails the step, as it would fail the bash script.
 
 Deliberate differences from bash
 --------------------------------
   * Missing config fails up front, before anything is installed: the GRID
-    url, sha256 and version, and the CUDA driver.version and
-    driver.distribution. Bash would download "null", run a missing installer,
-    or wget .../repos/null/... after the GRID driver was already installed.
+    url, sha256 and version, and the CUDA driver.version. Bash would download
+    "null", run a missing installer, or `apt install cuda-toolkit-null` after
+    the GRID driver was already installed.
   * An empty CUDA version (nvcc missing or unexpected output) or a failing
     `source /etc/profile; nvcc --version` fails the step. Bash, without
     pipefail and inside $(...), would record CUDA="".
@@ -127,6 +127,7 @@ step, as in bash under `set -e`.
 # Lets type hints such as `str | None` work on older Python versions.
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -141,11 +142,15 @@ from utils.process import exec_program, run_capture
 _OP = "install-nv-grid"
 
 # ---- Paths (module-level so tests can point them at a temporary directory) --
-# Scratch area for the driver installer and the cuda-keyring package.
+# Scratch area for the driver installer.
 _WORK_DIR = "/tmp/azhpc-nvidia-grid"
 _GRIDD_TEMPLATE = "/etc/nvidia/gridd.conf.template"
 _GRIDD_CONF = "/etc/nvidia/gridd.conf"
 _CUDA_PROFILE = "/etc/profile.d/cuda.sh"
+# Where the cuda-keyring package (installed by install_cuda_repo_and_dkms.sh
+# in the bootstrap) puts NVIDIA's CUDA apt source, e.g. cuda-ubuntu2404-x86_64.list.
+_APT_SOURCES_DIR = "/etc/apt/sources.list.d"
+_CUDA_APT_SOURCE_GLOB = "cuda-*"
 
 # The nested component script that configures nvidia-persistenced.
 _PERSISTENCE_SCRIPT = "configure_nvidia_persistence.sh"
@@ -156,7 +161,6 @@ _GRIDD_FALSE_KEYS = ("IgnoreSP", "EnableUI")
 _GRIDD_DELETE_PREFIX = "FeatureType=0"
 
 _DRIVER_INSTALLER_ARGS = ["--silent", "--dkms", "--kernel-module-type=open"]
-_CUDA_KEYRING = "cuda-keyring_1.1-1_all.deb"
 
 # The shell part of bash's  cuda_version=$(source /etc/profile; nvcc --version | ...).
 # It runs in its own bash so /etc/profile (and so /etc/profile.d/cuda.sh) can
@@ -188,12 +192,6 @@ _TEXT_IO = {"encoding": "utf-8", "errors": "surrogateescape", "newline": ""}
 def driver_installer_name(version: str) -> str:
     """The installer file name bash runs: NVIDIA-Linux-x86_64-<V>-grid-azure.run."""
     return f"NVIDIA-Linux-x86_64-{version}-grid-azure.run"
-
-
-def cuda_keyring_url(repo_distribution: str) -> str:
-    """The cuda-keyring .deb URL for a CUDA repo distribution such as ubuntu2404."""
-    return ("https://developer.download.nvidia.com/compute/cuda/repos/"
-            f"{repo_distribution}/x86_64/{_CUDA_KEYRING}")
 
 
 def cuda_toolkit_package(version: str) -> str:
@@ -308,12 +306,10 @@ def _resolve_config(env: dict[str, str]) -> dict[str, str] | None:
         "grid_sha256": grid.get("sha256"),
         "grid_version": grid.get("version"),
         "cuda_version": driver.get("version"),
-        "cuda_repo": driver.get("distribution"),
     }
     names = {"grid_url": "nvidia_grid.url", "grid_sha256": "nvidia_grid.sha256",
              "grid_version": "nvidia_grid.version",
-             "cuda_version": "cuda.driver.version",
-             "cuda_repo": "cuda.driver.distribution"}
+             "cuda_version": "cuda.driver.version"}
     missing = [names[key] for key, value in values.items() if not value]
     if missing:
         log_error(_OP, f"could not resolve {', '.join(missing)} from versions.json",
@@ -440,6 +436,24 @@ def _write_cuda_profile() -> bool:
     return True
 
 
+def _check_cuda_apt_source() -> None:
+    """Log whether NVIDIA's CUDA apt source is configured (bash doesn't check).
+
+    install_cuda_repo_and_dkms.sh adds it during the bootstrap; without it the
+    `apt install cuda-toolkit-...` below can't find the package.
+    """
+    sources = sorted(glob.glob(os.path.join(_APT_SOURCES_DIR, _CUDA_APT_SOURCE_GLOB)))
+    if sources:
+        log_info(_OP, "NVIDIA CUDA apt source present (added by "
+                      "install_cuda_repo_and_dkms.sh in the bootstrap)",
+                 cuda_apt_sources=", ".join(sources))
+    else:
+        log_warn(_OP, f"no CUDA apt source ({_CUDA_APT_SOURCE_GLOB}) in "
+                      f"{_APT_SOURCES_DIR}: the bootstrap's install_cuda_repo_and_dkms.sh "
+                      "should have added it; installing the toolkit anyway, as bash does",
+                 path=_APT_SOURCES_DIR)
+
+
 def _installed_cuda_version(env: dict[str, str]) -> str | None:
     """Ask nvcc, through /etc/profile, for the CUDA version. None (logged) on error."""
     rc, output = run_capture(["bash", "-c", _NVCC_VERSION_SHELL], _OP,
@@ -465,18 +479,16 @@ def install(env: dict[str, str]) -> int:
         return 3
     grid_version = values["grid_version"]
     toolkit = cuda_toolkit_package(values["cuda_version"])
-    keyring_url = cuda_keyring_url(values["cuda_repo"])
 
     log_info(_OP, f"Installing NVIDIA GRID driver {grid_version} and {toolkit}",
              grid_version=grid_version, source=values["grid_url"],
-             cuda_toolkit_version=values["cuda_version"],
-             cuda_repo=values["cuda_repo"], distro=distribution,
+             cuda_toolkit_version=values["cuda_version"], distro=distribution,
              sku=env.get("SKU", ""), node_type=env.get("TARGET_NODE_TYPE", ""),
              work_dir=_WORK_DIR)
     if not distribution.startswith("ubuntu"):
-        log_warn(_OP, "install_nvidiagriddriver.sh assumes Ubuntu (dpkg/apt) but "
+        log_warn(_OP, "install_nvidiagriddriver.sh assumes Ubuntu (apt) but "
                       "doesn't check the distro; continuing like bash, so the "
-                      "dpkg/apt commands will fail", distro=distribution)
+                      "apt command will fail", distro=distribution)
 
     try:
         # Start from an empty work directory (see the module docstring).
@@ -511,14 +523,11 @@ def install(env: dict[str, str]) -> int:
         if not _configure_grid_licensing(env):
             return 3
 
-        # ---- 3. CUDA toolkit ----------------------------------------------------
-        log_info(_OP, f"Adding the NVIDIA CUDA apt repository ({values['cuda_repo']}) "
-                      f"and installing {toolkit}", source=keyring_url,
-                 package=toolkit, cuda_repo=values["cuda_repo"])
-        if not _run_all([["wget", keyring_url],
-                         ["dpkg", "-i", f"./{_CUDA_KEYRING}"],
-                         ["apt-get", "update"],
-                         ["apt", "install", "-y", toolkit]], env):
+        # ---- 3. CUDA toolkit (repo added by the bootstrap, see docstring) -----
+        _check_cuda_apt_source()
+        log_info(_OP, f"Installing {toolkit} from the NVIDIA CUDA apt repository",
+                 package=toolkit, cuda_toolkit_version=values["cuda_version"])
+        if not _run_all([["apt", "install", "-y", toolkit]], env):
             log_error(_OP, f"CUDA toolkit installation failed ({toolkit})",
                       package=toolkit, distro=distribution)
             return 3

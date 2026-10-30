@@ -295,10 +295,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # dedicated install_nvidiagpudriver_gb200.sh was removed upstream in #566.)
         Step("install-nv-driver", "install_nvidiagpudriver.sh",
              action=install_nvidiagpudriver.install,
-             when=lambda c: nvidia(c) and c.gpu != "NCv6", resync="ADO 985"),
+             when=lambda c: nvidia(c) and c.gpu != "NCv6"),
         Step("install-nv-grid", "install_nvidiagriddriver.sh",
              action=install_nvidiagriddriver.install,
-             when=lambda c: nvidia(c) and c.gpu == "NCv6", resync="ADO 985"),
+             when=lambda c: nvidia(c) and c.gpu == "NCv6"),
 
         # PMIX + MPI libraries
         Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
@@ -310,10 +310,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nvloom", "install_nvloom.sh",
              action=install_nvloom.install,
-             when=lambda c: nvidia(c) and c.gpu == "GB200", resync="ADO 985"),
+             when=lambda c: nvidia(c) and c.gpu == "GB200"),
         Step("install-nvbandwidth", "install_nvbandwidth_tool.sh",
              action=install_nvbandwidth_tool.install,
-             when=lambda c: nvidia(c) and c.gpu == "GB200", resync="ADO 985"),
+             when=lambda c: nvidia(c) and c.gpu == "GB200"),
 
         # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", action=install_nccl.install,

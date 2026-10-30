@@ -141,10 +141,6 @@ class InstallShParityTests(unittest.TestCase):
 # deliberate change that also updates this test.
 class ResyncTests(unittest.TestCase):
     EXPECTED = {
-        "install-nv-driver": "ADO 985",
-        "install-nv-grid": "ADO 985",
-        "install-nvloom": "ADO 985",
-        "install-nvbandwidth": "ADO 985",
         "install-rocm": "ADO 986",
         "install-rccl": "ADO 986",
         "install-doca": "ADO 987",

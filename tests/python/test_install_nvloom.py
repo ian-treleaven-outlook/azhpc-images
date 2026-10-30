@@ -2,14 +2,17 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_commands, patch_path, build_script) are
-    tested directly.
+  * The pure helpers (dependency_commands, configured_ref, patch_path,
+    build_script) are tested directly. configured_ref was also compared with
+    real jq/bash in WSL on the same configs.
   * install() is tested with exec_program replaced by a fake that records each
     command and imitates its effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvloom_cli binary. The
     install paths (_DEST_DIR, _WORK_DIR) point into a temporary directory, so
     the real file moves and cleanup run without touching /opt or /tmp, and
-    nothing is installed, cloned or compiled.
+    nothing is installed, cloned or compiled. write_repo_source_info is
+    mocked too; its calls are recorded in the same list as the commands, so
+    the order (clone, checkout, record, patch, build) is checked.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_nvloom -v
@@ -30,6 +33,7 @@ from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nvloom"
 _URL = "https://github.com/NVIDIA/nvloom.git"
+_COMMIT = "bc0983828805d9ef2a912768fdae1465d581ef7c"
 
 # tests/python/<this file> -> parents[2] is the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,11 +53,13 @@ _UBUNTU_DEPS = [
 class _FakeExec:
     """Stands in for exec_program: records calls and imitates their effects.
 
-    fail_at, when given, is the index of the call that should fail (exit 1).
+    fail_at, when given, is the index of the command that should fail (exit 1),
+    counting commands only (not the write_repo_source_info markers).
     """
 
     def __init__(self, fail_at=None, clone_creates_source=True, build_creates_binary=True):
         self.calls = []          # (command, cwd) for every call, in order
+        self.commands = 0        # how many commands (not other markers) ran
         self.fail_at = fail_at
         self.clone_creates_source = clone_creates_source
         self.build_creates_binary = build_creates_binary
@@ -61,7 +67,8 @@ class _FakeExec:
     def __call__(self, command, op, *, cwd=None, env=None):
         assert op == _OP
         self.calls.append((command, cwd))
-        if len(self.calls) - 1 == self.fail_at:
+        self.commands += 1
+        if self.commands - 1 == self.fail_at:
             return 1
         if command[:2] == ["git", "clone"]:
             source = os.path.join(cwd, "nvloom")
@@ -90,10 +97,11 @@ class _Sandbox:
 
 
 def _env(distribution, sandbox, *, config=None, node_type=None):
-    """A minimal build env. config=None uses version 1.2.0 + the GitHub url;
-    config={} leaves nvloom out of COMPONENT_VERSIONS."""
+    """A minimal build env. config=None uses version 1.2.0, the GitHub url and
+    a pinned commit (no ref: it defaults to v1.2.0); config={} leaves nvloom
+    out of COMPONENT_VERSIONS."""
     if config is None:
-        config = {"version": "1.2.0", "url": _URL}
+        config = {"version": "1.2.0", "url": _URL, "commit": _COMMIT}
     versions = {"nvloom": {distribution: {"aarch64": config}}} if config else {}
     env = {
         "DISTRIBUTION": distribution,
@@ -117,6 +125,37 @@ class HelperTests(unittest.TestCase):
         for other in ("almalinux9.8", "rocky8.10", "azurelinux3.1", ""):
             with self.subTest(distribution=other):
                 self.assertIsNone(install_nvloom.dependency_commands(other))
+
+    def test_configured_ref_follows_jq_and_bash_defaults(self):
+        ref = install_nvloom.configured_ref
+        self.assertEqual(ref({}, "1.2.0"), "v1.2.0")
+        self.assertEqual(ref({"ref": "v9"}, "1.2.0"), "v9")
+        self.assertEqual(ref({"ref": "v9", "branch": "main"}, "1.2.0"), "v9")
+        self.assertEqual(ref({"branch": "main"}, "1.2.0"), "main")
+        self.assertEqual(ref({"ref": None, "branch": "main"}, "1.2.0"), "main")
+        self.assertEqual(ref({"ref": False, "branch": "main"}, "1.2.0"), "main")
+        # jq keeps "" (it hides branch); bash's ${REF:-...} then defaults it.
+        self.assertEqual(ref({"ref": "", "branch": "main"}, "1.2.0"), "v1.2.0")
+
+    def test_bash_script_still_matches(self):
+        script = (_REPO_ROOT / "components" / "install_nvloom.sh").read_text(encoding="utf-8")
+        for line in [
+            "NVLOOM_COMMIT=$(jq -r '.commit' <<< $nvloom_metadata)",
+            "NVLOOM_REF=$(jq -r '.ref // .branch // empty' <<< $nvloom_metadata)",
+            "NVLOOM_REF=${NVLOOM_REF:-v${NVLOOM_VERSION}}",
+            "git clone $NVLOOM_DOWNLOAD_URL --branch $NVLOOM_REF",
+            "git checkout $NVLOOM_COMMIT",
+            'write_repo_source_info "NVLOOM" . \\',
+            '--commit "${NVLOOM_COMMIT}" \\',
+            '--ref "${NVLOOM_REF}"',
+            'cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="100" .',
+            'write_component_version "NVLOOM" ${NVLOOM_VERSION}',
+        ]:
+            with self.subTest(line=line):
+                self.assertIn(line, script)
+        # Both distro branches clone, check out and record the source.
+        self.assertEqual(script.count("git checkout $NVLOOM_COMMIT"), 2)
+        self.assertEqual(script.count('write_repo_source_info "NVLOOM"'), 2)
 
     def test_patch_path_is_inside_the_repo_checkout(self):
         self.assertEqual(
@@ -148,25 +187,39 @@ class InstallTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.box = _Sandbox(temp.name)
 
-    def _install(self, env, fake=None, write_error=None):
+    def _install(self, env, fake=None, write_error=None, source_result=True):
         """Run install(env) with exec_program faked and paths in the sandbox.
 
+        source_result: what the mocked write_repo_source_info returns (or an
+        exception it raises).
         Returns the exit code, the fake (its .calls list) and the mocks for
         write_component_version and log_error.
         """
         fake = fake or _FakeExec()
+
+        def fake_source(component, repo_dir, op, *, commit=None, ref=None, env=None):
+            fake.calls.append((("repo_source", component, commit, ref), repo_dir))
+            if isinstance(source_result, Exception):
+                raise source_result
+            return source_result
+
         with mock.patch.object(install_nvloom, "_DEST_DIR", str(self.box.dest)), \
              mock.patch.object(install_nvloom, "_WORK_DIR", str(self.box.work)), \
              mock.patch.object(install_nvloom, "exec_program", side_effect=fake), \
+             mock.patch.object(install_nvloom, "write_repo_source_info",
+                               side_effect=fake_source), \
              mock.patch.object(install_nvloom, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(install_nvloom, "log_info") as self.log_info, \
              mock.patch.object(install_nvloom, "log_error") as log_error:
             rc = install_nvloom.install(env)
         return rc, fake, record, log_error
 
-    def _expected_build_calls(self, *, with_patch):
+    def _expected_build_calls(self, *, with_patch, ref="v1.2.0", commit=_COMMIT):
         source = str(self.box.work / "nvloom")
-        calls = [(["git", "clone", _URL, "--branch", "v1.2.0"], str(self.box.work))]
+        calls = [(["git", "clone", _URL, "--branch", ref], str(self.box.work)),
+                 (["git", "checkout", commit], source),
+                 (("repo_source", "NVLOOM", commit, ref), source)]
         if with_patch:
             calls.append((["git", "apply", str(self.box.patch)], source))
         calls.append((["bash", "-c", install_nvloom.build_script()], source))
@@ -185,6 +238,11 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(self.box.work.exists())     # bash's rm -rf ./nvloom
         record.assert_called_once_with("NVLOOM", "1.2.0")
         log_error.assert_not_called()
+        start = self.log_info.call_args_list[0].kwargs
+        self.assertEqual((start["version"], start["ref"], start["commit"], start["source"]),
+                         ("1.2.0", "v1.2.0", _COMMIT, _URL))
+        self.assertTrue(any("Applied azurelinux_nvloom.patch" in c.args[1]
+                            for c in self.log_info.call_args_list))
 
     def test_ubuntu_builds_without_a_patch(self):
         rc, fake, record, log_error = self._install(_env("ubuntu24.04", self.box))
@@ -197,13 +255,42 @@ class InstallTests(unittest.TestCase):
         record.assert_called_once_with("NVLOOM", "1.2.0")
         log_error.assert_not_called()
 
+    def test_configured_ref_and_branch_are_cloned(self):
+        for extra, ref in [({"ref": "v1.2.0-rc"}, "v1.2.0-rc"), ({"branch": "main"}, "main")]:
+            with self.subTest(extra=extra):
+                config = {"version": "1.2.0", "url": _URL, "commit": _COMMIT, **extra}
+                rc, fake, _, _ = self._install(_env("ubuntu24.04", self.box, config=config))
+                self.assertEqual(rc, 0)
+                self.assertEqual(fake.calls[3:],
+                                 self._expected_build_calls(with_patch=False, ref=ref))
+
+    def test_checkout_failure_stops_before_recording(self):
+        rc, fake, record, log_error = self._install(_env("ubuntu24.04", self.box),
+                                                    _FakeExec(fail_at=4))
+        self.assertEqual(rc, 3)
+        self.assertEqual(fake.calls[-1][0], ["git", "checkout", _COMMIT])
+        record.assert_not_called()
+
+    def test_repo_source_failure_returns_3(self):
+        for result in (False, PermissionError("denied")):
+            with self.subTest(result=result):
+                shutil.rmtree(self.box.work, ignore_errors=True)
+                rc, fake, record, log_error = self._install(
+                    _env("azurelinux3.0", self.box), source_result=result)
+                self.assertEqual(rc, 3)
+                self.assertEqual(fake.calls[-1][0][0], "repo_source")   # nothing after it
+                record.assert_not_called()
+                self.assertIn("could not record the nvloom source",
+                              log_error.call_args[0][1])
+
     def test_patch_is_never_read_from_hpcuser_home(self):
         # Regression: bash hardcodes /home/hpcuser/azhpc-images/....
         _, fake, _, _ = self._install(_env("azurelinux3.0", self.box))
 
-        applied = [cmd for cmd, _ in fake.calls if cmd[:2] == ["git", "apply"]]
+        commands = [cmd for cmd, _ in fake.calls if isinstance(cmd, list)]
+        applied = [cmd for cmd in commands if cmd[:2] == ["git", "apply"]]
         self.assertEqual(applied, [["git", "apply", str(self.box.patch)]])
-        self.assertFalse(any("/home/hpcuser" in " ".join(cmd) for cmd, _ in fake.calls))
+        self.assertFalse(any("/home/hpcuser" in " ".join(cmd) for cmd in commands))
 
     def test_rerun_replaces_a_leftover_checkout_and_binary(self):
         # A failed earlier run left a checkout behind; a successful one left
@@ -220,19 +307,25 @@ class InstallTests(unittest.TestCase):
 
     def test_real_versions_json_honours_the_baremetal_3p_override(self):
         versions = (_REPO_ROOT / "versions.json").read_text(encoding="utf-8")
-        cases = {None: "2.0.0", "baremetal_3p": "1.2.0"}
-        for node_type, expected in cases.items():
+        cases = {None: ("2.0.0", "7426efd0f6a9feb8cab70e9c5745c1a9eefaf352"),
+                 "baremetal_3p": ("1.2.0", "bc0983828805d9ef2a912768fdae1465d581ef7c")}
+        for node_type, (expected, commit) in cases.items():
             with self.subTest(node_type=node_type):
                 env = _env("ubuntu24.04", self.box, node_type=node_type)
                 env.update(GPU="NVIDIA", SKU="GB200", COMPONENT_VERSIONS=versions)
                 rc, fake, record, _ = self._install(env)
                 self.assertEqual(rc, 0)
                 self.assertIn(f"v{expected}", fake.calls[3][0])
+                self.assertEqual(fake.calls[4][0], ["git", "checkout", commit])
+                self.assertEqual(fake.calls[5][0],
+                                 ("repo_source", "NVLOOM", commit, f"v{expected}"))
                 record.assert_called_once_with("NVLOOM", expected)
 
     # ---- failure paths: each must return 3 and log an error ----------------
     def test_missing_config_returns_3_before_any_change(self):
-        for config in ({}, {"version": "1.2.0"}, {"url": _URL}):
+        for config in ({}, {"version": "1.2.0"}, {"url": _URL},
+                       {"version": "1.2.0", "url": _URL},
+                       {"version": "1.2.0", "url": _URL, "commit": ""}):
             with self.subTest(config=config):
                 rc, fake, record, log_error = self._install(
                     _env("ubuntu24.04", self.box, config=config))
@@ -272,8 +365,10 @@ class InstallTests(unittest.TestCase):
         self.assertIn("azurelinux_nvloom.patch", log_error.call_args[0][1])
 
     def test_each_failing_command_returns_3_and_stops(self):
-        # Azure Linux runs 6 commands: 3 deps, clone, apply, build.
-        for fail_at in range(6):
+        # Azure Linux runs 7 commands: 3 deps, clone, checkout, apply, build.
+        # (write_repo_source_info runs between checkout and apply; it is not
+        # a command, so it doesn't count for fail_at.)
+        for fail_at in range(7):
             with self.subTest(fail_at=fail_at):
                 # Each sub-test starts like a fresh build area. (install()
                 # would also clear it; this keeps the sub-tests independent.)
@@ -281,7 +376,9 @@ class InstallTests(unittest.TestCase):
                 rc, fake, record, log_error = self._install(
                     _env("azurelinux3.0", self.box), _FakeExec(fail_at=fail_at))
                 self.assertEqual(rc, 3)
-                self.assertEqual(len(fake.calls), fail_at + 1)   # nothing after it
+                commands = [c for c, _ in fake.calls if isinstance(c, list)]
+                self.assertEqual(len(commands), fail_at + 1)   # nothing after it
+                self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.box.dest / "nvloom_cli").exists())
                 record.assert_not_called()
                 log_error.assert_called_once()
