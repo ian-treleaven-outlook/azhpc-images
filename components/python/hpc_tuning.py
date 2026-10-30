@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from utils.distro import Distro
 from utils.files import write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import install_packages, remove_packages
 from utils.process import run, run_all, run_capture
 from utils.services import service_is_active, systemctl
 
@@ -195,10 +195,9 @@ def _append(path: str, text: str) -> bool:
     return write_file(path, text, _OP, append=True)
 
 
-# TODO(ADO 1001): toolkit candidate: remove_installed_packages(packages, env, op) -> bool
-# (probe `dnf list installed` / `dpkg -s`, then `dnf remove -y` / `apt-get remove -y`).
 def _remove_azsec_monitor(env: dict[str, str]) -> bool:
     """`if dnf list installed azsec-monitor >/dev/null 2>&1; then dnf remove -y ...; fi`."""
+    # The probe stays local: no other port removes a package only if installed.
     # A non-zero probe is the normal "not installed" answer, not an ERROR.
     rc, _ = run_capture(["dnf", "list", "installed", _AZSEC_PACKAGE], _OP, env=env,
                         failure_is_error=False)
@@ -208,7 +207,7 @@ def _remove_azsec_monitor(env: dict[str, str]) -> bool:
         return True
     log_info(_OP, f"Removing {_AZSEC_PACKAGE} (auoms) to avoid its CPU usage",
              package=_AZSEC_PACKAGE, installed=True)
-    return run(["dnf", "remove", "-y", _AZSEC_PACKAGE], _OP, env=env)
+    return remove_packages([_AZSEC_PACKAGE], env, _OP)
 
 
 def _distro_cleanup(tuning: DistroTuning, env: dict[str, str]) -> bool:
