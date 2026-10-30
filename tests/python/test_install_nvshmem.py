@@ -9,7 +9,7 @@ Two kinds of test:
     (exec_program, both the module's and utils.package_installer's, which
     runs the Azure Linux install, as one mock), listing installed packages (run_capture) and writing the
     versions file. The cuda config comes from a small COMPONENT_VERSIONS JSON in
-    the env, so the real config_for() resolves it. Nothing touches /opt or runs
+    the env, so the real require_config() resolves it. Nothing touches /opt or runs
     a package manager.
 
 Run from the repo root:
@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvshmem
-from utils import package_installer
+from utils import component_config, package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nvshmem"
@@ -173,7 +173,8 @@ class InstallTests(unittest.TestCase):
 
         Returns the exit code plus the mocks: run (exec_program), capture
         (run_capture), record (write_component_version) and log_error.
-        install_packages()'s own error log is kept as self.pkg_error.
+        install_packages()'s own error log is kept as self.pkg_error, and
+        require_config()'s as self.config_error.
         """
         if list_result is None:
             output = _DNF_LIST if env["DISTRIBUTION"] == "azurelinux3.0" else _APT_LIST
@@ -182,6 +183,7 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(package_installer, "exec_program", run), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
+             mock.patch.object(component_config, "log_error") as config_error, \
              mock.patch.object(install_nvshmem, "run_capture",
                                return_value=list_result) as capture, \
              mock.patch.object(install_nvshmem, "write_component_version",
@@ -191,6 +193,7 @@ class InstallTests(unittest.TestCase):
             rc = install_nvshmem.install(env)
         self.log_warn = log_warn
         self.pkg_error = pkg_error
+        self.config_error = config_error
         return rc, run, capture, record, log_error
 
     # ---- success paths -----------------------------------------------------
@@ -248,30 +251,36 @@ class InstallTests(unittest.TestCase):
 
     # ---- failure paths: each must return 3 and log an error ----------------
     def test_missing_cuda_config_returns_3(self):
-        rc, run, _, record, log_error = self._install(_env("ubuntu24.04", None))
+        for driver_version in (None, "null", ""):
+            with self.subTest(driver_version=driver_version):
+                rc, run, _, record, _ = self._install(_env("ubuntu24.04", driver_version))
 
-        self.assertEqual(rc, 3)
-        run.assert_not_called()
-        record.assert_not_called()
-        log_error.assert_called_once()
+                self.assertEqual(rc, 3)
+                run.assert_not_called()
+                record.assert_not_called()
+                self.config_error.assert_called_once()
 
     def test_non_numeric_cuda_version_returns_3(self):
-        rc, run, _, record, log_error = self._install(_env("ubuntu24.04", "null"))
+        rc, run, _, record, log_error = self._install(_env("ubuntu24.04", "x.0"))
 
         self.assertEqual(rc, 3)
         run.assert_not_called()
         record.assert_not_called()
         log_error.assert_called_once()
+        self.assertIn("'x.0' has no numeric major version", log_error.call_args[0][1])
 
     def test_unsupported_distro_returns_3_without_installing(self):
-        # Bash would install nothing and record an empty NVSHMEM version.
-        rc, run, capture, record, log_error = self._install(_env("almalinux9.8"))
+        # Bash would install nothing and record an empty NVSHMEM version. Azure
+        # Linux is an exact match in bash, so azurelinux2.0 is unsupported too.
+        for distribution in ("almalinux9.8", "azurelinux2.0"):
+            with self.subTest(distribution=distribution):
+                rc, run, capture, record, log_error = self._install(_env(distribution))
 
-        self.assertEqual(rc, 3)
-        run.assert_not_called()
-        capture.assert_not_called()
-        record.assert_not_called()
-        self.assertIn("almalinux9.8", log_error.call_args[0][1])
+                self.assertEqual(rc, 3)
+                run.assert_not_called()
+                capture.assert_not_called()
+                record.assert_not_called()
+                self.assertIn(distribution, log_error.call_args[0][1])
 
     def test_install_failure_returns_3_and_stops(self):
         for distribution in ("ubuntu24.04", "azurelinux3.0"):
@@ -288,11 +297,12 @@ class InstallTests(unittest.TestCase):
     def test_list_failure_returns_3(self):
         for distribution in ("ubuntu24.04", "azurelinux3.0"):
             with self.subTest(distribution=distribution):
-                rc, _, _, record, log_error = self._install(
+                # run_capture logs the failing command itself.
+                rc, _, capture, record, _ = self._install(
                     _env(distribution), list_result=(1, ""))
                 self.assertEqual(rc, 3)
+                capture.assert_called_once()
                 record.assert_not_called()
-                log_error.assert_called()
 
     def test_package_not_listed_returns_3(self):
         # Bash would record an empty version here.
