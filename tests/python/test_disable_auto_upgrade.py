@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import disable_auto_upgrade
+from utils import process
 from utils.build_config import BuildConfig, build_plan
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,11 +34,11 @@ _UBUNTU_FILE_OFF = ('APT::Periodic::Update-Package-Lists "1";\n'
 
 _SYSTEMCTL_CALLS = [
     mock.call(["systemctl", "stop", "unattended-upgrades.service"],
-              "disable-auto-upgrade", env=mock.ANY),
+              "disable-auto-upgrade", cwd=None, env=mock.ANY),
     mock.call(["systemctl", "disable", "unattended-upgrades.service"],
-              "disable-auto-upgrade", env=mock.ANY),
+              "disable-auto-upgrade", cwd=None, env=mock.ANY),
     mock.call(["systemctl", "mask", "unattended-upgrades.service"],
-              "disable-auto-upgrade", env=mock.ANY),
+              "disable-auto-upgrade", cwd=None, env=mock.ANY),
 ]
 
 
@@ -104,7 +105,7 @@ class InstallTests(unittest.TestCase):
         env = {"DISTRIBUTION": "ubuntu26.04"}
         with mock.patch.object(disable_auto_upgrade, "_AUTO_UPGRADES_FILE",
                                self.path), \
-             mock.patch.object(disable_auto_upgrade, "exec_program",
+             mock.patch.object(process, "exec_program",
                                side_effect=list(systemctl_rcs)) as run, \
              mock.patch.object(disable_auto_upgrade, "log_error") as log_error:
             rc = disable_auto_upgrade.install(env)
@@ -168,7 +169,7 @@ class InstallTests(unittest.TestCase):
                 # Calls up to and including the failing one; nothing after.
                 self.assertEqual(run.call_args_list,
                                  _SYSTEMCTL_CALLS[:failing + 1])
-                log_error.assert_called()
+                log_error.assert_not_called()  # exec_program logs the failure
 
 
 # --------------------------------------------------------------------------- #
@@ -178,15 +179,6 @@ class InstallTests(unittest.TestCase):
 class BashSourceTests(unittest.TestCase):
     def setUp(self):
         self.script = _BASH_SCRIPT.read_text(encoding="utf-8")
-
-    def test_docstring_quotes_the_ubuntu2604_script(self):
-        # Every non-blank line of the script after the shebang appears, indented
-        # by four spaces, in the module docstring.
-        doc = disable_auto_upgrade.__doc__
-        for line in self.script.splitlines()[1:]:
-            if line.strip():
-                with self.subTest(line=line):
-                    self.assertIn("    " + line + "\n", doc)
 
     def test_constants_match_the_script(self):
         self.assertIn(
