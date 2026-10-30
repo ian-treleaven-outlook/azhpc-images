@@ -23,8 +23,8 @@ from components.python import (
     disable_predictive_interface_renaming, hpc_tuning, install_amd_libs,
     install_azsecpack_prereqs, install_azure_persistent_rdma_naming, install_aznfs,
     install_dcgm, install_doca, install_docker, install_health_checks, install_hpcdiag,
-    install_intel_libs, install_libfabric, install_lustre_client, install_monitoring_tools,
-    install_mpifileutils, install_mpis, install_nccl, install_nvbandwidth_tool,
+    install_intel_libs, install_libfabric, install_lustre_client, install_mofed,
+    install_monitoring_tools, install_mpifileutils, install_mpis, install_nccl, install_nvbandwidth_tool,
     install_nvidiagpudriver, install_nvidiagriddriver, install_nvloom, install_nvshmem,
     install_pmix, install_rccl, install_rocm, install_waagent, no_rdma_network,
     remove_unused_packages, setup_sku_customizations, trivy_scan, write_kernel_os_version,
@@ -225,3 +225,9 @@ def unused_packages(**kw):
     """./remove_unused_packages.sh (Ubuntu 22.04 only; runs before install_utils.sh)."""
     return Step("remove-unused-packages", "remove_unused_packages.sh", base="distro",
                 action=remove_unused_packages.install, **kw)
+
+
+# --- Azure Linux ---------------------------------------------------------------
+def mofed(**kw):
+    """Azure Linux's InfiniBand stack (MOFED), in place of DOCA."""
+    return Step("install-mofed", "install_mofed.sh", action=install_mofed.install, **kw)
