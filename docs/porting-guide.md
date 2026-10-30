@@ -259,7 +259,9 @@ It picks the manager the bash scripts use on the build's distro
 **one command**, as bash's `apt-get install -y a b c` does, so dependency
 resolution and all-or-nothing failure match. Version pins (`pkg=1.2`), local
 files (`./foo.deb`) and extra flags (`options=["--only-upgrade"]`,
-`options=["--disableexcludes=main", "--refresh"]`) pass straight through.
+`options=["--disableexcludes=main", "--refresh"]`) pass straight through. For
+the rare bash command written without `-y`, `assume_yes=False` keeps that quirk
+(log a warning: the manager aborts if it needs to ask).
 
 Make one call per bash command, so the grouping into transactions stays
 bash's. Bash spells the same install several ways (`apt` / `apt-get`,

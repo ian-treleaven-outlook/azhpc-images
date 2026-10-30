@@ -60,6 +60,15 @@ class InstallPackagesTests(unittest.TestCase):
         _, run, _, _ = self._run("jq", "rocky9.7")
         self.assertEqual(run.call_args.args[0], [*_DNF, "jq"])
 
+    def test_assume_yes_false_leaves_out_dash_y(self):
+        # Only to mirror a bash command without -y (install_nvshmem on Ubuntu).
+        _, run, info, _ = self._run(["libnvshmem3-cuda-13"], "ubuntu24.04", assume_yes=False)
+        self.assertEqual(run.call_args.args[0],
+                         ["apt-get", "install", "-o", "Dpkg::Use-Pty=0", "libnvshmem3-cuda-13"])
+        self.assertIs(info.call_args.kwargs["assume_yes"], False)
+        _, run, _, _ = self._run(["jq"], "rocky9.7", assume_yes=False)
+        self.assertEqual(run.call_args.args[0], ["dnf", "install", "jq"])
+
     def test_options_go_before_the_packages(self):
         _, run, _, _ = self._run(["lustre-client"], "almalinux9.7",
                                  options=["--disableexcludes=main", "--refresh"])

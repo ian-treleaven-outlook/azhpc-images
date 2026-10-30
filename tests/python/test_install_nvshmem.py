@@ -56,7 +56,10 @@ _DNF_INSTALL = [
     "https://developer.download.nvidia.com/compute/cuda/repos/rhel9/sbsa",
     "libnvshmem3-cuda-13", "libnvshmem3-devel-cuda-13", "libnvshmem3-static-cuda-13",
 ]
-_APT_INSTALL = ["apt", "install", "libnvshmem3-cuda-13", "libnvshmem3-dev-cuda-13"]
+# Bash: `apt install ...` without -y; install_packages() writes apt-get and,
+# with assume_yes=False, also leaves out -y.
+_APT_INSTALL = ["apt-get", "install", "-o", "Dpkg::Use-Pty=0",
+                "libnvshmem3-cuda-13", "libnvshmem3-dev-cuda-13"]
 
 
 def _env(distribution, driver_version="13.0"):
@@ -176,8 +179,7 @@ class InstallTests(unittest.TestCase):
             output = _DNF_LIST if env["DISTRIBUTION"] == "azurelinux3.0" else _APT_LIST
             list_result = (0, output)
         run = mock.Mock(return_value=exec_rc)
-        with mock.patch.object(install_nvshmem, "exec_program", run), \
-             mock.patch.object(package_installer, "exec_program", run), \
+        with mock.patch.object(package_installer, "exec_program", run), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(install_nvshmem, "run_capture",
@@ -208,14 +210,14 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         # Exactly as bash: no -y (see _install_ubuntu for why it is kept).
-        run.assert_called_once_with(_APT_INSTALL, _OP, env=env)
+        run.assert_called_once_with(_APT_INSTALL, _OP, cwd=None, env=env)
         capture.assert_called_once_with(["apt", "list", "--installed"], _OP, env=env)
         record.assert_called_once_with("NVSHMEM", "3.4.5-1")
         log_error.assert_not_called()
         # The missing -y is announced before apt runs.
         self.log_warn.assert_called_once()
-        self.assertEqual(self.log_warn.call_args.kwargs["command"],
-                         " ".join(_APT_INSTALL))
+        self.assertEqual(self.log_warn.call_args.kwargs["packages"],
+                         "libnvshmem3-cuda-13 libnvshmem3-dev-cuda-13")
 
     def test_azure_linux_does_not_warn_about_apt(self):
         self._install(_env("azurelinux3.0"))
@@ -228,8 +230,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         run.assert_called_once_with(
-            ["apt", "install", "libnvshmem3-cuda-12", "libnvshmem3-dev-cuda-12"],
-            _OP, env=env)
+            ["apt-get", "install", "-o", "Dpkg::Use-Pty=0",
+             "libnvshmem3-cuda-12", "libnvshmem3-dev-cuda-12"],
+            _OP, cwd=None, env=env)
         record.assert_called_once_with("NVSHMEM", "3.2.5-1")
 
     def test_real_versions_json_gives_cuda_13_for_gb200(self):

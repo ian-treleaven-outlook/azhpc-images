@@ -38,7 +38,7 @@ from utils.process import exec_program
 
 
 def install_packages(packages, env: dict[str, str], op: str, *, options=(),
-                     cwd: str | None = None) -> bool:
+                     cwd: str | None = None, assume_yes: bool = True) -> bool:
     """Install `packages` in one command with the distro's manager.
 
     `packages` is a name or a list of names; it may include version pins
@@ -48,6 +48,8 @@ def install_packages(packages, env: dict[str, str], op: str, *, options=(),
     `["--only-upgrade"]` (apt-get) or `["--disableexcludes=main", "--refresh"]`
     (dnf); the caller knows which family it is in. `cwd` is where the command
     runs (for relative package files). `op` is the calling step's log label.
+    assume_yes=False leaves out "-y", only to mirror a bash command that does
+    (the manager aborts if it needs to ask; the caller should log_warn why).
 
     Returns True on success. On failure (unknown distro, or the command
     fails) it logs an ERROR and returns False; the caller returns 3.
@@ -63,10 +65,10 @@ def install_packages(packages, env: dict[str, str], op: str, *, options=(),
                   distribution=distribution, packages=" ".join(packages))
         return False
 
-    command = manager.install_packages_command(packages, options)
+    command = manager.install_packages_command(packages, options, assume_yes)
     log_info(op, f"Installing {len(packages)} package(s) with {manager.name}",
              package_manager=manager.name, packages=" ".join(packages),
-             options=" ".join(options))
+             options=" ".join(options), assume_yes=assume_yes)
     rc = exec_program(command, op, cwd=cwd, env=env)
     if rc != 0:
         log_error(op, f"{manager.name} install failed with exit code {rc}",

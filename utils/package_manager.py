@@ -60,14 +60,19 @@ class PackageManager:
         """The full argv to install one `package` non-interactively."""
         return self.install_packages_command([package])
 
-    def install_packages_command(self, packages, options=()) -> list[str]:
+    def install_packages_command(self, packages, options=(), assume_yes=True) -> list[str]:
         """The full argv to install all `packages` in one command.
 
         `options` go between the template and the packages, e.g.
         ["--disableexcludes=main", "--refresh"] gives
         dnf install -y --disableexcludes=main --refresh <packages>.
+        assume_yes=False drops the template's "-y", for the rare bash command
+        that leaves it out (the manager then aborts if it needs to ask).
         """
-        return [*_INSTALL_TEMPLATES[self.name], *options, *packages]
+        template = _INSTALL_TEMPLATES[self.name]
+        if not assume_yes:
+            template = [arg for arg in template if arg != "-y"]
+        return [*template, *options, *packages]
 
 
 def manager_for_distribution(distribution: str) -> PackageManager | None:
