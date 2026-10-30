@@ -328,6 +328,10 @@ class MorePackageHelperTests(unittest.TestCase):
         _, run, _, _ = self._run(package_installer.remove_packages, "azsec-monitor",
                                  distribution="azurelinux3.0")
         self.assertEqual(run.call_args.args[0], ["dnf", "remove", "-y", "azsec-monitor"])
+        _, run, _, _ = self._run(package_installer.remove_packages, ["graphviz"],
+                                 options=["--auto-remove"])
+        self.assertEqual(run.call_args.args[0],
+                         ["apt-get", "remove", "--auto-remove", "-y", "graphviz"])
 
     def test_update_packages(self):
         _, run, _, _ = self._run(package_installer.update_packages, ["WALinuxAgent"],

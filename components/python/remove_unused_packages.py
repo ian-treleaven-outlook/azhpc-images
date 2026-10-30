@@ -21,7 +21,7 @@ Kept apt behaviour:
 from __future__ import annotations
 
 from utils.logger import log_info
-from utils.process import run
+from utils.package_installer import remove_packages
 
 _OP = "remove-unused-packages"
 
@@ -29,19 +29,10 @@ _OP = "remove-unused-packages"
 _PRO_ONLY_PACKAGES = ["graphviz"]
 
 
-# TODO(toolkit): remove_packages() in utils/package_installer.py has no
-# --auto-remove option; use it here once it does.
-def _remove_with_unused_dependencies(packages: list[str], env: dict[str, str]) -> bool:
-    """`apt-get remove --auto-remove -y <packages>`, as the bash script runs it."""
-    log_info(_OP, f"Removing {len(packages)} package(s) and dependencies nothing "
-                  "else needs (apt-get --auto-remove)",
-             package_manager="apt-get", packages=" ".join(packages))
-    return run(["apt-get", "remove", "--auto-remove", "-y", *packages], _OP, env=env)
-
-
 def install(env: dict[str, str]) -> int:
     """Remove the packages that need Ubuntu Pro for security updates."""
-    if not _remove_with_unused_dependencies(_PRO_ONLY_PACKAGES, env):
+    # --auto-remove: also remove dependencies nothing else needs, as bash does.
+    if not remove_packages(_PRO_ONLY_PACKAGES, env, _OP, options=["--auto-remove"]):
         return 3
     log_info(_OP, "Removed packages that need Ubuntu Pro for security updates",
              packages=" ".join(_PRO_ONLY_PACKAGES))

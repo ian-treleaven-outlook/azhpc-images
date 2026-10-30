@@ -1,6 +1,7 @@
 """Unit tests for components/python/remove_unused_packages.py.
 
-exec_program is mocked, so the tests never run apt-get.
+exec_program is mocked (where remove_packages calls it), so the tests
+never run apt-get.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -13,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import remove_unused_packages
-from utils import process
+from utils import package_installer
 from utils.plans import steps
 
 _BASH_SCRIPT = (Path(__file__).resolve().parents[2]
@@ -24,7 +25,7 @@ _ENV = {"DISTRIBUTION": "ubuntu22.04"}
 
 class InstallTests(unittest.TestCase):
     def _install(self, rc=0):
-        with mock.patch.object(process, "exec_program", return_value=rc) as exec_program, \
+        with mock.patch.object(package_installer, "exec_program", return_value=rc) as exec_program, \
              mock.patch.object(remove_unused_packages, "log_info") as log_info:
             result = remove_unused_packages.install(_ENV)
         return result, exec_program, log_info
@@ -33,8 +34,7 @@ class InstallTests(unittest.TestCase):
         rc, exec_program, _ = self._install()
 
         self.assertEqual(rc, 0)
-        exec_program.assert_called_once_with(_COMMAND, "remove-unused-packages",
-                                             cwd=None, env=_ENV)
+        exec_program.assert_called_once_with(_COMMAND, "remove-unused-packages", env=_ENV)
 
     def test_command_is_the_bash_scripts_word_for_word(self):
         self.assertIn(" ".join(_COMMAND) + "\n", _BASH_SCRIPT.read_text(encoding="utf-8"))
@@ -42,15 +42,16 @@ class InstallTests(unittest.TestCase):
     def test_logs_what_it_removes(self):
         _, _, log_info = self._install()
 
-        self.assertEqual(log_info.call_args_list[0].kwargs["packages"], "graphviz")
-        self.assertEqual(log_info.call_args_list[-1].kwargs["packages"], "graphviz")
+        # remove_packages logs the command; the port logs the result.
+        log_info.assert_called_once()
+        self.assertEqual(log_info.call_args.kwargs["packages"], "graphviz")
 
     def test_apt_get_failure_returns_3(self):
         rc, exec_program, log_info = self._install(rc=100)
 
         self.assertEqual(rc, 3)
         exec_program.assert_called_once()
-        self.assertEqual(log_info.call_count, 1)      # no "Removed" line
+        log_info.assert_not_called()                 # no "Removed" line
 
 
 class StepTests(unittest.TestCase):
