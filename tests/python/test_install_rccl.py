@@ -7,8 +7,9 @@
     real GNU sed/awk/jq/bash. Key lines are also compared with the bash script
     itself (components/install_rccl.sh), so an upstream change shows up here.
   * install() runs with every external effect mocked: config lookup, download,
-    exec_program (in install_rccl, and in utils.package_installer for the
-    apt-get/dnf installs), run_capture (nproc, rpm, git rev-parse),
+    exec_program (in utils.process, where run/run_all/run_script/extract_tarball
+    run commands, and in utils.package_installer for the apt-get/dnf
+    installs), run_capture (nproc, rpm, git rev-parse),
     write_repo_source_info and the versions file. A fake exec_program creates
     the directories that
     `git clone` / `git init` / `tar` would, so the real Python file handling
@@ -29,8 +30,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_rccl
-from utils import package_installer
+from utils import component_config, download, files, package_installer, process
 from utils.build_config import BuildConfig, build_plan
+from utils.download import ChecksumError
 
 _BASH = Path(__file__).resolve().parents[2] / "components" / "install_rccl.sh"
 
@@ -61,8 +63,11 @@ _U2604_CMAKE_ARGS = ["-DROCM_PATH=/opt/rocm/core", "-DGPU_TARGETS=gfx90a;gfx942;
 
 
 def _rccl_tests(prefix="/opt/rccl", args=("-DGPU_TARGETS=gfx90a;gfx942",)):
-    # Called inside tests, so the script names the patched rccl-tests dir.
-    return ["bash", "-c", install_rccl.rccl_tests_script(prefix, list(args))]
+    # What run_script(..., modules=["mpi/hpcx"]) runs. Called inside tests, so
+    # the script names the patched rccl-tests dir.
+    lines = install_rccl.rccl_tests_script(prefix, list(args))
+    return ["bash", "-c", "set -e\nsource /etc/profile.d/modules.sh\nmodule load mpi/hpcx\n"
+            + "\n".join(lines) + "\n"]
 
 
 _SYSCTL = [["sysctl", "kernel.numa_balancing=0"], ["sysctl", "vm.max_map_count=1048576"]]
@@ -217,10 +222,9 @@ class PureHelperTests(unittest.TestCase):
         self.assertIsNone(install_rccl.azure_linux_rccl_version(" \n"))
 
     def test_rccl_tests_script(self):
-        script = install_rccl.rccl_tests_script("/opt/rocm", _U2604_CMAKE_ARGS)
-        self.assertTrue(script.startswith(
-            "set -e\nsource /etc/profile.d/modules.sh\nmodule load mpi/hpcx\n"
-            "pushd ./rocm-systems\n"))
+        # The lines after run_script's `module load mpi/hpcx` header.
+        script = "\n".join(install_rccl.rccl_tests_script("/opt/rocm", _U2604_CMAKE_ARGS)) + "\n"
+        self.assertTrue(script.startswith("pushd ./rocm-systems\n"))
         self.assertNotIn("git clone", script)          # cloned before, in Python
         self.assertIn('-DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm;$HPCX_MPI_DIR"', script)
         # Each extra argument stays one word; the ';' can't end the command.
@@ -230,7 +234,15 @@ class PureHelperTests(unittest.TestCase):
                       "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \\\n    ..\n", script)
         self.assertIn("git sparse-checkout set projects/rccl-tests\n", script)
         self.assertIn("cp ./*_perf /opt/rccl-tests/\n", script)
-        self.assertTrue(script.endswith("rm -rf rocm-systems\nmodule unload mpi/hpcx\n"))
+        self.assertTrue(script.endswith("popd\nrm -rf rocm-systems\n"))
+
+    def test_perftest_package_lists(self):
+        def lists(name):
+            return install_rccl.perftest_package_lists(install_rccl.Distro(name))
+        self.assertEqual(lists("ubuntu24.04"), [["libpci-dev"]])
+        self.assertEqual(lists("ubuntu26.04"), [["libpci-dev"], ["libibumad-dev"]])
+        self.assertEqual(lists("azurelinux3.0"), [])
+        self.assertEqual(lists("rocky9.8"), [])
 
 
 class BashTextTests(unittest.TestCase):
@@ -332,7 +344,8 @@ class InstallTests(unittest.TestCase):
 
     def _install(self, distro, cfg, *, fail_on=None, fail_rc=2, nproc=(0, f"{_NPROC}\n"),
                  rpm=(0, "2.22.3-1.azl3"), rev_parse=(0, f"{_THEROCK_PIN}\n"),
-                 write_error=None, repo_ok=True, rocm_cfg=_ROCM_2604_CFG):
+                 write_error=None, repo_ok=True, rocm_cfg=_ROCM_2604_CFG,
+                 download_error=None):
         self.calls, self.events, self.fail_on, self.fail_rc = [], [], fail_on, fail_rc
         self.repo_dirs_existed = {}
 
@@ -345,6 +358,8 @@ class InstallTests(unittest.TestCase):
             return rpm
 
         def fake_download(url, sha256, dest_dir="."):
+            if download_error:
+                raise download_error
             path = Path(dest_dir) / Path(url).name
             path.write_bytes(b"tgz")
             return path
@@ -363,13 +378,15 @@ class InstallTests(unittest.TestCase):
                 raise write_error
 
         env = {"DISTRIBUTION": distro, "PATH": "/usr/bin"}
-        # Installs run in utils.package_installer; the same fake records them
-        # in self.calls, in order with every other command, and its failure
-        # log goes to the module's log_error mock.
-        with mock.patch.object(install_rccl, "config_for", side_effect=fake_config) as config, \
-             mock.patch.object(install_rccl, "download_and_verify",
-                               side_effect=fake_download) as download, \
-             mock.patch.object(install_rccl, "exec_program", side_effect=self._fake_exec), \
+        # Commands run in utils.process (run/run_all/run_script/extract_tarball)
+        # and utils.package_installer; the same fake records them in
+        # self.calls, in order. The toolkit helpers log their own results, so
+        # their log calls share the module's mocks.
+        with mock.patch.object(component_config, "config_for",
+                               side_effect=fake_config) as config, \
+             mock.patch.object(download, "download_and_verify",
+                               side_effect=fake_download) as fetch, \
+             mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(install_rccl, "run_capture", side_effect=fake_capture) as cap, \
              mock.patch.object(install_rccl, "write_repo_source_info",
@@ -380,9 +397,13 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_rccl, "log_warn") as warn, \
              mock.patch.object(install_rccl, "log_error") as error, \
              mock.patch.object(package_installer, "log_info"), \
-             mock.patch.object(package_installer, "log_error", new=error):
+             mock.patch.object(package_installer, "log_error", new=error), \
+             mock.patch.object(files, "log_info", new=info), \
+             mock.patch.object(files, "log_error", new=error), \
+             mock.patch.object(download, "log_error", new=error), \
+             mock.patch.object(component_config, "log_error", new=error):
             result = install_rccl.install(env)
-        self.config, self.download, self.capture, self.record = config, download, cap, record
+        self.config, self.download, self.capture, self.record = config, fetch, cap, record
         self.repo = repo
         self.info, self.warn, self.error = info, warn, error
         return result
@@ -401,7 +422,7 @@ class InstallTests(unittest.TestCase):
                       "https://github.com/ROCm/rccl.git", folder],
                      ["git", "checkout", cfg["commit"]]]
         else:
-            fetch = [["tar", "-xzf", install_rccl.tarball_name(cfg["url"])]]
+            fetch = [["tar", "-xf", install_rccl.tarball_name(cfg["url"])]]
         return fetch + [
             ["cmake", "-DCMAKE_PREFIX_PATH=/opt/rocm/", "-DCMAKE_INSTALL_PREFIX=/opt/rccl",
              "-DGPU_TARGETS=gfx90a;gfx942", "-DAMDGPU_TARGETS=gfx90a;gfx942", ".."],
@@ -457,9 +478,9 @@ class InstallTests(unittest.TestCase):
             mock.call("RCCL", os.path.join(self.work, "rccl-rocm-6.4.4"), "install-rccl",
                       commit=_CLONE_CFG["commit"], ref="release/rocm-rel-6.4", env=mock.ANY),
             mock.call("RCCL_TESTS", os.path.join(self.work, "rocm-systems"), "install-rccl",
-                      commit=None, ref=None, env=mock.ANY),
+                      env=mock.ANY),
             mock.call("PERFTEST", os.path.join(self.work, "perftest"), "install-rccl",
-                      commit=None, ref=None, env=mock.ANY)])
+                      env=mock.ANY)])
         # Each checkout still exists when it is recorded.
         self.assertEqual(self.repo_dirs_existed,
                          {"RCCL": True, "RCCL_TESTS": True, "PERFTEST": True})
@@ -547,7 +568,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(by_message["Packaged RCCL version is 2.27.7"]["version"], "2.27.7")
         pin = by_message[f"TheRock therock-10.0 pins rocm-systems at {_THEROCK_PIN}"]
         self.assertEqual(pin["rccl_tests_commit"], _THEROCK_PIN)
-        self.assertIn("Ubuntu 26.04: perftest also needs libibumad-dev", by_message)
+        self.assertIn("ubuntu26.04: perftest also needs libibumad-dev", by_message)
         self.assertEqual(by_message["Building rccl-tests from ROCm/rocm-systems "
                                     "(sparse clone) with HPC-X"]["cmake_args"],
                          _U2604_CMAKE_ARGS)
@@ -621,7 +642,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._install("ubuntu26.04", None, rocm_cfg=rocm_cfg), 3)
                 self.assertEqual(self.calls, [])
                 self.capture.assert_not_called()
-                self.assertIn("TheRock branch", self.error.call_args.args[1])
+                self.assertIn("'rocm' config", self.error.call_args.args[1])
 
     def test_ubuntu2604_bad_rccl_version_returns_3(self):
         for content in (None, 'set(PACKAGE_VERSION "2.27")\n', "nothing\n"):
@@ -650,7 +671,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(distro=distro):
                 self.assertEqual(self._install(distro, cfg, repo_ok=False), 3)
                 self.assertEqual(self._commands()[-1], last)
-                self.assertIn("could not record", self.error.call_args.args[1])
+                self.assertFalse(os.path.exists(self.work))
 
     def test_branch_null_uses_tarball(self):
         cfg = {**_TARBALL_CFG, "branch": "null"}
@@ -670,16 +691,12 @@ class InstallTests(unittest.TestCase):
                 self.record.assert_not_called()
 
     def test_download_failure_returns_3(self):
-        with mock.patch.object(install_rccl, "download_and_verify",
-                               side_effect=RuntimeError("checksum")):
-            self.calls, self.events, self.fail_on = [], [], None
-            with mock.patch.object(install_rccl, "config_for", return_value=_TARBALL_CFG), \
-                 mock.patch.object(install_rccl, "exec_program", side_effect=self._fake_exec), \
-                 mock.patch.object(install_rccl, "run_capture", return_value=(0, "4\n")), \
-                 mock.patch.object(install_rccl, "log_error") as error:
-                self.assertEqual(install_rccl.install({"DISTRIBUTION": "ubuntu22.04"}), 3)
+        self.assertEqual(self._install("ubuntu22.04", _TARBALL_CFG,
+                                       download_error=ChecksumError("checksum")), 3)
         self.assertEqual(self.calls, [])
-        self.assertIn("download/verify", error.call_args.args[1])
+        self.record.assert_not_called()
+        self.assertIn("download of", self.error.call_args.args[1])
+        self.assertFalse(os.path.exists(self.work))
 
     def test_each_failing_command_stops_the_step(self):
         cases = [
@@ -697,7 +714,7 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual(self._install(distro, cfg, fail_on=command), 3)
                     self.assertEqual(self._commands(), commands[:index + 1])
                     self.assertEqual(self.record.called, index > record_after)
-                    self.error.assert_called()
+                    # (The failure is logged by exec_program, mocked here.)
                     self.assertFalse(os.path.exists(self.work))
 
     def test_missing_source_folder_returns_3(self):
@@ -710,7 +727,7 @@ class InstallTests(unittest.TestCase):
         os.makedirs(self.sysctl_conf)          # a directory can't be opened for append
         self.assertEqual(self._install("azurelinux3.0", None), 3)
         self.assertNotIn("bash", [c[0] for c in self._commands()])
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not write", self.error.call_args.args[1])
 
     def test_unwritable_versions_file_returns_3(self):
         rc = self._install("azurelinux3.0", None, write_error=PermissionError("denied"))
