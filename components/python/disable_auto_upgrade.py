@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import re
 
-from utils.logger import log_error, log_info
+from utils.files import edit_file
+from utils.logger import log_info
 from utils.services import systemctl
 
 _OP = "disable-auto-upgrade"
@@ -45,33 +46,9 @@ def set_unattended_upgrade_off(text: str) -> str:
                      for line in text.split("\n"))
 
 
-def _rewrite_auto_upgrades_file() -> bool:
-    """bash `sed -i` on the apt file.
-
-    newline="" keeps "\\r\\n" as it is and surrogateescape passes non-UTF-8
-    bytes through, as sed does; write_file() would do neither.
-    """
-    # TODO(ADO 1001): toolkit candidate: byte-preserving `sed -i`, e.g.
-    # edit_file(path, transform: Callable[[str], str], op) -> (old, new) | None
-    try:
-        with open(_AUTO_UPGRADES_FILE, encoding="utf-8",
-                  errors="surrogateescape", newline="") as f:
-            original = f.read()
-        with open(_AUTO_UPGRADES_FILE, "w", encoding="utf-8",
-                  errors="surrogateescape", newline="") as f:
-            f.write(set_unattended_upgrade_off(original))
-    except OSError as exc:
-        log_error(_OP, f"could not update {_AUTO_UPGRADES_FILE}: {exc}",
-                  path=_AUTO_UPGRADES_FILE)
-        return False
-    log_info(_OP, f"Set APT::Periodic::Unattended-Upgrade to \"0\" in "
-                  f"{_AUTO_UPGRADES_FILE}", path=_AUTO_UPGRADES_FILE)
-    return True
-
-
 def install(env: dict[str, str]) -> int:
     """Turn off Ubuntu's unattended upgrades."""
-    if not _rewrite_auto_upgrades_file():
+    if not edit_file(_AUTO_UPGRADES_FILE, set_unattended_upgrade_off, _OP):
         return 3
     for verb in ("stop", "disable", "mask"):
         if not systemctl(verb, _SERVICE, op=_OP, env=env):

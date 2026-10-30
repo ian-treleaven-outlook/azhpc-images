@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import disable_auto_upgrade
-from utils import process
+from utils import files, process
 from utils.build_config import BuildConfig, build_plan
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -107,7 +107,7 @@ class InstallTests(unittest.TestCase):
                                self.path), \
              mock.patch.object(process, "exec_program",
                                side_effect=list(systemctl_rcs)) as run, \
-             mock.patch.object(disable_auto_upgrade, "log_error") as log_error:
+             mock.patch.object(files, "log_error") as log_error:
             rc = disable_auto_upgrade.install(env)
         return rc, run, log_error
 
@@ -140,17 +140,8 @@ class InstallTests(unittest.TestCase):
         log_error.assert_called_once()
 
     def test_unwritable_file_returns_3(self):
-        real_open = open
-
-        def fail_on_write(path, mode="r", *args, **kwargs):
-            if "w" in mode:
-                raise PermissionError("permission denied")
-            return real_open(path, mode, *args, **kwargs)
-
-        # create=True adds an `open` name to the module, shadowing the builtin
-        # only for code in disable_auto_upgrade.
-        with mock.patch.object(disable_auto_upgrade, "open", create=True,
-                               side_effect=fail_on_write):
+        with mock.patch.object(Path, "write_bytes",
+                               side_effect=PermissionError("permission denied")):
             rc, run, log_error = self._install()
 
         self.assertEqual(rc, 3)
