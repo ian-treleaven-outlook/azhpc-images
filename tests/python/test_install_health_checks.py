@@ -26,6 +26,8 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_health_checks
+from utils import download as download_module
+from utils import process
 from utils.build_config import BuildConfig, build_plan
 from utils.download import ChecksumError
 
@@ -100,7 +102,7 @@ class ChmodPlusXTests(unittest.TestCase):
 # install(): external effects faked, file system in a temporary folder.
 # --------------------------------------------------------------------------- #
 class FakeCommands:
-    """Stands in for exec_program and download_and_verify.
+    """Stands in for utils.process.exec_program and utils.download.download_and_verify.
 
     Records every command. The fake `tar` creates the parts of the upstream
     repository that install() works on. fail_at=N makes the Nth command
@@ -122,7 +124,7 @@ class FakeCommands:
         if len(self.commands) - 1 == self.fail_at:
             return 1
         if command[0] == "tar" and self.layout:
-            repo = os.path.join(cwd, command[-1])
+            repo = os.path.join(cwd, command[command.index("-C") + 1])
             files = {"triggerGHR/triggerGHR.sh": "upstream\n",
                      "triggerGHR/config/b.conf": "b\r\n",
                      "triggerGHR/config/a.conf": "a\r\n",
@@ -162,8 +164,8 @@ class InstallTests(unittest.TestCase):
         fake = fake or FakeCommands()
         download = mock.Mock(side_effect=download_error or fake.download)
         with mock.patch.object(install_health_checks, "_DEST_TEST_DIR", self.dest), \
-             mock.patch.object(install_health_checks, "exec_program", side_effect=fake.run), \
-             mock.patch.object(install_health_checks, "download_and_verify", download), \
+             mock.patch.object(process, "exec_program", side_effect=fake.run), \
+             mock.patch.object(download_module, "download_and_verify", download), \
              mock.patch.object(install_health_checks, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_health_checks, "log_error"), \
@@ -178,8 +180,8 @@ class InstallTests(unittest.TestCase):
     def _expected_commands(self, image):
         configs = os.path.join(self.repo, "triggerGHR", "config")
         return [
-            (["tar", "-xvf", "v0.4.5.tar.gz", "--strip-components=1",
-              "-C", "azurehpc-health-checks"], self.dest),
+            (["tar", "-xf", "v0.4.5.tar.gz", "-C", "azurehpc-health-checks",
+              "--strip-components=1"], self.dest),
             (["dos2unix", f"{configs}/a.conf", f"{configs}/b.conf"], self.repo),
             (["./dockerfile/pull-image-mcr.sh", image], self.repo),
         ]
