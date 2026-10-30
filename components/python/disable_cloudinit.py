@@ -33,8 +33,9 @@ Deliberate differences from bash
   * Files are written with write_file (no `sudo tee`: the build runs as
     root), which creates missing parent folders. So on Azure Linux the step
     now fails at `netplan apply`, not when writing /etc/netplan.
-  * The three `sed -i` deletions are one read-modify-write; the result is the
-    same. sed replaces the file, Python writes through a symlink.
+  * The three `sed -i` deletions are one edit_file (read-modify-write); the
+    result is the same. sed replaces the file, Python writes through a
+    symlink, and leaves an unchanged file untouched.
   * Distro tests use Distro (bash's `*"rhel"*` contains-tests and `rhel8*`
     become is_rhel_family and major "8"; the same for every distro built).
 
@@ -53,7 +54,7 @@ import re
 
 from utils.component_config import DEFAULT_NODE_TYPE
 from utils.distro import Distro
-from utils.files import write_file
+from utils.files import edit_file, touch, write_file
 from utils.logger import log_error, log_info, log_warn
 from utils.process import run
 from utils.services import service_is_active, systemctl
@@ -131,6 +132,13 @@ def delete_lines_starting_with(text: str, prefix: str) -> tuple[str, int]:
     return "".join(kept), len(lines) - len(kept)
 
 
+def remove_build_vm_ifcfg_lines(text: str) -> str:
+    """The three sed deletions on ifcfg-eth0 (HWADDR=, DHCP_HOSTNAME=, IPV6INIT=)."""
+    for key in _IFCFG_KEYS_TO_DELETE:
+        text, _ = delete_lines_starting_with(text, key)
+    return text
+
+
 def cleanup_script_text(ifcfg_file: str) -> str:
     """/usr/sbin/disable_cloudinit.sh, with "$IFCFG_FILE" expanded as in bash."""
     return f"""\
@@ -179,31 +187,6 @@ def _append_config_disabled(path: str) -> bool:
     return write_file(path, _NETWORK_CONFIG_DISABLED, _OP, append=True)
 
 
-# TODO(ADO 1001): toolkit candidate: edit_file(path, edit, op) -> bool — `sed -i`
-# style read/modify/write that round-trips the bytes and fails on a missing file.
-def _remove_ifcfg_lines(path: str) -> bool:
-    """The three sed deletions on ifcfg-eth0, in bash's order.
-
-    newline="" and surrogateescape keep "\\r\\n" and non-UTF-8 bytes as sed would.
-    """
-    try:
-        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as handle:
-            text = handle.read()
-        removed = {}
-        for key in _IFCFG_KEYS_TO_DELETE:
-            text, removed[key] = delete_lines_starting_with(text, key)
-        with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-            handle.write(text)
-    except OSError as exc:
-        log_error(_OP, f"could not edit {path} (bash's sed -i fails here too): {exc}",
-                  path=path)
-        return False
-    counts = {f"{key.rstrip('=').lower()}_removed": n for key, n in removed.items()}
-    log_info(_OP, f"Edited {path} in place: deleted HWADDR=, DHCP_HOSTNAME= "
-                  "and IPV6INIT= lines", path=path, action="edited", **counts)
-    return True
-
-
 def _install_cleanup_service(env: dict[str, str]) -> bool:
     """EL8: the boot-time service that deletes the ifcfg-eth0 lines again."""
     if not (write_file(_SCRIPT_PATH, cleanup_script_text(_IFCFG_FILE), _OP, mode=0o755)
@@ -223,7 +206,8 @@ def _install_cleanup_service(env: dict[str, str]) -> bool:
 def _disable_rhel(env: dict[str, str], distro: Distro) -> bool:
     """RHEL family: cloud-init config, ifcfg-eth0 cleanup, EL8 service."""
     if not (_append_config_disabled(_CUSTOM_NETWORKING_CFG)
-            and _remove_ifcfg_lines(_IFCFG_FILE)):
+            # A missing ifcfg-eth0 fails here, as bash's sed -i does.
+            and edit_file(_IFCFG_FILE, remove_build_vm_ifcfg_lines, _OP)):
         return False
     if not needs_ifcfg_cleanup_service(distro):
         log_info(_OP, "No boot-time ifcfg cleanup service needed (only "
@@ -256,21 +240,6 @@ def _remove_cloud_init_netplan() -> bool:
     return True
 
 
-# TODO(ADO 1001): toolkit candidate: touch(path, op) -> bool — bash `touch`.
-def _touch(path: str) -> bool:
-    """bash `touch`: create an empty file, or update its timestamps."""
-    existed = os.path.exists(path)
-    try:
-        with open(path, "a", encoding="utf-8"):
-            pass
-        os.utime(path)
-    except OSError as exc:
-        log_error(_OP, f"could not touch {path}: {exc}", path=path)
-        return False
-    log_info(_OP, f"Touched {path}", path=path, action="touched" if existed else "created")
-    return True
-
-
 def _disable_netplan(env: dict[str, str], distro: Distro, target: str) -> bool:
     """Ubuntu (and, by bash's branching, Azure Linux): cloud-init + netplan."""
     if distro.is_azurelinux:
@@ -286,7 +255,7 @@ def _disable_netplan(env: dict[str, str], distro: Distro, target: str) -> bool:
                       "cloud-init entirely", node_type=target)
         return (write_file(_NETPLAN_BAREMETAL, _NETPLAN_BAREMETAL_TEXT, _OP, mode=0o600)
                 and _remove_cloud_init_netplan()
-                and _touch(_CLOUD_INIT_DISABLED))
+                and touch(_CLOUD_INIT_DISABLED, _OP))
     log_info(_OP, "Regular node: replacing 50-cloud-init.yaml with DHCP on "
                   "eth0 and applying it", node_type=target)
     return (write_file(_NETPLAN_CLOUD_INIT, _NETPLAN_CLOUD_INIT_TEXT, _OP)

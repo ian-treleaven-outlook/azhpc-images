@@ -267,10 +267,9 @@ class RhelInstallTests(InstallTestBase):
         by_path = {r.fields.get("path"): r.fields for r in info if "action" in r.fields}
         self.assertEqual(by_path[self.paths["_CUSTOM_NETWORKING_CFG"]]["action"],
                          "appended")
-        ifcfg = by_path[self.paths["_IFCFG_FILE"]]
-        self.assertEqual(ifcfg["action"], "edited")
-        self.assertEqual((ifcfg["hwaddr_removed"], ifcfg["dhcp_hostname_removed"],
-                          ifcfg["ipv6init_removed"]), (1, 1, 1))
+        edited = [r.fields for r in info
+                  if r.fields.get("path") == self.paths["_IFCFG_FILE"]]
+        self.assertEqual(edited, [{"path": self.paths["_IFCFG_FILE"], "changed": True}])
         self.assertEqual(by_path[self.paths["_SCRIPT_PATH"]]["action"], "created")
         self.assertEqual(by_path[self.paths["_SERVICE_PATH"]]["action"], "created")
 
