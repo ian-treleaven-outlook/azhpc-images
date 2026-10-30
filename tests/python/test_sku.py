@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from utils.sku import (is_ncv6_sku, sku_has_infiniband, sku_network_mode,
+from utils.sku import (is_ncv6_sku, sku_family, sku_has_infiniband, sku_network_mode,
                        sku_uses_ipoib, sku_uses_ucx)
 
 
@@ -16,6 +16,14 @@ from utils.sku import (is_ncv6_sku, sku_has_infiniband, sku_network_mode,
 # InfiniBand, so it skips DOCA-OFED and uses libfabric instead of UCX. Everything else
 # is "normal". These tests pin that down so a future SKU change can't silently flip it.
 class SkuHelperTests(unittest.TestCase):
+    def test_sku_family_matches_set_properties(self):
+        cases = {"GB200": "gb-family", "GB300": "gb-family", "A100": "A100plus",
+                 "H100": "A100plus", "H200": "A100plus", "V100": "V100",
+                 "NCv6": "NCv6", "MI300X": "MI300X", "": "", None: ""}
+        for sku, family in cases.items():
+            with self.subTest(sku=sku):
+                self.assertEqual(sku_family(sku), family)
+
     def test_is_ncv6_sku(self):
         self.assertTrue(is_ncv6_sku("NCv6"))
         for sku in ("A100", "H100", "GB200", "MI300", "V100"):

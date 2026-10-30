@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 from typing import Callable
 from pathlib import Path
 import json
@@ -12,8 +13,9 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, install_azsecpack_prereqs
-from utils.sku import sku_has_infiniband
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, no_rdma_network, install_azsecpack_prereqs
+from utils.sku import sku_family, sku_has_infiniband
+from utils.system_prep import prepare_system
 from utils.component_config import DEFAULT_NODE_TYPE
 
 MODULE_DIRS = {
@@ -23,7 +25,9 @@ DEFAULT_MODULE_DIR = "/usr/share/Modules/modulefiles"  # alma/rocky/azure/rhel
 
 VALID_GPUS = {
     "NVidia": {"GB200", "GB300", "NCv6", "V100", "A100", "H100", "H200", "VR200"},
-    "AMD": {"MI300", "MI400", "MI500"},
+    # MI300X is the SKU Packer passes for Standard_ND96isr_MI300X_v5 (bash then
+    # exports SKU=MI300X); MI300 is kept for existing command lines.
+    "AMD": {"MI300X", "MI300", "MI400", "MI500"},
 }
 DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
 
@@ -82,8 +86,8 @@ def _detect_arch_distro(distribution: str) -> str:
 def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     """The env vars set_properties.sh exported that the component scripts read.
 
-    Pure environment setup only — no apt/yum side effects (those stay in the
-    bootstrap step for now).
+    Pure environment setup only; set_properties.sh's system changes (apt
+    upgrade, jq, ...) run in the bootstrap (utils/system_prep.py).
     """
     distribution = _detect_distribution()
 
@@ -102,8 +106,10 @@ def component_env(repo_root: Path, cfg: BuildConfig) -> dict[str, str]:
     env["ARCHITECTURE_DISTRO"] = _detect_arch_distro(distribution)
 
     env["GPU"]        = cfg.gpu_arg                              # NVIDIA / AMD
-    env["SKU"]        = cfg.gpu                                  # H100, MI300, ...
-    env["SKU_FAMILY"] = "gb-family" if cfg.gpu in {"GB200", "GB300"} else cfg.gpu
+    env["SKU"]        = cfg.gpu                                  # H100, MI300X, ...
+    # As set_properties.sh: keep a SKU_FAMILY the caller already exported
+    # (`if [[ -z "${SKU_FAMILY:-}" ]]`), otherwise derive it from the SKU.
+    env["SKU_FAMILY"] = os.environ.get("SKU_FAMILY") or sku_family(cfg.gpu)
     # The deployment target, under the same name and default bash uses (see
     # utils/set_properties.sh). versions.json overrides are keyed on it, and the
     # bash steps that still run read it directly. An empty value gets the
@@ -232,22 +238,33 @@ class Step:
         """
         return "python" if self.action is not None and not self.resync else "bash"
 
-def _cleanup_downloads(env: dict[str, str]) -> int:
+_CLEANUP_SCRIPT = """\
+rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh
+rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*
+rm -rf /var/intel/
+(
+    shopt -s dotglob nullglob
+    rm -rf -- /var/cache/* || true
+    rm -Rf -- */ || true
+)
+"""
+
+
+def _cleanup_downloads(env: dict[str, str], distro_dir: str) -> int:
     """Free space by removing downloaded tarballs/installers and extracted dirs.
 
-    Mirrors the inline cleanup in install.sh between install_intel_libs and
-    hpc-tuning. Runs the exact bash rm in the distro build dir. Destructive by
+    Runs install.sh's inline cleanup (between install_intel_libs and
+    hpc-tuning) word for word, with `bash -e` like install.sh's `set -e`, in
+    the distro folder install.sh runs from (`distro_dir`, e.g.
+    "distros/ubuntu24.04"). The subshell's `dotglob nullglob` makes the globs
+    include hidden entries and expand to nothing when nothing matches; its
+    `|| true` keeps those two removals from failing the build. Destructive by
     design; only ever runs during a real build() on the build VM.
     """
-    build_dir = Path(env.get("TOP_DIR", ".")) / "distros" / env.get("DISTRIBUTION", "")
-    cleanup = (
-        "rm -rf *.tgz *.bz2 *.tbz *.tar.gz *.run *.deb *_offline.sh; "
-        "rm -rf /tmp/MLNX_OFED_LINUX* /tmp/*conf*; "
-        "rm -rf /var/intel/; "
-        "rm -rf /var/cache/* || true; "
-        "rm -Rf -- */"
-    )
-    return exec_program(["bash", "-c", cleanup], "cleanup-downloads",
+    build_dir = Path(env.get("TOP_DIR", ".")) / distro_dir
+    log_info("cleanup-downloads", f"Removing downloads and extracted folders in {build_dir}",
+             build_dir=str(build_dir))
+    return exec_program(["bash", "-ec", _CLEANUP_SCRIPT], "cleanup-downloads",
                         cwd=str(build_dir), env=env)
 
 
@@ -277,8 +294,14 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
         Step("install-doca", "install_doca.sh", action=install_doca.install,
              when=lambda c: sku_has_infiniband(c.gpu)),
+        # No-RDMA SKUs (NCv6): install.sh's inline rdma-core install, then
+        # libfabric, then the mana_ib blacklist (see no_rdma_network.py).
+        Step("install-rdma-core", action=no_rdma_network.install_rdma_core,
+             when=lambda c: not sku_has_infiniband(c.gpu)),
         Step("install-libfabric", "install_libfabric.sh",
              action=install_libfabric.install,
+             when=lambda c: not sku_has_infiniband(c.gpu)),
+        Step("blacklist-mana-ib", action=no_rdma_network.blacklist_mana_ib,
              when=lambda c: not sku_has_infiniband(c.gpu)),
 
         # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
@@ -343,8 +366,11 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # (install_dynolog_drl.sh was removed upstream in #627.)
 
-        # free space: remove downloaded tarballs/installers (inline rm in install.sh)
-        Step("cleanup-downloads", action=_cleanup_downloads),
+        # free space: remove downloaded tarballs/installers (inline rm in install.sh).
+        # functools.partial fills in distro_dir now, so the action still takes
+        # just `env`, like every other action.
+        Step("cleanup-downloads",
+             action=functools.partial(_cleanup_downloads, distro_dir=cfg.distro_dir)),
 
         # optimizations + persistent RDMA naming
         Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install),
@@ -412,9 +438,15 @@ class ImageBuilder:
     def _bootstrap(self, build_dir: Path, env: dict[str, str]) -> int:
         """Run system prep that must happen before any component.
 
-        Mirrors install_utils.sh (Microsoft repo, base packages, IB modules).
-        Still bash for now — it's heavily distro-specific, side-effecting work.
+        First the system changes utils/set_properties.sh makes (apt update and
+        upgrade, jq, AlmaLinux GPG keys; see utils/system_prep.py), then
+        install_utils.sh (Microsoft repo, base packages, IB modules), as every
+        distro's install.sh does. install_utils.sh is still bash: it's heavily
+        distro-specific, side-effecting work.
         """
+        rc = prepare_system(env)
+        if rc != 0:
+            return rc
         install_utils = build_dir / "install_utils.sh"
         log_info("bootstrap", "Preparing system (install_utils.sh)")
         return exec_program([str(install_utils)], "bootstrap",

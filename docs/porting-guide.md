@@ -5,8 +5,10 @@ orchestration to Python.
 
 **Status:** [`build_plan()`](../utils/build_config.py#L191) in
 [`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 34 steps; **all 34 run natively in Python**,
+[`azhpc.py`](../azhpc.py#L192), has 36 steps; **all 36 run natively in Python**,
 matching upstream `Azure/azhpc-images@0c2b8f9` (October 2026; see §12).
+Before them, the bootstrap makes `utils/set_properties.sh`'s system changes
+(`utils/system_prep.py`: apt upgrade, jq, ...) and runs `install_utils.sh`.
 Each bash script is kept as that step's fallback and parity reference: delete a
 Step's `action=`, or mark it `resync=`, and it runs the bash script again. The
 plan mirrors `distros/ubuntu24.04/install.sh`; the other distros' `install.sh`
@@ -391,11 +393,11 @@ remaining scripts.
 
 | Situation | Study |
 |---|---|
-| Needs distro packages first | `install_mpifileutils.py` + `_MPIFILEUTILS_DEPS` in `build_config.py` |
+| Needs distro packages first | `install_mpifileutils.py` (installs its build dependencies per distro, as bash does) |
 | Shell that must share one shell (e.g. `module load` then build) | `install_mpifileutils.py` — the build step |
 | Three-way distro branching | `install_doca.py` |
 | Needs stdout parsed from a command | `install_nccl.py` / `run_capture` |
-| Inline shell in `install.sh` with no component script | `_cleanup_downloads` in `build_config.py` |
+| Inline shell in `install.sh` with no component script | `_cleanup_downloads` in `build_config.py`; `no_rdma_network.py` |
 
 ---
 
@@ -429,7 +431,7 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **1066 tests, ~standard library only** — `unittest` and
+The suite is **1089 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
 the test environment and skip themselves when those tools are missing.
 
@@ -552,7 +554,9 @@ original next steps:
 3. **Port where Python adds value** — component by component, one reversible
    line at a time.
 
-See `ToDo.md` in the repo root for the current open project-level items.
+See `ToDo.md` in the repo root for the current open project-level items, and
+[python-cli-builds.md](python-cli-builds.md) for building an image with the
+Python CLI through Packer and comparing it with a bash-built one.
 
 ---
 

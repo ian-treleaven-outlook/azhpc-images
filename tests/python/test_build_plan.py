@@ -194,6 +194,36 @@ class GatingTests(unittest.TestCase):
             cfg = resolve_config(args)
         self.assertEqual(cfg.gpu, "H100")
         warned.assert_not_called()
+
+    def test_every_sku_packer_passes_is_accepted(self):
+        # packer/variables.pkr.hcl maps VM sizes to the SKU it hands install.sh
+        # (and would hand azhpc.py). gpu_platform is AMD only for MI300X.
+        import re
+        hcl = (_REPO_ROOT / "packer" / "variables.pkr.hcl").read_text(encoding="utf-8")
+        block = re.search(r"vm_size_gpu_sku_map\s*=\s*\{(.*?)\}", hcl, re.S).group(1)
+        skus = set(re.findall(r'=\s*"([^"]+)"', block))
+        self.assertIn("MI300X", skus)
+        for sku in sorted(skus):
+            vendor = "AMD" if sku == "MI300X" else "NVidia"
+            with self.subTest(sku=sku):
+                args = Namespace(vendor=vendor, gpu=sku, os="Ubuntu24", spec=None, fips=False)
+                with mock.patch.object(build_config, "log_warn"):
+                    cfg = resolve_config(args)
+                self.assertEqual(cfg.gpu, build_config.build_sku(sku))
+
+    def test_packer_python_cli_os_map_matches_the_cli(self):
+        # packer/variables.pkr.hcl maps each distro folder with a Python plan to
+        # an azhpc.py --os value (use_python_cli). Each must be a CLI OS whose
+        # distro folder is that same folder.
+        import re
+        hcl = (_REPO_ROOT / "packer" / "variables.pkr.hcl").read_text(encoding="utf-8")
+        block = re.search(r"python_cli_os_by_folder\s*=\s*\{(.*?)\}", hcl, re.S).group(1)
+        mapping = dict(re.findall(r'"([^"]+)"\s*=\s*"([^"]+)"', block))
+        self.assertTrue(mapping)
+        for folder, os_name in mapping.items():
+            with self.subTest(folder=folder):
+                self.assertEqual(build_config.DISTRO_DIRS[os_name], f"distros/{folder}")
+                self.assertTrue((_REPO_ROOT / "distros" / folder / "install.sh").is_file())
     def test_a100_includes_ib_and_excludes_other_paths(self):
         plan = _plan_scripts(_cfg("NVidia", "A100"))
         self.assertIn("install_doca.sh", plan)          # IB SKU -> DOCA
@@ -282,6 +312,59 @@ class GatingTests(unittest.TestCase):
                 with self.subTest(gpu=gpu, script=step.script):
                     self.assertTrue((base / step.script).is_file(),
                                     f"{base / step.script} does not exist")
+
+
+# component_env() provides what set_properties.sh exports.
+class ComponentEnvTests(unittest.TestCase):
+    def _env(self, gpu, sku_family=None):
+        import os
+        with mock.patch.object(build_config, "_detect_distribution", return_value="ubuntu24.04"), \
+             mock.patch.object(build_config, "_detect_arch_distro", return_value="amd64"), \
+             mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKU_FAMILY", None)
+            if sku_family is not None:
+                os.environ["SKU_FAMILY"] = sku_family
+            return build_config.component_env(_REPO_ROOT, _cfg("NVidia", gpu))
+
+    def test_sku_family_is_derived_like_set_properties(self):
+        for gpu, family in (("A100", "A100plus"), ("H100", "A100plus"),
+                            ("GB200", "gb-family"), ("NCv6", "NCv6")):
+            with self.subTest(gpu=gpu):
+                self.assertEqual(self._env(gpu)["SKU_FAMILY"], family)
+
+    def test_a_caller_provided_sku_family_is_kept(self):
+        self.assertEqual(self._env("A100", sku_family="custom")["SKU_FAMILY"], "custom")
+
+
+# The inline cleanup in install.sh, run word for word from the distro folder.
+class CleanupTests(unittest.TestCase):
+    def test_script_is_install_sh_text_word_for_word(self):
+        self.assertIn(build_config._CLEANUP_SCRIPT, _INSTALL_SH.read_text(encoding="utf-8"))
+
+    def test_runs_with_set_e_in_the_distro_folder(self):
+        cfg = _cfg("NVidia", "A100")
+        step = {s.op: s for s in build_plan(cfg)}["cleanup-downloads"]
+        with mock.patch.object(build_config, "exec_program", return_value=0) as run, \
+             mock.patch.object(build_config, "log_info"):
+            self.assertEqual(step.action({"TOP_DIR": "/repo"}), 0)
+        self.assertEqual(run.call_args.args[0], ["bash", "-ec", build_config._CLEANUP_SCRIPT])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/repo/distros/ubuntu24.04")
+
+    def test_dotglob_and_nullglob_behave_as_in_bash(self):
+        # Run just the subshell part against a scratch folder: hidden folders
+        # go too, and an empty match is not an error.
+        import shutil, subprocess, tempfile
+        if not shutil.which("bash"):
+            self.skipTest("needs bash")
+        subshell = build_config._CLEANUP_SCRIPT.split("(\n", 1)[1].rsplit(")", 1)[0]
+        subshell = subshell.replace("rm -rf -- /var/cache/* || true\n", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("visible", ".hidden"):
+                (Path(tmp) / name).mkdir()
+            (Path(tmp) / "keep.txt").write_text("x", encoding="utf-8")
+            subprocess.run(["bash", "-ec", subshell], cwd=tmp, check=True)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["keep.txt"])
+            subprocess.run(["bash", "-ec", subshell], cwd=tmp, check=True)   # nothing left
 
 
 # A component action is just a python function, so it can raise as well as return
