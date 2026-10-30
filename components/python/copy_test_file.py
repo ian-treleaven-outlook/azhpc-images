@@ -14,13 +14,14 @@ Kept bash behaviour:
   * nvcc needs a host gcc newer than 6 (bash: `[ $(gcc -dumpversion | cut
     -d. -f1) -gt 6 ]`); otherwise it is pointed at /opt/gcc-9.2.0/bin.
   * `*.*` skips dotfiles and matches directories too; cp without -r fails on
-    a directory, and so does this step. When nothing matches, bash's cp gets
-    the literal "*.*" and fails; so does this step.
+    a directory, and so does this step (copy_files stops at it, in sorted
+    order). When nothing matches, bash's cp gets the literal "*.*" and fails;
+    so does this step.
 
 How the copies compare with cp:
-  * `cp files dir` copies content and permission bits, following symlinks;
-    shutil.copy does the same. Over an existing file, cp keeps that file's
-    permissions where shutil.copy sets the source's.
+  * `cp files dir` is copy_files(): content and permission bits, following
+    symlinks. Over an existing file, cp keeps that file's permissions where
+    copy_files sets the source's.
   * `cp -r` is shutil.copytree(symlinks=True, dirs_exist_ok=True,
     copy_function=shutil.copy): links stay links, existing trees are merged,
     file timestamps are not copied. copytree also copies directory modes and
@@ -41,6 +42,7 @@ import os
 import re
 import shutil
 
+from utils.files import copy_files, make_dirs
 from utils.logger import log_error, log_info
 from utils.process import run, run_capture
 
@@ -57,18 +59,6 @@ _FALLBACK_GCC_BINDIR = "/opt/gcc-9.2.0/bin"
 _HEALTH_CHECKS = "health_checks"
 _GPU_COPY_SOURCE = os.path.join(_HEALTH_CHECKS, "NDv4", "gpu-copy.cu")
 _GPU_COPY_BINARY = os.path.join(_HEALTH_CHECKS, "NDv4", "gpu-copy")
-
-
-def top_level_test_files(names: list[str]) -> list[str]:
-    """The names the shell glob `*.*` matches, sorted.
-
-    A name matches if it contains a dot and doesn't start with one (bash skips
-    dotfiles without `dotglob`), whether it is a file or a directory:
-
-        ["run-tests.sh", "python", ".hidden.sh"]  ->  ["run-tests.sh"]
-    """
-    return sorted(name for name in names
-                  if "." in name and not name.startswith("."))
 
 
 def gcc_major_version(gcc_output: str) -> int | None:
@@ -90,34 +80,6 @@ def nvcc_command(nvcc: str, gcc_major: int, cufile: str, outfile: str) -> list[s
             "-lnuma", cufile, "-o", outfile]
 
 
-def _make_dest_dir() -> bool:
-    """bash `mkdir -p /opt/azurehpc/test`."""
-    try:
-        os.makedirs(_DEST_TEST_DIR, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_DEST_TEST_DIR}: {exc}", path=_DEST_TEST_DIR)
-        return False
-    return True
-
-
-def _copy_top_level_files(test_dir: str) -> bool:
-    """bash `cp $AZHPC_IMAGES_TEST_DIR/*.* $DEST_TEST_DIR`."""
-    try:
-        names = top_level_test_files(os.listdir(test_dir))
-        if not names:
-            log_error(_OP, f"no files matching *.* in {test_dir}")
-            return False
-        for name in names:
-            # Raises IsADirectoryError for a directory, as cp without -r fails.
-            shutil.copy(os.path.join(test_dir, name), _DEST_TEST_DIR)
-    except OSError as exc:
-        log_error(_OP, f"could not copy test files from {test_dir} "
-                       f"to {_DEST_TEST_DIR}: {exc}")
-        return False
-    log_info(_OP, f"Copied {', '.join(names)} to {_DEST_TEST_DIR}")
-    return True
-
-
 def _compile_gpu_copy(test_dir: str, env: dict[str, str]) -> bool:
     """Compile gpu-copy.cu with nvcc, choosing the host gcc as bash does."""
     rc, output = run_capture(["gcc", "-dumpversion"], _OP, env=env)
@@ -136,7 +98,10 @@ def _compile_gpu_copy(test_dir: str, env: dict[str, str]) -> bool:
 
 
 def _copy_health_checks(test_dir: str) -> bool:
-    """bash `cp -r $AZHPC_IMAGES_TEST_DIR/health_checks $DEST_TEST_DIR`."""
+    """bash `cp -r $AZHPC_IMAGES_TEST_DIR/health_checks $DEST_TEST_DIR`.
+
+    Stays local: the toolkit has no `cp -r`, and only this step copies a tree.
+    """
     source = os.path.join(test_dir, _HEALTH_CHECKS)
     destination = os.path.join(_DEST_TEST_DIR, _HEALTH_CHECKS)
     # These options make copytree behave like `cp -r` (module docstring).
@@ -157,9 +122,10 @@ def install(env: dict[str, str]) -> int:
         log_error(_OP, "AZHPC_IMAGES_TEST_DIR is not set")
         return 3
 
-    if not _make_dest_dir():
+    if not make_dirs(_DEST_TEST_DIR, op=_OP):
         return 3
-    if not _copy_top_level_files(test_dir):
+    # bash `cp $AZHPC_IMAGES_TEST_DIR/*.* $DEST_TEST_DIR`
+    if not copy_files(os.path.join(test_dir, "*.*"), _DEST_TEST_DIR, _OP):
         return 3
     if os.path.isfile(_NVCC):                       # bash `test -f`
         if not _compile_gpu_copy(test_dir, env):

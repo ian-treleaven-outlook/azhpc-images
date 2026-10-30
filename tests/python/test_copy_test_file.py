@@ -2,13 +2,14 @@
 
 Three kinds of test:
 
-  * The pure helpers (top_level_test_files, gcc_major_version, nvcc_command)
-    are tested directly with real inputs.
+  * The pure helpers (gcc_major_version, nvcc_command) are tested directly
+    with real inputs.
   * install() is tested against a small fake "tests" tree in a temporary
     directory. The module's path constants (destination, nvcc) are pointed
     into that directory, so real files are copied but nothing under /opt or
     /usr is touched. gcc and nvcc never run: the module's run_capture and
-    utils.process.exec_program (where nvcc runs) are replaced by mocks.
+    utils.process.exec_program (where nvcc runs) are replaced by mocks. One
+    log_error mock stands in for the module's and utils.files'.
   * component_env() must provide AZHPC_IMAGES_TEST_DIR, and the build plan
     must call this module.
 
@@ -21,6 +22,7 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import glob
 import os
 import tempfile
 import unittest
@@ -28,31 +30,23 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import copy_test_file
-from utils import build_config, process
+from utils import build_config, files, process
 from utils.build_config import BuildConfig, build_plan
 
 
 # --------------------------------------------------------------------------- #
 # Pure helpers: real inputs, no mocks. Each was compared with real bash once.
 # --------------------------------------------------------------------------- #
-class TopLevelTestFilesTests(unittest.TestCase):
-    def test_matches_names_with_a_dot_except_dotfiles(self):
-        names = ["run-tests.sh", "python", ".hidden.sh", "health_checks",
-                 "test-matrix_NVIDIA.json", "trailing.", "x..y"]
-        self.assertEqual(copy_test_file.top_level_test_files(names),
-                         ["run-tests.sh", "test-matrix_NVIDIA.json", "trailing.", "x..y"])
-
-    def test_no_match_returns_empty_list(self):
-        self.assertEqual(copy_test_file.top_level_test_files(["python", ".git"]), [])
-
+class RealTestsTreeTests(unittest.TestCase):
     def test_the_real_tests_directory(self):
         # The repo's tests/ today: four files, and no directory with a dot in
         # its name (cp without -r would fail on one).
         tests_dir = Path(__file__).resolve().parents[1]
-        names = copy_test_file.top_level_test_files(os.listdir(tests_dir))
-        self.assertIn("run-tests.sh", names)
-        for name in names:
-            self.assertTrue((tests_dir / name).is_file(), name)
+        # glob.glob, like bash's `*.*` (and copy_files), skips dotfiles.
+        matches = sorted(glob.glob(str(tests_dir / "*.*")))
+        self.assertIn(str(tests_dir / "run-tests.sh"), matches)
+        for path in matches:
+            self.assertTrue(os.path.isfile(path), path)
 
     def test_real_health_checks_has_no_symlinks(self):
         # Keeps the copytree rerun difference (module docstring) unreachable.
@@ -133,7 +127,8 @@ class InstallTests(unittest.TestCase):
                                return_value=gcc_result) as gcc, \
              mock.patch.object(process, "exec_program",
                                side_effect=fake_nvcc) as nvcc, \
-             mock.patch.object(copy_test_file, "log_error") as log_error:
+             mock.patch.object(copy_test_file, "log_error") as log_error, \
+             mock.patch.object(files, "log_error", log_error):
             rc = copy_test_file.install(self.env if env is None else env)
         return rc, gcc, nvcc, log_error
 
