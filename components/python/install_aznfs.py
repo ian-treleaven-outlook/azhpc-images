@@ -2,8 +2,8 @@
 
 Installs the AZNFS mount helper (Azure Blob NFS mounts). Where Microsoft's
 package repository (PMC) publishes an aznfs package it comes from there
-(`apt install -y aznfs` on Ubuntu, `dnf install -y aznfs` on AlmaLinux, Rocky
-and RHEL). Any other distro (Azure Linux 3.0 today, bash's `else`) runs the
+(install_packages: `apt-get install -y aznfs` on Ubuntu, `dnf install -y
+aznfs` on AlmaLinux, Rocky and RHEL). Any other distro (Azure Linux 3.0 today, bash's `else`) runs the
 upstream AZNFS-mount installer: download the release's aznfs_install.sh
 (SHA256 checked) into the current directory, `sed -i 's/yum/dnf/'` it, run it
 with bash, then `rm -f` it. AZNFS_NONINTERACTIVE_INSTALL=1 is set for every
@@ -18,6 +18,8 @@ Kept bash quirks:
     the `rm -f`); the error names its path.
 
 Deliberate differences:
+  * Bash's `apt install -y aznfs` runs as install_packages()'s
+    `apt-get install -y aznfs` (same package, apt-get's stable CLI).
   * The distro is matched with Distro (a "rhel" family name starts with
     almalinux/rocky/rhel) rather than bash's substring tests; the same for
     every distribution this project builds.
@@ -39,17 +41,16 @@ from pathlib import Path
 from utils.component_config import require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import remove_paths
+from utils.files import edit_file, remove_paths
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import run
 
 _OP = "install-aznfs"
 
-# Distro family -> the manager bash installs the PMC package with. Others run
-# the upstream installer. The argv is spelled as bash spells it, `apt` rather
-# than install_packages()'s `apt-get`.
-# TODO(ADO 1001): toolkit candidate: install_packages(..., keep `apt` spelling)
-_PMC_MANAGER = {"ubuntu": "apt", "rhel": "dnf"}
+# Distro families that install the PMC aznfs package; others run the
+# upstream installer.
+_PMC_FAMILIES = ("ubuntu", "rhel")
 
 # The distro the installer branch was written for; others reaching it are warned about.
 _INSTALLER_DISTRO = "azurelinux"
@@ -65,26 +66,23 @@ _NONINTERACTIVE = {"AZNFS_NONINTERACTIVE_INSTALL": "1"}
 
 
 def install_branch(distribution: str) -> str:
-    """Which branch of bash's if/elif/else runs: "apt", "dnf" or "installer"."""
-    return _PMC_MANAGER.get(Distro(distribution).family, "installer")
+    """Which branch of bash's if/elif/else runs: "pmc" or "installer"."""
+    return "pmc" if Distro(distribution).family in _PMC_FAMILIES else "installer"
 
 
-def sed_yum_to_dnf(data: bytes) -> tuple[bytes, int]:
-    """`sed 's/yum/dnf/'` on the file's bytes: the first "yum" on each line.
+def sed_yum_to_dnf(text: str) -> str:
+    """`sed 's/yum/dnf/'` on the file's text: the first "yum" on each line.
 
-    Returns (new bytes, number of lines changed). A missing final newline
-    stays missing, as with sed.
+    A missing final newline stays missing, as with sed.
     """
-    lines = data.split(b"\n")
-    changed = sum(1 for line in lines if b"yum" in line)
-    return b"\n".join(line.replace(b"yum", b"dnf", 1) for line in lines), changed
+    return "\n".join(line.replace("yum", "dnf", 1) for line in text.split("\n"))
 
 
-def _install_from_pmc(manager: str, run_env: dict[str, str]) -> int:
-    """`apt install -y aznfs` or `dnf install -y aznfs`."""
-    if not run([manager, "install", "-y", "aznfs"], _OP, env=run_env):
+def _install_from_pmc(run_env: dict[str, str]) -> int:
+    """`apt-get install -y aznfs` or `dnf install -y aznfs`."""
+    if not install_packages(["aznfs"], run_env, _OP):
         return 3
-    log_info(_OP, "AZNFS installed", branch=manager, package="aznfs")
+    log_info(_OP, "AZNFS installed", branch="pmc", package="aznfs")
     return 0
 
 
@@ -100,21 +98,17 @@ def _download_installer(url: str, sha256: str) -> Path | None:
 
 def _patch_installer(script: Path) -> bool:
     """bash `sed -i 's/yum/dnf/' aznfs_install.sh`."""
-    try:
-        patched, changed = sed_yum_to_dnf(script.read_bytes())
-        script.write_bytes(patched)
-    except OSError as exc:
-        log_error(_OP, f"could not patch {script}: {exc}", path=str(script))
-        return False
-    log_info(_OP, f"Patched {script}: first 'yum' on each line -> 'dnf' "
-                  "(sed -i 's/yum/dnf/')", path=str(script), action="replaced",
-             lines_changed=changed)
-    if changed == 0:
-        log_warn(_OP, f"{script} has no 'yum' to replace; running it unchanged",
-                 path=str(script))
-    log_debug(_OP, f"Patched installer {script}:\n"
-                   f"{patched.decode('utf-8', errors='replace')}", path=str(script))
-    return True
+    def patch(text: str) -> str:
+        changed = sum(1 for line in text.split("\n") if "yum" in line)
+        log_info(_OP, f"Patched {script}: first 'yum' on each line -> 'dnf' "
+                      "(sed -i 's/yum/dnf/')", path=str(script), lines_changed=changed)
+        if changed == 0:
+            log_warn(_OP, f"{script} has no 'yum' to replace; running it unchanged",
+                     path=str(script))
+        patched = sed_yum_to_dnf(text)
+        log_debug(_OP, f"Patched installer {script}:\n{patched}", path=str(script))
+        return patched
+    return edit_file(script, patch, _OP)
 
 
 def _install_from_upstream_installer(env: dict[str, str], run_env: dict[str, str],
@@ -153,4 +147,4 @@ def install(env: dict[str, str]) -> int:
              branch=branch, noninteractive=True)
     if branch == "installer":
         return _install_from_upstream_installer(env, run_env, distro)
-    return _install_from_pmc(branch, run_env)
+    return _install_from_pmc(run_env)

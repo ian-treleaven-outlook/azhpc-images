@@ -777,9 +777,10 @@ class MonitoringToolsTests(unittest.TestCase):
 
 
 class AznfsTests(unittest.TestCase):
-    """install_aznfs.py. Commands (utils.process.exec_program) and the download
-    (utils.download.download_and_verify) are mocked; the installer is written
-    into a temporary directory (the port's _DOWNLOAD_DIR)."""
+    """install_aznfs.py. Commands (utils.process / utils.package_installer
+    exec_program) and the download (utils.download.download_and_verify) are
+    mocked; the installer is written into a temporary directory (the port's
+    _DOWNLOAD_DIR)."""
 
     _VERSIONS = json.dumps({"aznfs": {"common": {"version": "3.0.12", "sha256": "s"}}})
     _URL = ("https://github.com/Azure/AZNFS-mount/releases/download/3.0.12/"
@@ -792,6 +793,8 @@ class AznfsTests(unittest.TestCase):
                   b"\n"
                   b"YUM yum\n"
                   b"last line yum yum")
+    _APT_INSTALL = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "aznfs"]
+    _DNF_INSTALL = ["dnf", "install", "-y", "aznfs"]
     _PATCHED = (b"dnf install -y yum-utils && yum update\n"
                 b"no match here\n"
                 b"  if command -v dnf; then yum -y install aznfs; fi\n"
@@ -841,6 +844,8 @@ class AznfsTests(unittest.TestCase):
         with mock.patch.object(download_module, "download_and_verify",
                                side_effect=fake_download) as download, \
              mock.patch.object(process, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_aznfs, "log_info") as info, \
              mock.patch.object(install_aznfs, "log_warn") as warn, \
              mock.patch.object(install_aznfs, "log_error") as error, \
@@ -857,40 +862,43 @@ class AznfsTests(unittest.TestCase):
 
     # ---- pure helpers ----------------------------------------------------------
     def test_install_branch(self):
-        cases = {"ubuntu22.04": "apt", "ubuntu24.04": "apt", "ubuntu26.04": "apt",
-                 "almalinux8.10": "dnf", "almalinux9.8": "dnf", "rocky9.8": "dnf",
-                 "rhel9.8": "dnf", "rhel8.10": "dnf", "azurelinux3.0": "installer",
+        cases = {"ubuntu22.04": "pmc", "ubuntu24.04": "pmc", "ubuntu26.04": "pmc",
+                 "almalinux8.10": "pmc", "almalinux9.8": "pmc", "rocky9.8": "pmc",
+                 "rhel9.8": "pmc", "rhel8.10": "pmc", "azurelinux3.0": "installer",
                  "sles15": "installer", "": "installer"}
         for distro, branch in cases.items():
             with self.subTest(distro=distro):
                 self.assertEqual(install_aznfs.install_branch(distro), branch)
 
     def test_sed_replaces_only_the_first_yum_on_each_line(self):
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(self._INSTALLER), (self._PATCHED, 5))
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(b"yum\n"), (b"dnf\n", 1))
-        self.assertEqual(install_aznfs.sed_yum_to_dnf(b""), (b"", 0))
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(self._INSTALLER.decode()),
+                         self._PATCHED.decode())
+        self.assertEqual(install_aznfs.sed_yum_to_dnf("yum\n"), "dnf\n")
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(""), "")
 
     # ---- PMC branches ----------------------------------------------------------
     def test_ubuntu_and_rhel_family_install_from_pmc(self):
-        cases = {"ubuntu24.04": "apt", "ubuntu26.04": "apt", "ubuntu22.04": "apt",
-                 "almalinux9.8": "dnf", "rocky8.10": "dnf", "rhel9.8": "dnf"}
-        for distro, manager in cases.items():
+        # bash's `apt install -y aznfs` runs as install_packages()'s apt-get.
+        cases = {"ubuntu24.04": self._APT_INSTALL, "ubuntu26.04": self._APT_INSTALL,
+                 "ubuntu22.04": self._APT_INSTALL, "almalinux9.8": self._DNF_INSTALL,
+                 "rocky8.10": self._DNF_INSTALL, "rhel9.8": self._DNF_INSTALL}
+        for distro, command in cases.items():
             with self.subTest(distro=distro):
                 rc, commands, m = self._install(distro)
                 self.assertEqual(rc, 0)
-                self.assertEqual(commands, [[manager, "install", "-y", "aznfs"]])
+                self.assertEqual(commands, [command])
                 m["download"].assert_not_called()
                 m["warn"].assert_not_called()
                 m["error"].assert_not_called()
                 self.assertEqual(m["info"].call_args_list[0].kwargs,
-                                 {"distro": distro, "branch": manager,
+                                 {"distro": distro, "branch": "pmc",
                                   "noninteractive": True})
 
     def test_pmc_failure_returns_3(self):
-        rc, commands, m = self._install("ubuntu24.04", rcs={"apt": 100})
+        rc, commands, m = self._install("ubuntu24.04", rcs={"apt-get": 100})
         self.assertEqual(rc, 3)
-        self.assertEqual(commands, [["apt", "install", "-y", "aznfs"]])
-        m["error"].assert_not_called()       # exec_program logs the failed command
+        self.assertEqual(commands, [self._APT_INSTALL])
+        m["error"].assert_not_called()       # install_packages logs the failure
 
     # ---- installer branch ------------------------------------------------------
     def test_azurelinux_runs_the_patched_installer_and_removes_it(self):
