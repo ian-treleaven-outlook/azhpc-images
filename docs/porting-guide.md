@@ -7,7 +7,8 @@ orchestration to Python.
 run by `azhpc.py`. The Ubuntu 24.04 plan
 ([`ubuntu24_04.py`](../utils/plans/ubuntu24_04.py)) has 36 steps; **all 36 run
 natively in Python**, matching upstream `Azure/azhpc-images@0c2b8f9` (October
-2026; see §12). Other distros get their plans in ADO 992–997.
+2026; see §12). Ubuntu 22.04, Ubuntu 26.04 and Azure Linux 3.0 have their
+plans too (ADO 992–994); AlmaLinux, Rocky and RHEL come next (ADO 995–997).
 Before them, the bootstrap makes `utils/set_properties.sh`'s system changes
 (`utils/system_prep.py`: apt upgrade, jq, ...) and runs `install_utils.sh`.
 The October 2026 clarity pass (ADO 1001) moved every port onto the shared
@@ -184,7 +185,8 @@ belongs here.
 | Clone at a ref, check out a commit; resolve `.ref // .branch // v<version>` | `git_clone(url, op, ref=, commit=, dest=, cwd=)` → dir or None; `configured_ref(cfg, version)` | `utils.repo_source` |
 | Which distro is this? | `Distro.from_env(env)` → `.is_ubuntu`, `.is_azurelinux`, `.is_rhel_family`, `.is_rpm`, `.major` | `utils.distro` |
 | Install distro packages | `install_packages(packages, env, op, options=, cwd=)` → bool | `utils.package_installer` |
-| Refresh / remove / upgrade packages; installed version | `refresh_package_index(env, op)`, `remove_packages(pkgs, env, op, purge=)`, `update_packages(pkgs, env, op)`, `installed_package_version(pkg, env, op)` | `utils.package_installer` |
+| Refresh / remove / upgrade packages; installed version | `refresh_package_index(env, op)`, `remove_packages(pkgs, env, op, purge=, options=)`, `update_packages(pkgs, env, op)`, `installed_package_version(pkg, env, op)` | `utils.package_installer` |
+| Record OFED as `ofed_info` reports it (DOCA, MOFED) | `record_ofed_version(env, op)` → bool; `parse_ofed_version(output)` | `utils.ofed` |
 | Pin packages against dnf updates | `dnf_pin_packages(packages, op, env=)` → bool | `utils.package_pinning` |
 | Download + SHA256 verify | `fetch_verified(url, sha256, op, dest_dir)` → Path or None | `utils.download` |
 | Download with no checksum (only where bash has none) | `fetch(url, op, dest_dir)` → Path or None | `utils.download` |
@@ -502,7 +504,7 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **1166 tests, ~standard library only** — `unittest` and
+The suite is **1244 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
 the test environment and skip themselves when those tools are missing.
 
@@ -592,7 +594,8 @@ Nested component scripts that a ported step calls (e.g. `install_gdrcopy.sh`,
 step exactly as the bash step did; `install_cuda_samples` runs as its Python
 port, called by both driver steps.
 
-`install-nv-driver` covers GB200/GB300 (and VR200, built as GB200) too, as in
+`install-nv-driver` covers GB200/GB300 (and VR200 on Ubuntu 24.04, whose
+install.sh builds it as GB200) too, as in
 bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, and
 the shared script switches to IMEX/CDMM when `NVLINK_RACKSCALE=true` (packer sets
 it for GB*/VR* SKUs).
@@ -612,17 +615,28 @@ DistroPlan(
     pre_bootstrap=...,                # steps before install_utils.sh (optional)
     vendors=frozenset({"NVidia"}),    # what install.sh accepts (optional)
     vendor_error="AMD GPU support is not implemented yet for AlmaLinux.",
+    sku_aliases={"VR200": "GB200"},   # SKUs install.sh builds as another (optional)
+    reject_sku=ubuntu26_04.reject_sku,  # install.sh's message for a SKU it refuses
 )
 ```
+
+`sku_aliases` and `reject_sku` are per distro because each install.sh differs:
+only Ubuntu 24.04's builds VR200 as GB200, and only Ubuntu 26.04's refuses
+V100, GB200, VR200 and NCv6. `resolve_config` applies both before anything
+runs, so a refused SKU fails with install.sh's message and changes nothing.
 
 A build runs set_properties.sh's system changes, the plan's pre-bootstrap
 steps, `install_utils.sh`, then the plan's steps.
 
 The CLI accepts every distro folder as `--os` (Ubuntu22/24/26, Azure3,
 Alma8/9, Rocky8/9, RHEL8/9). `versions` and `validate` work for all of them;
-building needs a plan, and an OS without one stops with the ticket that will
-add it (`PENDING`): Ubuntu 22.04 ADO 992, Ubuntu 26.04 ADO 993, Azure Linux
-ADO 994, AlmaLinux ADO 995, Rocky ADO 996, RHEL ADO 997.
+building needs a plan. Plans exist for Ubuntu 22.04, 24.04 and 26.04 and
+Azure Linux 3.0; an OS without one stops with the ticket that will add it
+(`PENDING`): AlmaLinux ADO 995, Rocky ADO 996, RHEL ADO 997.
+
+Their distro-only scripts are ported too: `install_mofed.py` and
+`azurelinux_network_config.py` (Azure Linux), and `remove_unused_packages.py`
+(Ubuntu 22.04's pre-bootstrap step).
 
 **Adding a distro:** write `utils/plans/<folder>.py` with `build(cfg)` (and
 `pre_bootstrap(cfg)` if needed), reading top to bottom like its install.sh;
@@ -633,7 +647,8 @@ automatically: the same order, every script covered across representative
 SKUs, every script present, and the cleanup word for word.
 
 The Python code needs Python 3.10 or newer. AlmaLinux/Rocky 8 ship 3.6 and 9
-ship 3.9, so those plans need a newer `python3` on the build VM.
+ship 3.9, so those plans need a newer `python3` on the build VM: Packer will
+install python3.11 or python3.12 and run `azhpc.py` with it (ADO 1008).
 
 ---
 ## 13. Where this is headed

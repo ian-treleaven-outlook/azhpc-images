@@ -9,12 +9,14 @@ with one built the usual bash way.
 
 | | Python CLI | Notes |
 |---|---|---|
-| Ubuntu 24.04 | yes | The only distro with a parity build plan so far. Others: ADO 991–997 |
+| Ubuntu 22.04, 24.04, 26.04 | yes | Ubuntu 26.04 refuses V100, GB200, VR200 and NCv6, as its install.sh does |
+| Azure Linux 3.0 | yes | |
+| AlmaLinux, Rocky, RHEL | no | Plans in ADO 995–997; they also need a newer `python3` (ADO 1008) |
 | `azure_vm_regular` | yes | |
 | `baremetal_3p` | yes | |
 | `azure_vm_akshost` | no | Runs `install_aks.sh`, which has no Python plan |
 | `baremetal_1p` | no | Needs the out-of-repo 1P overlay, which replaces bash files |
-| SKUs | every SKU Packer passes | V100, A100, MI300X, GB200 (also GB300 VMs), VR200 (built as GB200), NCv6 |
+| SKUs | every SKU Packer passes | V100, A100, MI300X, GB200 (also GB300 VMs), VR200 (built as GB200 on Ubuntu 24.04), NCv6 |
 
 Packer stops before creating a VM if `USE_PYTHON_CLI` is set for anything
 else, with an `ERROR: use_python_cli is set, ...` message.
@@ -33,11 +35,11 @@ packer build --var 'target_vm_size=Standard_ND96asr_v4' --var 'os_family=ubuntu'
 ```
 
 Only the "Install HPC components" step changes. Instead of
-`bash install.sh <GPU> <SKU>` in `distros/ubuntu24.04/`, it runs
+`bash install.sh <GPU> <SKU>` in `distros/<folder>/`, it runs
 
 ```bash
 cd /home/<user>/azhpc-images; python3 --version; \
-    python3 azhpc.py --vendor <NVidia|AMD> --gpu <SKU> --os Ubuntu24
+    python3 azhpc.py --vendor <NVidia|AMD> --gpu <SKU> --os <Ubuntu22|Ubuntu24|Ubuntu26|Azure3>
 ```
 
 with the same environment (`TARGET_NODE_TYPE`, `NVLINK_RACKSCALE`,
