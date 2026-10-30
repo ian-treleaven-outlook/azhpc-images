@@ -91,6 +91,10 @@ Parity notes
 
 Deliberate differences from bash
 --------------------------------
+  * Installs go through install_packages(), which normalises bash's spellings
+    (`apt install pkg -y` -> `apt-get install -y -o Dpkg::Use-Pty=0 pkg`).
+    In the RHEL-family branch only AlmaLinux/Rocky/RHEL have a known manager;
+    the toolkit install fails on any other distro (bash would try dnf).
   * Every versions.json value a branch needs is checked before anything is
     installed, and a missing one fails the step: nvidia driver.version (Ubuntu,
     RHEL family), driver.sha256 (RHEL family), driver.repo_file (Ubuntu MRC or
@@ -150,6 +154,7 @@ from components.python import install_cuda_samples
 from utils.component_config import DEFAULT_NODE_TYPE, config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.package_pinning import dnf_pin_packages
 from utils.process import exec_program, run_capture
 from utils.sku import NETWORK_MODE_MRC, sku_network_mode
@@ -567,8 +572,7 @@ def _driver_azurelinux(env, p: _Inputs) -> str | None:
 
     # The CUDA repo has an identically named 'cuda' meta-package, so it is
     # disabled: every driver package comes from PMC.
-    if not _run(["dnf", "install", "-y", "--disablerepo=cuda-azl3*", package], env):
-        log_error(_OP, f"could not install driver package {package}", package=package)
+    if not install_packages([package], env, _OP, options=["--disablerepo=cuda-azl3*"]):
         return None
 
     rc, listing = run_capture(["dnf", "list", "installed"], _OP, env=env)
@@ -621,25 +625,24 @@ def _driver_ubuntu(env, p: _Inputs) -> str | None:
                       "driver packages come from the CUDA repo",
                  node_type=p.node_type, driver_source=p.driver_source or "(not set)")
 
-    commands = [["apt", "install", f"nvidia-driver-pinning-{p.driver_version}", "-y"]]
+    installs = [[f"nvidia-driver-pinning-{p.driver_version}"]]
     if p.sku == "V100":
         log_info(_OP, "V100: installing cuda-drivers (proprietary kernel modules)")
-        commands.append(["apt", "install", "cuda-drivers", "-y"])
+        installs.append(["cuda-drivers"])
         branch = "cuda-drivers"
     elif p.rackscale:
         major = p.driver_major
         log_info(_OP, f"NVLINK_RACKSCALE=true: installing the {major} open dkms/driver "
                       "packages and nvidia-modprobe", driver_major=major)
-        commands.append(["apt", "install", f"nvidia-dkms-{major}-open",
-                         f"nvidia-driver-{major}-open", "nvidia-modprobe", "-y"])
+        installs.append([f"nvidia-dkms-{major}-open", f"nvidia-driver-{major}-open",
+                         "nvidia-modprobe"])
         branch = "rackscale"
     else:
         log_info(_OP, "Installing nvidia-open (open kernel modules)")
-        commands.append(["apt", "install", "nvidia-open", "-y"])
+        installs.append(["nvidia-open"])
         branch = "nvidia-open"
-    if not _run_all(commands, env):
-        log_error(_OP, "NVIDIA driver package installation failed",
-                  driver_version=p.driver_version)
+    # One install per bash command, stopping at the first failure.
+    if not all(install_packages(packages, env, _OP) for packages in installs):
         return None
 
     version = p.driver_version
@@ -705,8 +708,7 @@ def _add_local_repo(env, p: _Inputs) -> bool:
                   "over every other source (the CUDA toolkit still comes from the "
                   "online CUDA repo)", repo_file=deb, node_type=p.node_type,
              driver_source=p.driver_source or "(not set)", mrc_network=p.mrc)
-    if not _run(["apt", "install", "-y", deb], env):
-        log_error(_OP, f"could not install the local driver repo {deb}", path=deb)
+    if not install_packages([deb], env, _OP):
         return False
 
     pattern = _host(f"/var/{local_repo_dir(p.repo_file)}/nvidia-driver-local-*-keyring.gpg")
@@ -768,11 +770,10 @@ def _install_toolkit(env, p: _Inputs) -> str | None:
     package = cuda_toolkit_package(p.cuda_version)
     log_info(_OP, f"Installing CUDA toolkit {p.cuda_version} ({package})",
              cuda_version=p.cuda_version, package=package)
-    if p.family == "ubuntu":
-        commands = [["apt", "install", "-y", package]]   # repo added by the bootstrap
-    elif p.family == "azurelinux":
-        commands = [["dnf", "install", "-y", package]]
-    else:
+    # Ubuntu's CUDA repo comes from the bootstrap, Azure Linux's from step 1;
+    # the RHEL family adds and configures it first.
+    setup = []
+    if p.family == "rhel":
         repo = _RHEL_CUDA_REPO.format(d=p.cuda_distribution)
         _warn_x86_64_only(p, "The CUDA dnf repo")
         excludes = rhel_cuda_excludes(p.cuda_version)
@@ -780,20 +781,19 @@ def _install_toolkit(env, p: _Inputs) -> str | None:
         # that CUDA 12 still needs (see the bash comments).
         log_info(_OP, f"Adding CUDA repo {repo} with excludepkgs={excludes}",
                  source=repo, excludepkgs=excludes)
-        commands = [["dnf", "config-manager", "--add-repo", repo]]
+        setup = [["dnf", "config-manager", "--add-repo", repo]]
         if p.cuda_version.startswith("12.") and p.distribution.startswith("rhel"):
             supplementary = rhel_supplementary_repo(p.distribution, p.arch)
             log_info(_OP, f"RHEL with CUDA 12: also excluding cccl-* from {supplementary}",
                      repo=supplementary, excludepkgs="cccl-*", distro=p.distribution)
-            commands.append(["dnf", "config-manager", "--save",
-                             f"--setopt={supplementary}.excludepkgs=cccl-*"])
-        commands += [
+            setup.append(["dnf", "config-manager", "--save",
+                          f"--setopt={supplementary}.excludepkgs=cccl-*"])
+        setup += [
             ["dnf", "config-manager", "--save",
              f"--setopt=cuda-{p.cuda_distribution}-x86_64.excludepkgs={excludes}"],
             ["dnf", "clean", "expire-cache"],
-            ["dnf", "install", "-y", package],
         ]
-    if not _run_all(commands, env):
+    if not (_run_all(setup, env) and install_packages([package], env, _OP)):
         log_error(_OP, f"CUDA toolkit installation failed ({package})", package=package)
         return None
 
@@ -838,7 +838,7 @@ def _install_imex(env, p: _Inputs) -> bool:
         return False
 
     if p.family == "azurelinux":
-        command = ["dnf", "install", "-y", f"nvidia-imex-{p.imex_version}"]
+        package = f"nvidia-imex-{p.imex_version}"
     else:   # ubuntu (other distros were rejected in _resolve, as bash exits 1)
         # BASH QUIRK (kept): apt installs whatever nvidia-imex it picks, but
         # the versions.json version is what gets recorded.
@@ -846,9 +846,8 @@ def _install_imex(env, p: _Inputs) -> bool:
                       f"recorded as {p.imex_version} from versions.json without "
                       "checking what apt installed (bash behaviour, kept)",
                  imex_version=p.imex_version)
-        command = ["apt-get", "install", "nvidia-imex", "-y"]
-    if not _run(command, env):
-        log_error(_OP, "NVIDIA IMEX installation failed", imex_version=p.imex_version)
+        package = "nvidia-imex"
+    if not install_packages([package], env, _OP):
         return False
     if not _record("IMEX", p.imex_version):
         return False

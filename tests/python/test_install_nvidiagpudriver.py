@@ -7,8 +7,9 @@
     bash script's own echo/tee/heredoc lines in real bash. (00-nvidia-prefer
     is stored as 00-nvidia-prefer.txt: .gitattributes forces LF only on names
     with a dot, and a CRLF checkout would break the byte comparison.)
-  * install() runs with every external effect mocked: exec_program,
-    run_capture, download_and_verify, dnf_pin_packages,
+  * install() runs with every external effect mocked: exec_program (the
+    module's and utils.package_installer's, which runs the installs, into one
+    ordered record), run_capture, download_and_verify, dnf_pin_packages,
     write_component_version and install_cuda_samples.install. System paths are
     redirected under a temporary directory (_ROOT), as is the work dir.
 
@@ -27,6 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvidiagpudriver as m
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nv-driver"
@@ -120,6 +122,16 @@ _FABRIC_MANAGER = _nested("install_nvidia_fabric_manager.sh")
 _PERSISTENCE = _nested("configure_nvidia_persistence.sh")
 _NVCC = ("capture", ["bash", "-c", "source /etc/profile; nvcc --version"])
 _SAMPLES = ("samples",)
+
+
+def _apt(*packages):
+    """An install_packages() call on Ubuntu, as recorded by the harness."""
+    return ("exec", ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", *packages])
+
+
+def _dnf(*args):
+    """An install_packages() call on Azure Linux / the RHEL family."""
+    return ("exec", ["dnf", "install", "-y", *args])
 
 
 # --------------------------------------------------------------------------- #
@@ -322,6 +334,9 @@ class _InstallBase(unittest.TestCase):
             return Path(dest_dir) / os.path.basename(url)
 
         with mock.patch.object(m, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(m, "run_capture", side_effect=fake_capture), \
              mock.patch.object(m.install_cuda_samples, "install",
                                side_effect=fake_samples), \
@@ -335,7 +350,7 @@ class _InstallBase(unittest.TestCase):
              mock.patch.object(m, "log_error") as log_error:
             rc = m.install(env)
         mocks = {"record": record, "info": log_info, "warn": log_warn,
-                 "error": log_error, "cwd": seen_work}
+                 "error": log_error, "pkg_error": pkg_error, "cwd": seen_work}
         return rc, calls, mocks
 
     @staticmethod
@@ -372,10 +387,10 @@ class AzureLinuxTests(_InstallBase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [
             *self._repo_calls("x86_64", "x86_64"),
-            ("exec", ["dnf", "install", "-y", "--disablerepo=cuda-azl3*", "cuda-open"]),
+            _dnf("--disablerepo=cuda-azl3*", "cuda-open"),
             ("capture", ["dnf", "list", "installed"]),
             ("pin", ["cuda-open"]),
-            ("exec", ["dnf", "install", "-y", "cuda-toolkit-13-0"]),
+            _dnf("cuda-toolkit-13-0"),
             _NVCC, _SAMPLES, *_TAIL_FM,
         ])
         self.assertEqual(self.recorded(mocks), [("NVIDIA", "580.126.20-1"),
@@ -396,12 +411,12 @@ class AzureLinuxTests(_InstallBase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [
             *self._repo_calls("sbsa", "aarch64"),
-            ("exec", ["dnf", "install", "-y", "--disablerepo=cuda-azl3*", "cuda-open-hwe"]),
+            _dnf("--disablerepo=cuda-azl3*", "cuda-open-hwe"),
             ("capture", ["dnf", "list", "installed"]),
             ("pin", ["cuda-open-hwe"]),
-            ("exec", ["dnf", "install", "-y", "cuda-toolkit-13-0"]),
+            _dnf("cuda-toolkit-13-0"),
             _NVCC, _SAMPLES, _GDRCOPY,
-            ("exec", ["dnf", "install", "-y", "nvidia-imex-580.159.04"]),
+            _dnf("nvidia-imex-580.159.04"),
             ("exec", ["dracut", "--force"]),
             ("exec", ["systemctl", "enable", "nvidia-imex.service"]),
             _PERSISTENCE,
@@ -421,10 +436,10 @@ class AzureLinuxTests(_InstallBase):
     def test_v100_uses_proprietary_cuda_package(self):
         rc, calls, mocks = self._install(_env("azurelinux3.0", sku="V100"))
         self.assertEqual(rc, 0)
-        self.assertIn(("exec", ["dnf", "install", "-y", "--disablerepo=cuda-azl3*", "cuda"]),
+        self.assertIn(_dnf("--disablerepo=cuda-azl3*", "cuda"),
                       calls)
         self.assertIn(("pin", ["cuda"]), calls)
-        self.assertIn(("exec", ["dnf", "install", "-y", "cuda-toolkit-12-9"]), calls)
+        self.assertIn(_dnf("cuda-toolkit-12-9"), calls)
         self.assertEqual(self.recorded(mocks)[0], ("NVIDIA", "575.57.08-1"))
 
     def test_repo_file_without_section_warns(self):
@@ -459,6 +474,14 @@ class AzureLinuxTests(_InstallBase):
         self.assertEqual(rc, 3)
         self.assertEqual(self.recorded(mocks), [])
 
+    def test_driver_install_failure_returns_3(self):
+        fail = _dnf("--disablerepo=cuda-azl3*", "cuda-open")[1]
+        rc, calls, mocks = self._install(_env("azurelinux3.0"), fail_on=fail)
+        self.assertEqual(rc, 3)
+        self.assertEqual(calls[-1], ("exec", fail))
+        self.assertEqual(self.recorded(mocks), [])
+        self.assert_logged(mocks["pkg_error"], "dnf install failed")
+
     def test_pin_failure_returns_3(self):
         rc, calls, mocks = self._install(_env("azurelinux3.0"), pin_ok=False)
         self.assertEqual(rc, 3)
@@ -479,9 +502,9 @@ class UbuntuTests(_InstallBase):
         self.assertEqual(rc, 0)
         # No keyring/apt-get update: the bootstrap set up the CUDA repo (#643).
         self.assertEqual(calls, [
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.178.04", "-y"]),
-            ("exec", ["apt", "install", "nvidia-open", "-y"]),
-            ("exec", ["apt", "install", "-y", "cuda-toolkit-13-0"]),
+            _apt("nvidia-driver-pinning-580.178.04"),
+            _apt("nvidia-open"),
+            _apt("cuda-toolkit-13-0"),
             _NVCC, _SAMPLES, *_TAIL_FM,
         ])
         self.assertEqual(self.recorded(mocks), [("NVIDIA", "580.178.04"),
@@ -510,9 +533,9 @@ class UbuntuTests(_InstallBase):
         rc, calls, mocks = self._install(_env(sku="V100"))
         self.assertEqual(rc, 0)
         self.assertEqual(calls[0:3], [
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.178.04", "-y"]),
-            ("exec", ["apt", "install", "cuda-drivers", "-y"]),
-            ("exec", ["apt", "install", "-y", "cuda-toolkit-12-9"]),
+            _apt("nvidia-driver-pinning-580.178.04"),
+            _apt("cuda-drivers"),
+            _apt("cuda-toolkit-12-9"),
         ])
         self.assertEqual(self.recorded(mocks)[1], ("CUDA", "12.9.86"))
 
@@ -521,12 +544,11 @@ class UbuntuTests(_InstallBase):
         rc, calls, mocks = self._install(env)
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.126.20", "-y"]),
-            ("exec", ["apt", "install", "nvidia-dkms-580-open", "nvidia-driver-580-open",
-                      "nvidia-modprobe", "-y"]),
-            ("exec", ["apt", "install", "-y", "cuda-toolkit-13-0"]),
+            _apt("nvidia-driver-pinning-580.126.20"),
+            _apt("nvidia-dkms-580-open", "nvidia-driver-580-open", "nvidia-modprobe"),
+            _apt("cuda-toolkit-13-0"),
             _NVCC, _SAMPLES, _GDRCOPY,
-            ("exec", ["apt-get", "install", "nvidia-imex", "-y"]),
+            _apt("nvidia-imex"),
             ("exec", ["update-initramfs", "-u", "-k", "all"]),
             ("exec", ["systemctl", "enable", "nvidia-imex.service"]),
             _PERSISTENCE,
@@ -557,7 +579,7 @@ class UbuntuTests(_InstallBase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.read("/etc/modprobe.d/nvidia.conf"),
                          _fixture("nvidia.conf.baremetal-rackscale"))
-        self.assertIn(("exec", ["apt", "install", "nvidia-driver-pinning-580.167.08", "-y"]),
+        self.assertIn(_apt("nvidia-driver-pinning-580.167.08"),
                       calls)
         self.assertEqual(self.recorded(mocks)[-1], ("IMEX", "580.167.08-1"))
         self.assert_not_logged(mocks["info"], "MRC network (baremetal_1p)")
@@ -570,11 +592,11 @@ class UbuntuTests(_InstallBase):
         rc, calls, mocks = self._install(_env(node_type="baremetal_1p"))
         self.assertEqual(rc, 0)
         self.assertEqual(calls[:5], [
-            ("exec", ["apt", "install", "-y", f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"]),
+            _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"),
             ("exec", ["apt", "update"]),
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.178.04", "-y"]),
-            ("exec", ["apt", "install", "nvidia-open", "-y"]),
-            ("exec", ["apt", "install", "-y", "cuda-toolkit-13-0"]),
+            _apt("nvidia-driver-pinning-580.178.04"),
+            _apt("nvidia-open"),
+            _apt("cuda-toolkit-13-0"),
         ])
         self.assertEqual(sorted(os.listdir(self.path("/usr/share/keyrings"))),
                          ["nvidia-driver-local-A1B2-keyring.gpg"])
@@ -586,8 +608,7 @@ class UbuntuTests(_InstallBase):
     def test_mrc_without_keyring_returns_3(self):
         rc, calls, mocks = self._install(_env(node_type="baremetal_1p"))
         self.assertEqual(rc, 3)
-        self.assertEqual(calls[-1], ("exec", ["apt", "install", "-y",
-                                              f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"]))
+        self.assertEqual(calls[-1], _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"))
         self.assert_logged(mocks["error"], "no keyring matches")
 
     def test_mrc_without_repo_file_fails_up_front(self):
@@ -602,8 +623,8 @@ class UbuntuTests(_InstallBase):
         rc, calls, mocks = self._install(_env(node_type="azure_vm_akshost"))
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.178.04", "-y"]),
-            ("exec", ["apt", "install", "nvidia-open", "-y"]),
+            _apt("nvidia-driver-pinning-580.178.04"),
+            _apt("nvidia-open"),
             *_TAIL_FM,
         ])
         self.assertEqual(self.recorded(mocks), [("NVIDIA", "580.178.04")])
@@ -619,7 +640,7 @@ class UbuntuTests(_InstallBase):
         self.assert_logged(mocks["error"], "nvidia driver.version")
 
     def test_driver_package_failure_stops(self):
-        fail = ["apt", "install", "nvidia-open", "-y"]
+        fail = _apt("nvidia-open")[1]
         rc, calls, mocks = self._install(_env(), fail_on=fail)
         self.assertEqual(rc, 3)
         self.assertEqual(calls[-1], ("exec", fail))
@@ -647,10 +668,10 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
         rc, calls, mocks = self._install(_env(versions=self._private_versions()))
         self.assertEqual(rc, 0)
         self.assertEqual(calls[:4], [
-            ("exec", ["apt", "install", "-y", f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"]),
+            _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"),
             ("exec", ["apt", "update"]),
-            ("exec", ["apt", "install", "nvidia-driver-pinning-580.178.04", "-y"]),
-            ("exec", ["apt", "install", "nvidia-open", "-y"]),
+            _apt("nvidia-driver-pinning-580.178.04"),
+            _apt("nvidia-open"),
         ])
         self.assertEqual(os.listdir(self.path("/usr/share/keyrings")),
                          ["nvidia-driver-local-X-keyring.gpg"])
@@ -679,17 +700,18 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
         versions["nvidia"]["ubuntu24.04"]["x86_64"]["driver"]["source"] = "public"
         rc, calls, mocks = self._install(_env(versions=versions))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[0], ("exec", ["apt", "install",
-                                             "nvidia-driver-pinning-580.178.04", "-y"]))
+        self.assertEqual(calls[0], _apt("nvidia-driver-pinning-580.178.04"))
         self.assert_logged(mocks["info"], "Not the MRC network")
 
     def test_local_repo_install_failure_stops(self):
-        fail = ["apt", "install", "-y", f"{_TOP_DIR}/internal_bits/{_REPO_FILE}"]
+        fail = _apt(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}")[1]
         rc, calls, mocks = self._install(_env(versions=self._private_versions()),
                                          fail_on=fail)
         self.assertEqual(rc, 3)
         self.assertEqual(calls, [("exec", fail)])
-        self.assert_logged(mocks["error"], "could not install the local driver repo")
+        self.assert_logged(mocks["pkg_error"], "apt-get install failed with exit code 1")
+        self.assertIn(f"{_TOP_DIR}/internal_bits/{_REPO_FILE}",
+                      mocks["pkg_error"].call_args.kwargs["packages"])
 
     def test_missing_cuda_apt_source_warns_and_continues(self):
         os.remove(self.cuda_source)
@@ -708,10 +730,10 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
         rc, calls, mocks = self._install(_env("ubuntu26.04"))
         self.assertEqual(rc, 0)
         self.assertEqual(calls[:4], [
-            ("exec", ["apt", "install", "nvidia-driver-pinning-610", "-y"]),
-            ("exec", ["apt", "install", "nvidia-open", "-y"]),
+            _apt("nvidia-driver-pinning-610"),
+            _apt("nvidia-open"),
             _DPKG_QUERY,
-            ("exec", ["apt", "install", "-y", "cuda-toolkit-13-0"]),
+            _apt("cuda-toolkit-13-0"),
         ])
         self.assertEqual(self.recorded(mocks)[0], ("NVIDIA", "610.43.02"))
         self.assert_logged(mocks["info"], "installed driver version is 610.43.02")
@@ -741,7 +763,7 @@ class UbuntuLocalRepoAndDistroTests(_InstallBase):
     def test_ubuntu2604_v100_warns_about_querying_nvidia_open(self):
         rc, calls, mocks = self._install(_env("ubuntu26.04", sku="V100"))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[1:3], [("exec", ["apt", "install", "cuda-drivers", "-y"]),
+        self.assertEqual(calls[1:3], [_apt("cuda-drivers"),
                                       _DPKG_QUERY])
         self.assert_logged(mocks["warn"], "although the cuda-drivers branch was installed")
 
@@ -777,7 +799,7 @@ class RhelTests(_InstallBase):
             ("exec", ["dnf", "config-manager", "--save",
                       f"--setopt=cuda-rhel9-x86_64.excludepkgs={excludes}"]),
             ("exec", ["dnf", "clean", "expire-cache"]),
-            ("exec", ["dnf", "install", "-y", toolkit]),
+            _dnf(toolkit),
             _NVCC, _SAMPLES, *_TAIL_FM,
         ]
 
@@ -808,7 +830,7 @@ class RhelTests(_InstallBase):
             ("exec", ["dnf", "config-manager", "--save",
                       f"--setopt=cuda-rhel9-x86_64.excludepkgs={excludes}"]),
             ("exec", ["dnf", "clean", "expire-cache"]),
-            ("exec", ["dnf", "install", "-y", toolkit]),
+            _dnf(toolkit),
         ]
 
     def test_rhel_cuda12_also_excludes_cccl_from_supplementary_repo(self):
@@ -835,10 +857,19 @@ class RhelTests(_InstallBase):
         self.assert_logged(mocks["error"], "CUDA toolkit installation failed")
 
     def test_other_distro_skips_dkms(self):
-        rc, calls, mocks = self._install(_env("sles15"))
+        rc, calls, mocks = self._install(_env("sles15", node_type="azure_vm_akshost"))
         self.assertEqual(rc, 0)
         self.assertFalse(any(c[0] == "exec" and c[1][0] == "dkms" for c in calls))
         self.assert_logged(mocks["info"], "no dkms install")
+
+    def test_other_distro_toolkit_install_fails(self):
+        # Deliberate difference: install_packages() knows no manager for sles15
+        # (bash would try dnf there).
+        rc, calls, mocks = self._install(_env("sles15"))
+        self.assertEqual(rc, 3)
+        self.assertEqual(calls[-1], ("exec", ["dnf", "clean", "expire-cache"]))
+        self.assert_logged(mocks["pkg_error"], "no package manager known")
+        self.assert_logged(mocks["error"], "CUDA toolkit installation failed")
 
     def test_non_x86_64_warns(self):
         versions = json.loads(json.dumps(_VERSIONS))
@@ -922,7 +953,7 @@ class CommonTests(_InstallBase):
         rc, _, _ = self._install(_env())
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(self.work))
-        rc, _, _ = self._install(_env(), fail_on=["apt", "install", "nvidia-open", "-y"])
+        rc, _, _ = self._install(_env(), fail_on=_apt("nvidia-open")[1])
         self.assertEqual(rc, 3)
         self.assertFalse(os.path.exists(self.work))
 
@@ -949,9 +980,17 @@ class CommonTests(_InstallBase):
         self.assertEqual(calls[-1], _NVCC)
         self.assertEqual(self.recorded(mocks), [("NVIDIA", "580.178.04")])
 
+    def test_toolkit_install_failure_stops(self):
+        fail = _apt("cuda-toolkit-13-0")[1]
+        rc, calls, mocks = self._install(_env(), fail_on=fail)
+        self.assertEqual(rc, 3)
+        self.assertEqual(calls[-1], ("exec", fail))
+        self.assert_logged(mocks["error"], "CUDA toolkit installation failed")
+        self.assertFalse(os.path.exists(self.path("/etc/profile.d/cuda.sh")))
+
     def test_imex_failure_stops(self):
         env = _env(sku="GB200", arch="aarch64", NVLINK_RACKSCALE="true")
-        fail = ["apt-get", "install", "nvidia-imex", "-y"]
+        fail = _apt("nvidia-imex")[1]
         rc, calls, mocks = self._install(env, fail_on=fail)
         self.assertEqual(rc, 3)
         self.assertEqual(calls[-1], ("exec", fail))
@@ -968,14 +1007,14 @@ class CommonTests(_InstallBase):
         rc, calls, mocks = self._install(_env(), write_error=PermissionError("denied"))
         self.assertEqual(rc, 3)
         self.assertEqual(calls[-1],
-                         ("exec", ["apt", "install", "nvidia-open", "-y"]))
+                         _apt("nvidia-open"))
         self.assert_logged(mocks["error"], "denied")
 
     def test_file_write_error_returns_3(self):
         os.rmdir(self.path("/etc/profile.d"))
         rc, calls, mocks = self._install(_env())
         self.assertEqual(rc, 3)
-        self.assertEqual(calls[-1], ("exec", ["apt", "install", "-y", "cuda-toolkit-13-0"]))
+        self.assertEqual(calls[-1], _apt("cuda-toolkit-13-0"))
         self.assert_logged(mocks["error"], "could not write")
 
 
