@@ -495,9 +495,16 @@ class MonitoringToolsTests(unittest.TestCase):
             "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
+    # What install_packages() runs for bash's python3-pip installs.
+    _APT_PIP = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "--only-upgrade",
+                "python3-pip"]
+    _DNF_PIP = ["dnf", "install", "-y", "python3-pip"]
+    _PIP_UPGRADE = ["python3", "-m", "pip", "install", "--upgrade", "pip"]
+
     def _install(self, env, *, fail=None, script_mode=0o755, real_configure=False,
                  download_error=None):
-        """Run install(env) with commands faked. The fake tar creates
+        """Run install(env) with commands faked (also those run by
+        install_packages, in the same record). The fake tar creates
         Moneo/linux_service/configure_service.sh (mode `script_mode`).
         fail: {first word of command: exit code}. Returns (rc, calls, mocks),
         calls being [(command, cwd)]."""
@@ -533,6 +540,9 @@ class MonitoringToolsTests(unittest.TestCase):
                                side_effect=fake_download) as download, \
              mock.patch.object(install_monitoring_tools, "exec_program",
                                side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
              mock.patch.object(install_monitoring_tools, "log_info") as info, \
              mock.patch.object(install_monitoring_tools, "log_warn") as warn, \
@@ -548,18 +558,20 @@ class MonitoringToolsTests(unittest.TestCase):
                 (["./configure_service.sh"], self.service_dir)]
 
     # ---- pure helpers ----------------------------------------------------------
-    def test_pip_command_per_distro(self):
+    def test_pip_package_options_per_distro(self):
+        # None: bash's else branch, `python3 -m pip install --upgrade pip`.
         cases = {
-            "azurelinux3.0": ["dnf", "install", "-y", "python3-pip"],
-            "ubuntu24.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
-            "ubuntu26.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
-            "ubuntu22.04": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
-            "almalinux9.8": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
-            "rhel8.10": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+            "azurelinux3.0": [],
+            "ubuntu24.04": ["--only-upgrade"],
+            "ubuntu26.04": ["--only-upgrade"],
+            "ubuntu22.04": None,
+            "almalinux9.8": None,
+            "rhel8.10": None,
         }
-        for distro, command in cases.items():
+        for distro, options in cases.items():
             with self.subTest(distro=distro):
-                self.assertEqual(install_monitoring_tools.pip_command(distro), command)
+                self.assertEqual(install_monitoring_tools.pip_package_options(distro),
+                                 options)
 
     def test_ensure_line_matches_grep_qxF(self):
         line = "alias x='y'"
@@ -587,11 +599,11 @@ class MonitoringToolsTests(unittest.TestCase):
     # ---- install() -------------------------------------------------------------
     def test_install_commands_per_distro(self):
         cases = {
-            "ubuntu24.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
-            "ubuntu26.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
-            "azurelinux3.0": ["dnf", "install", "-y", "python3-pip"],
-            "ubuntu22.04": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
-            "almalinux9.8": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+            "ubuntu24.04": self._APT_PIP,
+            "ubuntu26.04": self._APT_PIP,
+            "azurelinux3.0": self._DNF_PIP,
+            "ubuntu22.04": self._PIP_UPGRADE,
+            "almalinux9.8": self._PIP_UPGRADE,
         }
         for distro, pip in cases.items():
             with self.subTest(distro=distro):
@@ -628,8 +640,8 @@ class MonitoringToolsTests(unittest.TestCase):
         self._install(self._env())
         rc, calls, m = self._install(self._env())
         self.assertEqual(rc, 0)
-        pip = ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"]
-        self.assertEqual(calls, [(pip, None), (["./configure_service.sh"], self.service_dir)])
+        self.assertEqual(calls, [(self._APT_PIP, None),
+                                 (["./configure_service.sh"], self.service_dir)])
         self.assertEqual(m["warn"].call_args.kwargs, {"path": self.moneo})
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")      # not appended twice
@@ -652,8 +664,7 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertEqual((error.kwargs["exists"], error.kwargs["executable"]), (True, False))
 
     def test_each_failing_command_returns_3_and_stops(self):
-        expected = self._expected(["apt-get", "install", "-y", "--only-upgrade",
-                                   "python3-pip"])
+        expected = self._expected(self._APT_PIP)
         for index, word in enumerate(["apt-get", "tar", "./configure_service.sh"]):
             with self.subTest(failing=word):
                 self.tearDown_moneo()
