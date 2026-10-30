@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_doca
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-doca"
@@ -34,6 +35,9 @@ _BASH = (_REPO / "components" / "install_doca.sh").read_text(encoding="utf-8")
 _PATCHES = _REPO / "components" / "patches"
 _MARKER = "hpcx-provides-doca-ofed-deps"
 _KERNEL = "5.14.0-611.el9.x86_64"
+# What install_packages() runs on Ubuntu / the RPM distros.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
 
 _UBUNTU_CFG = {"version": "3.2.3", "sha256": "abc",
                "url": "https://example/DOCA_v3.2.3/host/doca-host_3.2.3-019000-25.10-ubuntu2404_amd64.deb"}
@@ -198,7 +202,7 @@ class InstallTests(unittest.TestCase):
 
     def _fake_exec(self, command, op, *, cwd=None, env=None, failure_is_error=True):
         self.calls.append((command, cwd))
-        if command == ["dnf", "-y", "install", "doca-ofed"]:
+        if command == [*_DNF, "doca-ofed"]:
             self.dnf_conf_during = self.dnf_conf.read_text()
         if command == self.fail_on:
             return 1
@@ -256,6 +260,9 @@ class InstallTests(unittest.TestCase):
         self.work = os.path.join(str(self.top), "distros", distro)
         with mock.patch.object(install_doca, "config_for", return_value=cfg), \
              mock.patch.object(install_doca, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_doca, "run_capture", side_effect=self._fake_capture), \
              mock.patch.object(install_doca, "download_and_verify",
                                side_effect=self._fake_download), \
@@ -283,13 +290,13 @@ class InstallTests(unittest.TestCase):
 
     def _ubuntu_commands(self, deb, version="3.2.3"):
         return [
-            ["apt", "install", "-y", deb],
+            [*_APT, deb],
             ["apt-get", "update"],
-            ["apt-get", "install", "-y", "equivs"],
+            [*_APT, "equivs"],
             ["dpkg", "--compare-versions", version, "lt", "3.3.0"],
             ["equivs-build", str(self.tmp / _MARKER)],
-            ["apt", "install", "-y", str(self.tmp / f"{_MARKER}_3.2.3_all.deb")],
-            ["apt-get", "-y", "install", "doca-ofed"],
+            [*_APT, str(self.tmp / f"{_MARKER}_3.2.3_all.deb")],
+            [*_APT, "doca-ofed"],
             ["systemctl", "daemon-reload"],
             ["systemctl", "enable", "openibd"],
         ]
@@ -306,7 +313,7 @@ class InstallTests(unittest.TestCase):
     def _rhel_commands(self, pin="baseos.excludepkgs=libibverbs rdma-core"):
         return ([["rpm", "-i", os.path.basename(_RHEL_CFG["url"])], ["dnf", "clean", "all"]]
                 + self._rpm_marker_commands()
-                + [["dnf", "-y", "install", "doca-ofed"]]
+                + [[*_DNF, "doca-ofed"]]
                 + ([["dnf", "config-manager", "--save", f"--setopt={pin}"]] if pin else [])
                 + [["systemctl", "daemon-reload"], ["systemctl", "enable", "openibd"]])
 
@@ -384,7 +391,7 @@ class InstallTests(unittest.TestCase):
                          (_PATCHES / "mlnx-ofed-kernel-xdp-fragments.patch").read_bytes())
         # The patch overlays are in place before doca-ofed builds the modules.
         self.assertLess(self._commands().index(["equivs-build", str(self.tmp / _MARKER)]),
-                        self._commands().index(["apt-get", "-y", "install", "doca-ofed"]))
+                        self._commands().index([*_APT, "doca-ofed"]))
 
     def test_xdp_patch_only_for_3_2_3_on_22_04(self):
         for distro, version in (("ubuntu22.04", "3.2.2"), ("ubuntu24.04", "3.2.3"),
@@ -409,8 +416,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.downloads, [])
         self.checksum.assert_called_once_with(str(package), "123")
-        self.assertEqual(self._commands()[0], ["apt", "install", "-y",
-                                               os.path.realpath(str(package))])
+        self.assertEqual(self._commands()[0], [*_APT, os.path.realpath(str(package))])
 
     def test_private_checksum_mismatch_returns_3(self):
         rc = self._install(cfg=_PRIVATE_CFG, checksum_ok=False)
@@ -446,7 +452,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(), (
             [["rpm", "-i", os.path.basename(_RHEL_CFG["url"])], ["dnf", "clean", "all"]]
             + self._rpm_marker_commands()
-            + [["dnf", "-y", "install", "doca-ofed"],
+            + [[*_DNF, "doca-ofed"],
                ["systemctl", "daemon-reload"], ["systemctl", "enable", "openibd"]]))
         self.assertEqual(self.calls[0][1], self.work)
         self.assertEqual(len(self.downloads), 2)         # bash downloads twice
@@ -461,7 +467,7 @@ class InstallTests(unittest.TestCase):
     def test_rpm_build_installed_when_rpmbuild_missing(self):
         self.assertEqual(self._install("azurelinux3.0", cfg=_RHEL_CFG,
                                        rpmbuild_present=False), 0)
-        self.assertEqual(self._commands()[2], ["dnf", "-y", "install", "rpm-build"])
+        self.assertEqual(self._commands()[2], [*_DNF, "rpm-build"])
 
     def test_private_package_on_rpm_distros_fails_like_bash(self):
         for distro in ("azurelinux3.0", "almalinux9.8"):
@@ -529,7 +535,7 @@ class InstallTests(unittest.TestCase):
 
     def test_rhel_failed_install_still_restores_dnf_conf(self):
         rc = self._install("almalinux9.8", cfg=_RHEL_CFG,
-                           fail_on=["dnf", "-y", "install", "doca-ofed"])
+                           fail_on=[*_DNF, "doca-ofed"])
         self.assertEqual(rc, 3)
         self.assertEqual(self.dnf_conf.read_text(), self.dnf_conf_text)
         self.assertFalse(Path(f"{self.dnf_conf}.bak").exists())
