@@ -36,7 +36,8 @@ digits, `=` and spaces); a GRUB_CMDLINE_LINUX containing regex characters,
 
 from __future__ import annotations
 
-from utils.logger import log_error, log_info, log_warn
+from utils.files import edit_file
+from utils.logger import log_info, log_warn
 from utils.process import run
 
 _OP = "disable-predictive-interface-renaming"
@@ -65,48 +66,30 @@ def add_kernel_parameter(text: str, search: str, parameter: str) -> str:
                      for line in text.split("\n"))
 
 
-def _edit_settings_file(search: str) -> tuple[str, str] | None:
-    """bash `sed -i` on the settings file: (original, updated) text, or None.
+def _parameter_adder(search: str):
+    """The edit_file transform: add_kernel_parameter, logging how many lines match.
 
-    newline="" keeps "\\r\\n" as it is and surrogateescape passes non-UTF-8
-    bytes through, as sed does; write_file() would do neither.
+    bash's sed succeeds silently when nothing matches; the warning makes a
+    build log show that net.ifnames=0 was not added.
     """
-    # TODO(ADO 1001): toolkit candidate: byte-preserving `sed -i`, e.g.
-    # edit_file(path, transform: Callable[[str], str], op) -> (old, new) | None
-    try:
-        with open(_GRUB_SETTINGS_FILE, encoding="utf-8",
-                  errors="surrogateescape", newline="") as f:
-            original = f.read()
-        updated = add_kernel_parameter(original, search, _KERNEL_PARAMETER)
-        with open(_GRUB_SETTINGS_FILE, "w", encoding="utf-8",
-                  errors="surrogateescape", newline="") as f:
-            f.write(updated)
-    except OSError as exc:
-        log_error(_OP, f"could not update {_GRUB_SETTINGS_FILE}: {exc}",
-                  path=_GRUB_SETTINGS_FILE)
-        return None
-    return original, updated
-
-
-def _log_edit(original: str, updated: str, search: str) -> None:
-    if updated == original:
-        log_warn(_OP, f"No line in {_GRUB_SETTINGS_FILE} contains the search "
-                      f"text, so {_KERNEL_PARAMETER} was not added (bash's sed "
-                      "succeeds silently here too)",
-                 path=_GRUB_SETTINGS_FILE, search=search, lines_changed=0)
-        return
-    changed = sum(1 for line in original.split("\n") if search in line)
-    log_info(_OP, f"Added {_KERNEL_PARAMETER} in {_GRUB_SETTINGS_FILE}",
-             path=_GRUB_SETTINGS_FILE, lines_changed=changed)
+    def transform(text: str) -> str:
+        matching = sum(1 for line in text.split("\n") if search in line)
+        if matching:
+            log_info(_OP, f"Adding {_KERNEL_PARAMETER} in {_GRUB_SETTINGS_FILE}",
+                     path=_GRUB_SETTINGS_FILE, lines_changed=matching)
+        else:
+            log_warn(_OP, f"No line in {_GRUB_SETTINGS_FILE} contains the search "
+                          f"text, so {_KERNEL_PARAMETER} was not added (bash's sed "
+                          "succeeds silently here too)",
+                     path=_GRUB_SETTINGS_FILE, search=search, lines_changed=0)
+        return add_kernel_parameter(text, search, _KERNEL_PARAMETER)
+    return transform
 
 
 def install(env: dict[str, str]) -> int:
     """Add net.ifnames=0 to the GRUB settings and regenerate the GRUB config."""
-    search = search_text(env)
-    edit = _edit_settings_file(search)
-    if edit is None:
+    if not edit_file(_GRUB_SETTINGS_FILE, _parameter_adder(search_text(env)), _OP):
         return 3
-    _log_edit(*edit, search)
     if not run(["update-grub"], _OP, env=env):
         return 3
     log_info(_OP, "Regenerated the GRUB configuration")
