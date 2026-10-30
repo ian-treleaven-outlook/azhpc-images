@@ -26,6 +26,10 @@ _MONEO_DIR = f"{_MONITOR_DIR}/Moneo"
 _BASHRC = "/etc/bash.bashrc"
 _ALIAS = "alias moneo='python3 /opt/azurehpc/tools/Moneo/moneo.py'"
 
+# Distros whose pip comes from the distro's python3-pip package (exact
+# matches, as in bash); every other distro upgrades pip with pip itself.
+_PIP_PACKAGE_DISTROS = ("azurelinux3.0", "ubuntu24.04", "ubuntu26.04")
+
 
 def extract_stripped(tarball, dest_dir):
     """Extract `tarball` into `dest_dir`, dropping the leading path component.
@@ -65,15 +69,24 @@ def ensure_line(path, line):
 def install_deps(env):
     """Make sure pip is available before installing Moneo.
 
-    azurelinux/ubuntu install the distro's python3-pip package; other distros
-    upgrade pip in place. Returns 0 on success, 3 on failure.
+    azurelinux3.0 / ubuntu24.04 / ubuntu26.04 install the distro's python3-pip
+    package; other distros upgrade pip in place. Returns 0 on success, 3 on
+    failure.
+
+    bash: `dnf install -y python3-pip` on azurelinux3.0,
+    `apt-get install -y --only-upgrade python3-pip` on ubuntu24.04 and
+    ubuntu26.04, else `python3 -m pip install --upgrade pip`.
     """
     distribution = env.get("DISTRIBUTION", "")
-    if distribution in ("azurelinux3.0", "ubuntu24.04"):
+    if distribution in _PIP_PACKAGE_DISTROS:
+        log_info("install-monitoring-tools", "Installing python3-pip from the distro "
+                 "package manager", distro=distribution, branch="python3-pip package")
         installer = PackageInstaller()
         if installer.manager is None:
             return 3
         return 0 if installer.install_package(["python3-pip"]) else 3
+    log_info("install-monitoring-tools", "Upgrading pip with pip", distro=distribution,
+             branch="pip upgrade")
     return exec_program(
         ["python3", "-m", "pip", "install", "--upgrade", "pip"],
         "install-monitoring-tools", env=env,

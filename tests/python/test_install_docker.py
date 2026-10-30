@@ -39,6 +39,7 @@ _DNF_OUT = ("Installed Packages\n"
 _RPM_OUT = ("bash-5.2.15-3.azl3.x86_64\n"
             "moby-engine-25.0.3-11.azl3.x86_64\n"
             "moby-cli-25.0.3-11.azl3.x86_64\n")
+_DPKG_OUT = "28.2.2-0ubuntu1"
 
 _SERVICES = [
     ["systemctl", "enable", "docker"],
@@ -120,10 +121,22 @@ class MobyVersionParseTests(unittest.TestCase):
     def test_version_commands_per_distro(self):
         self.assertEqual(install_docker.moby_version_command("ubuntu22.04"),
                          ["apt", "list", "--installed"])
+        self.assertEqual(install_docker.moby_version_command("ubuntu24.04"),
+                         ["apt", "list", "--installed"])
+        # bash: dpkg-query -W -f='${Version}' docker.io (single-quoted, literal).
+        self.assertEqual(install_docker.moby_version_command("ubuntu26.04"),
+                         ["dpkg-query", "-W", "-f=${Version}", "docker.io"])
         self.assertEqual(install_docker.moby_version_command("azurelinux3.0"),
                          ["rpm", "-qa"])
         self.assertEqual(install_docker.moby_version_command("rocky8.10"),
                          ["dnf", "list", "installed"])
+
+    def test_dpkg_query_version(self):
+        # dpkg-query -W -f='${Version}' prints the bare version, no newline
+        # (checked in WSL).
+        self.assertEqual(install_docker.parse_moby_version("ubuntu26.04", _DPKG_OUT),
+                         "28.2.2-0ubuntu1")
+        self.assertIsNone(install_docker.parse_moby_version("ubuntu26.04", ""))
 
 
 class WantsContainerToolkitTests(unittest.TestCase):
@@ -160,6 +173,7 @@ class InstallTests(unittest.TestCase):
         """
         captures = {"docker": (0, _DOCKER_OUT), "apt": (0, _APT_OUT),
                     "dnf": (0, _DNF_OUT), "rpm": (0, _RPM_OUT),
+                    "dpkg-query": (0, _DPKG_OUT),
                     **(captures or {})}
 
         def fake_exec(command, op, **kwargs):
@@ -219,6 +233,50 @@ class InstallTests(unittest.TestCase):
         ])
         m["config_for"].assert_not_called()     # only read on baremetal_3p
         m["error"].assert_not_called()
+
+    def test_ubuntu_2604_installs_docker_io_on_every_node_type(self):
+        # Checked before baremetal_3p in bash, so no moby pin and no config.
+        for node_type in ("azure_vm_regular", "baremetal_3p"):
+            with self.subTest(node_type=node_type):
+                env = _env("ubuntu26.04", TARGET_NODE_TYPE=node_type)
+                rc, m = self._install(env)
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(self._commands(m), [
+                    ["apt-get", "install", "-y", "docker.io", "docker-buildx"],
+                    [_TOOLKIT],
+                    *_SERVICES,
+                    *_CONTAINERD,
+                ])
+                self.assertEqual(
+                    [c.args[0] for c in m["capture"].call_args_list],
+                    [["docker", "--version"],
+                     ["dpkg-query", "-W", "-f=${Version}", "docker.io"]])
+                self.assertEqual(m["record"].call_args_list, [
+                    mock.call("DOCKER", "29.1.4"),
+                    mock.call("MOBY_ENGINE", "28.2.2-0ubuntu1"),
+                ])
+                m["config_for"].assert_not_called()
+                m["error"].assert_not_called()
+                messages = self._messages(m["info"])
+                self.assertIn("Ubuntu 26.04: installing Canonical's docker.io and "
+                              "docker-buildx (no Microsoft moby packages), on every "
+                              "node type", messages)
+                self.assertIn("Ubuntu 26.04: MOBY_ENGINE records the docker.io "
+                              "package version, as bash does", messages)
+
+    def test_ubuntu_2604_docker_io_failures_return_3(self):
+        rc, m = self._install(
+            _env("ubuntu26.04"),
+            fail_on=["apt-get", "install", "-y", "docker.io", "docker-buildx"])
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(self._commands(m)), 1)
+        m["record"].assert_not_called()
+
+        # dpkg-query exits 1 when docker.io isn't installed (bash's set -e stops).
+        rc, m = self._install(_env("ubuntu26.04"), captures={"dpkg-query": (1, "")})
+        self.assertEqual(rc, 3)
+        m["record"].assert_called_once_with("DOCKER", "29.1.4")
 
     def test_ubuntu_baremetal_3p_pins_moby_version(self):
         rc, m = self._install(_env(TARGET_NODE_TYPE="baremetal_3p"),

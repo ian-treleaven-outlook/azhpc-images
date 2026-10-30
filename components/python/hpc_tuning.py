@@ -7,7 +7,7 @@ Applies the image's HPC system tuning. In order:
   1. Distro-specific clean-up:
        * ubuntu22.04: `pip3 install -U netifaces`, `pip3 install -U PyYAML`,
          `systemctl disable ufw`
-       * ubuntu24.04: `apt install -y python3-netifaces`,
+       * ubuntu24.04 and ubuntu26.04: `apt install -y python3-netifaces`,
          `apt install -y python3-yaml`, `systemctl disable ufw`
        * almalinux*/rocky*/rhel*: `systemctl disable firewalld` on almalinux8.10
          and rhel8* only (Rocky 8 has no firewalld), then remove the
@@ -37,7 +37,7 @@ is in the constants below):
         pip3 install -U netifaces
         pip3 install -U PyYAML
         systemctl disable ufw
-    elif [[ $DISTRIBUTION == "ubuntu24.04" ]]; then
+    elif [[ $DISTRIBUTION == "ubuntu24.04" ]] || [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
         apt install -y python3-netifaces
         apt install -y python3-yaml
         systemctl disable ufw
@@ -86,7 +86,7 @@ is in the constants below):
     cat > /etc/udev/rules.d/90-nfs-readahead.rules << EOM
     SUBSYSTEM=="bdi", \\
     ACTION=="add", \\
-    PROGRAM="/usr/bin/awk -v bdi=\\$kernel 'BEGIN{ret=1} {if (\\$4 == bdi) {ret=0}} END{exit ret}' /proc/fs/nfsfs/volumes", \\
+    PROGRAM="/usr/bin/awk -v bdi=\\$kernel 'BEGIN{ret=1} {if (\\$\\$4 == bdi) {ret=0}} END{exit ret}' /proc/fs/nfsfs/volumes", \\
     ATTR{read_ahead_kb}="15380"
     EOM
 
@@ -99,8 +99,11 @@ Some bash details that matter for exact parity:
   * `${NVLINK_RACKSCALE,,}` lower-cases the value, so "True" and "TRUE" count.
   * `>>` and `tee -a` append; `>` replaces.
   * The udev rule heredoc is unquoted, so bash turns `\\$kernel` into `$kernel`
-    and `\\$4` into `$4`, AND joins lines ending in a backslash: the rule is
-    written as ONE line. (udev would accept either form.)
+    and `\\$\\$4` into `$$4`, AND joins lines ending in a backslash: the rule is
+    written as ONE line. (udev would accept either form.) udev itself then
+    substitutes `$kernel` with the device name and reads `$$` as a literal
+    `$`, so awk sees `$4` (#651; before it the file held a bare `$4`, which
+    udev tried to treat as one of its own substitutions).
   * `set -e`: the first failing command stops the script. The "service
     inactive" message after `systemctl is-active` is never reached, because
     `set -e` already stopped the script when is-active returned non-zero. The
@@ -165,7 +168,7 @@ _SUNRPC_SERVICE = "sunrpc_tcp_settings"
 # Prefix matches, as in bash: [[ $DISTRIBUTION == almalinux* ]].
 _RHEL_FAMILY_PREFIXES = ("almalinux", "rocky", "rhel")
 
-# The fixed commands for the two Ubuntu releases, in bash's order.
+# The fixed commands for the two Ubuntu branches, in bash's order.
 _UBUNTU_COMMANDS = {
     "ubuntu22.04": [["pip3", "install", "-U", "netifaces"],
                     ["pip3", "install", "-U", "PyYAML"],
@@ -173,6 +176,15 @@ _UBUNTU_COMMANDS = {
     "ubuntu24.04": [["apt", "install", "-y", "python3-netifaces"],
                     ["apt", "install", "-y", "python3-yaml"],
                     ["systemctl", "disable", "ufw"]],
+}
+
+# Which Ubuntu branch each distribution takes (exact matches, as in bash).
+# Ubuntu 26.04 shares the 24.04 branch:
+#   elif [[ $DISTRIBUTION == "ubuntu24.04" ]] || [[ $DISTRIBUTION == "ubuntu26.04" ]]
+_UBUNTU_BRANCH = {
+    "ubuntu22.04": "ubuntu22.04",
+    "ubuntu24.04": "ubuntu24.04",
+    "ubuntu26.04": "ubuntu24.04",
 }
 
 _AZSEC_PACKAGE = "azsec-monitor"
@@ -229,15 +241,16 @@ WantedBy=multi-user.target
 """
 
 # What bash's unquoted heredoc produces: the backslash-newline pairs are
-# removed (so it's one line), and `\$` becomes `$`. The string is split over
-# several source lines only for readability; Python joins adjacent string
-# literals, so there are no newlines until the final "\n". It was compared
-# byte for byte with bash's output in WSL.
+# removed (so it's one line), and `\$` becomes `$`. `$$4` is udev's escape for
+# a literal `$`, so awk gets `$4`; `$kernel` is a udev substitution (the device
+# name). The string is split over several source lines only for readability;
+# Python joins adjacent string literals, so there are no newlines until the
+# final "\n". It was compared byte for byte with bash's output in WSL.
 _NFS_READAHEAD_RULE = (
     'SUBSYSTEM=="bdi", '
     'ACTION=="add", '
     'PROGRAM="/usr/bin/awk -v bdi=$kernel \'BEGIN{ret=1} '
-    '{if ($4 == bdi) {ret=0}} END{exit ret}\' /proc/fs/nfsfs/volumes", '
+    '{if ($$4 == bdi) {ret=0}} END{exit ret}\' /proc/fs/nfsfs/volumes", '
     'ATTR{read_ahead_kb}="15380"\n'
 )
 
@@ -256,11 +269,12 @@ def is_rhel_family(distribution: str) -> bool:
 def distro_branch(distribution: str) -> str | None:
     """Which branch of bash's first if/elif chain runs, or None for none.
 
-    Returns "ubuntu22.04", "ubuntu24.04", "rhel-family" or "azurelinux3.0".
-    The checks run in bash's order.
+    Returns "ubuntu22.04", "ubuntu24.04" (also for ubuntu26.04, which shares
+    that branch), "rhel-family" or "azurelinux3.0". The checks run in bash's
+    order.
     """
-    if distribution in _UBUNTU_COMMANDS:
-        return distribution
+    if distribution in _UBUNTU_BRANCH:
+        return _UBUNTU_BRANCH[distribution]
     if is_rhel_family(distribution):
         return "rhel-family"
     if distribution == "azurelinux3.0":

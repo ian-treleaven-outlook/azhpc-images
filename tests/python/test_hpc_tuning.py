@@ -17,9 +17,11 @@ Run from the repo root:
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from components.python import hpc_tuning
@@ -57,8 +59,24 @@ _RACKSCALE_SYSCTL = (
     "net.ipv4.tcp_wmem = 4096 67108864 1073741824\n")
 _UDEV_RULE = (
     'SUBSYSTEM=="bdi", ACTION=="add", PROGRAM="/usr/bin/awk -v bdi=$kernel '
-    "'BEGIN{ret=1} {if ($4 == bdi) {ret=0}} END{exit ret}' "
+    "'BEGIN{ret=1} {if ($$4 == bdi) {ret=0}} END{exit ret}' "
     '/proc/fs/nfsfs/volumes", ATTR{read_ahead_kb}="15380"\n')
+
+_SCRIPT = (Path(__file__).resolve().parents[2] / "components" / "hpc-tuning.sh").read_text(
+    encoding="utf-8")
+
+
+def _unquoted_heredoc(name: str) -> str:
+    """The text bash writes for the unquoted `<< name` heredoc in hpc-tuning.sh.
+
+    Applies the escapes bash processes inside an unquoted heredoc: a backslash
+    before a newline removes both (joining the lines), and a backslash before
+    $, ` or another backslash is dropped. This rule has no parameter
+    expansions left after that, so nothing else changes.
+    """
+    body = re.search(rf"<< {name}\n(.*?\n){name}\n", _SCRIPT, re.S).group(1)
+    return re.sub(r"\\([$`\\\n])", lambda m: "" if m.group(1) == "\n" else m.group(1),
+                  body)
 
 _AZSEC_PROBE = ["dnf", "list", "installed", "azsec-monitor"]
 _AZSEC_REMOVE = ["dnf", "remove", "-y", "azsec-monitor"]
@@ -80,6 +98,7 @@ class HelperTests(unittest.TestCase):
         cases = {
             "ubuntu22.04": "ubuntu22.04",
             "ubuntu24.04": "ubuntu24.04",
+            "ubuntu26.04": "ubuntu24.04",      # bash: 24.04 || 26.04, one branch
             "almalinux8.10": "rhel-family",
             "almalinux9.7": "rhel-family",
             "rocky8.10": "rhel-family",
@@ -113,8 +132,12 @@ class HelperTests(unittest.TestCase):
 
     def test_udev_rule_is_one_line_with_literal_dollars(self):
         # Bash's unquoted heredoc joins the backslash-continued lines and turns
-        # \$kernel / \$4 into $kernel / $4.
+        # \$kernel / \$\$4 into $kernel / $$4 (udev's escape for a literal $).
         self.assertEqual(hpc_tuning._NFS_READAHEAD_RULE, _UDEV_RULE)
+
+    def test_udev_rule_matches_the_bash_heredoc(self):
+        self.assertEqual(hpc_tuning._NFS_READAHEAD_RULE, _unquoted_heredoc("EOM"))
+        self.assertIn("{if ($$4 == bdi)", hpc_tuning._NFS_READAHEAD_RULE)
 
     def test_limits_block_uses_spaces(self):
         self.assertEqual(hpc_tuning._LIMITS_BLOCK, _LIMITS)
@@ -230,6 +253,21 @@ class InstallTests(unittest.TestCase):
             ["apt", "install", "-y", "python3-yaml"],
             ["systemctl", "disable", "ufw"],
         ] + _COMMON_TAIL)
+
+    def test_ubuntu2604_takes_the_2404_branch(self):
+        rc, commands, info, _, error = self.install({"DISTRIBUTION": "ubuntu26.04"})
+
+        self.assertEqual(rc, 0)
+        error.assert_not_called()
+        self.assertEqual(commands, [
+            ["apt", "install", "-y", "python3-netifaces"],
+            ["apt", "install", "-y", "python3-yaml"],
+            ["systemctl", "disable", "ufw"],
+        ] + _COMMON_TAIL)
+        self.assertEqual(self.read("_NFS_READAHEAD_RULES"), _UDEV_RULE)
+        start = info.call_args_list[0]
+        self.assertEqual((start.kwargs["distro"], start.kwargs["branch"]),
+                         ("ubuntu26.04", "ubuntu24.04"))
 
     def test_rhel_family_firewalld_and_azsec(self):
         cases = {

@@ -1,2 +1,0 @@
-# EL ko2iblnd is record 3; --with-o2ib=no intentionally skips it.
-BUILD_EXCLUSIVE_KERNEL[3]="^$"

@@ -2,10 +2,31 @@
 
 rdma_rename=/usr/sbin/rdma_rename_56.1
 
-an_index=0
-ib_index=0
+mapfile -t all_devices < <(ibdev2netdev -v | sort -n | awk '{print $2}')
 
-for old_device in $(ibdev2netdev -v | sort -n | cut -f2 -d' '); do
+next_index() {
+	local prefix=$1
+	local max_index=-1
+	local dev suffix
+
+	for dev in "${all_devices[@]}"; do
+		suffix=${dev#$prefix}
+		if [[ "$dev" == "$prefix"* && "$suffix" =~ ^[0-9]+$ && "$suffix" -gt "$max_index" ]]; then
+			max_index=$suffix
+		fi
+	done
+
+	echo $((max_index + 1))
+}
+
+an_index=$(next_index mlx5_an)
+ib_index=$(next_index mlx5_ib)
+
+for old_device in "${all_devices[@]}"; do
+
+	case "$old_device" in
+		mlx5_ib*|mlx5_an*) continue ;;
+	esac
 
 	link_layer=$(ibv_devinfo -d $old_device | sed -n 's/^[\ \t]*link_layer:[\ \t]*\([a-zA-Z]*\)$/\1/p')
 	
@@ -21,7 +42,7 @@ for old_device in $(ibdev2netdev -v | sort -n | cut -f2 -d' '); do
 		
 	else
 	
-		echo "Unknown device type for $old_device - $device_type."
+		echo "Unknown device type for $old_device."
 		
 	fi
 	

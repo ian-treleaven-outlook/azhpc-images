@@ -329,7 +329,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # Lustre client, then mpifileutils which builds against it (upstream #557
         # moved lustre here so mpifileutils picks up Lustre support).
         Step("install-lustre", "install_lustre_client.sh",
-             action=install_lustre_client.install, resync="ADO 988"),
+             action=install_lustre_client.install),
         Step("install-mpifileutils", "install_mpifileutils.sh",
              action=install_mpifileutils.install),
 
@@ -347,16 +347,15 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("cleanup-downloads", action=_cleanup_downloads),
 
         # optimizations + persistent RDMA naming
-        Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install,
-             resync="ADO 988"),
+        Step("hpc-tuning", "hpc-tuning.sh", action=hpc_tuning.install),
         Step("install-waagent", "install_waagent.sh", action=install_waagent.install),
         Step("install-persistent-rdma-naming",
              "install_azure_persistent_rdma_naming.sh",
-             action=install_azure_persistent_rdma_naming.install, resync="ADO 988"),
+             action=install_azure_persistent_rdma_naming.install),
 
         # not-GB200 group
         Step("install-aznfs", "install_aznfs.sh", action=install_aznfs.install,
-             when=lambda c: c.gpu != "GB200", resync="ADO 988"),
+             when=lambda c: c.gpu != "GB200"),
         Step("install-hpcdiag", "install_hpcdiag.sh",
              action=install_hpcdiag.install, when=lambda c: c.gpu != "GB200"),
         Step("install-monitoring-tools", "install_monitoring_tools.sh",

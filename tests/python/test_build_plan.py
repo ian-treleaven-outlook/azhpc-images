@@ -141,10 +141,6 @@ class InstallShParityTests(unittest.TestCase):
 # deliberate change that also updates this test.
 class ResyncTests(unittest.TestCase):
     EXPECTED = {
-        "install-lustre": "ADO 988",
-        "hpc-tuning": "ADO 988",
-        "install-persistent-rdma-naming": "ADO 988",
-        "install-aznfs": "ADO 988",
     }
 
     def _steps(self):

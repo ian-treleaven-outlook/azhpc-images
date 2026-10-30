@@ -4,11 +4,12 @@
     real bash functions and echo/tee lines of install_lustre_client.sh in WSL
     (tests/python/fixtures/install_lustre_client/), and each quoted heredoc is
     checked against the .sh file so the two can't drift.
-  * The text helpers mirroring grep/cut/sed pipelines were compared against
-    real bash in WSL on representative input.
-  * install() runs with exec_program, run_capture, config_for,
-    download_and_verify, check_dkms_status and write_component_version mocked,
-    and every /etc and /lib/modules path redirected into a temporary directory.
+  * The text helpers mirroring grep/cut/sed pipelines, and the kernel 7.0
+    skip pattern, were compared against real bash in WSL on representative
+    input.
+  * install() runs with exec_program, config_for, check_dkms_status and
+    write_component_version mocked, `uname -r` replaced, and every /etc path
+    redirected into a temporary directory.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_lustre_client -v
@@ -16,7 +17,6 @@ Run from the repo root:
 
 from __future__ import annotations
 
-import builtins
 import os
 import re
 import tempfile
@@ -31,14 +31,6 @@ _OP = "install-lustre"
 _REPO = Path(__file__).resolve().parents[2]
 _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "install_lustre_client"
 _SCRIPT = (_REPO / "components" / "install_lustre_client.sh").read_text(encoding="utf-8")
-_PATCH = _REPO / "components" / "patches" / "lustre-client-lu-20071-timer-container-of.patch"
-
-# Upstream changed install_lustre_client.sh after this port was written: it
-# removed the LU-20071 patch (and its patch file) and the Jammy DKMS 3.4.1
-# workaround, and skips 7.0 kernels. Builds run the bash script until ADO 988
-# updates the port (Step.resync). The tests below compare the port with the old
-# script or need the deleted patch file, so they are skipped until then.
-_STALE = "install_lustre_client.sh changed upstream; port resync in ADO 988"
 
 _KERNEL = "5.14.0-687.el9.x86_64"
 _UBUNTU_V = "2.15.8-35-gdf4872c"
@@ -50,15 +42,17 @@ _LSB = {
               'DISTRIB_DESCRIPTION="Ubuntu 22.04.5 LTS"\n'),
     "noble": ('DISTRIB_ID=Ubuntu\nDISTRIB_RELEASE=24.04\nDISTRIB_CODENAME=noble\n'
               'DISTRIB_DESCRIPTION="Ubuntu 24.04.3 LTS"\n'),
+    "resolute": ('DISTRIB_ID=Ubuntu\nDISTRIB_RELEASE=26.04\nDISTRIB_CODENAME=resolute\n'
+                 'DISTRIB_DESCRIPTION="Ubuntu 26.04 LTS"\n'),
 }
 _OS_RELEASE = {
     "ubuntu22.04": 'NAME="Ubuntu"\nVERSION_ID="22.04"\nVERSION="22.04.5 LTS (Jammy Jellyfish)"\n',
     "ubuntu24.04": 'NAME="Ubuntu"\nVERSION_ID="24.04"\nVERSION="24.04.3 LTS (Noble Numbat)"\n',
+    "ubuntu26.04": 'NAME="Ubuntu"\nVERSION_ID="26.04"\nVERSION="26.04 LTS (Resolute Raccoon)"\n',
     "almalinux9.8": 'NAME="AlmaLinux"\nVERSION="9.8 (Moss Jungle Cat)"\nVERSION_ID="9.8"\n',
     "rocky8.10": 'NAME="Rocky Linux"\nVERSION="8.10 (Green Obsidian)"\nVERSION_ID="8.10"\n',
     "azurelinux3.0": 'NAME="Microsoft Azure Linux"\nVERSION_ID="3.0"\n',
 }
-_DKMS_DEB = "dkms_3.4.1-1ubuntu1_all.deb"
 
 
 def _fixture(name: str) -> str:
@@ -104,19 +98,31 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(f("DISTRIB_ID=Ubuntu\n"), "")
         self.assertEqual(f("DISTRIB_CODENAME=\n"), "")
 
-    def test_dkms_version_from_output(self):
-        f = lustre.dkms_version_from_output
-        self.assertEqual(f("dkms-3.0.3\n"), "3.0.3")
-        self.assertEqual(f("dkms-3.4.1"), "3.4.1")
-        self.assertEqual(f("x\ndkms-2.8.7\n"), "2.8.7")
-        self.assertEqual(f("dkms-3.0\ndkms-3.1\n"), "3.0\n3.1")
-        self.assertEqual(f("dkms: 3.4.1\n"), "")
-        self.assertEqual(f("dkms-\n"), "")
-        self.assertEqual(f(""), "")
-
     def test_underscore_version(self):
         self.assertEqual(lustre.underscore_version("2.15.8-35-gdf4872c"), _EL_V)
         self.assertEqual(lustre.underscore_version(_EL_V), _EL_V)
+
+    def test_skips_kernel_matches_bash(self):
+        # Results of bash's [[ "$k" == "7.0" || "$k" == 7.0.* || "$k" == 7.0-* ]]
+        # for each value, from WSL.
+        skipped = ["7.0", "7.0.0", "7.0.0-1004-azure", "7.0-rc1", "7.0.", "7.0-"]
+        installed = ["7.00", "7.01.2", "17.0", "6.8.0-1030-azure", "7.1.0", "7", "",
+                     " 7.0", "7.0 ", "7.0_x", _KERNEL]
+        for kernel in skipped:
+            with self.subTest(kernel=kernel):
+                self.assertTrue(lustre.skips_kernel(kernel))
+        for kernel in installed:
+            with self.subTest(kernel=kernel):
+                self.assertFalse(lustre.skips_kernel(kernel))
+
+    def test_current_kernel_version(self):
+        with mock.patch.object(lustre, "_kernel_release", return_value=_KERNEL):
+            self.assertEqual(lustre.current_kernel_version({"KERNEL_VERSION": "7.0"}),
+                             ("7.0", "KERNEL_VERSION"))
+            # ${KERNEL_VERSION:-...}: unset and empty both fall back to uname -r.
+            self.assertEqual(lustre.current_kernel_version({}), (_KERNEL, "uname -r"))
+            self.assertEqual(lustre.current_kernel_version({"KERNEL_VERSION": ""}),
+                             (_KERNEL, "uname -r"))
 
     def test_rendered_files_match_bash(self):
         cases = {
@@ -130,35 +136,40 @@ class HelperTests(unittest.TestCase):
             "sysconfig-dkms-lustre.conf": lustre._NO_O2IB_TR_CONF,
             "jammy-dkms.conf": lustre._LEGACY_DKMS_CONF + lustre.skip_artifact_block(
                 11, lustre._UBUNTU_SKIP_DESCRIPTION),
-            "el-dkms.conf.no-patch": lustre.skip_artifact_block(
+            "el-dkms.conf": lustre.skip_artifact_block(3, lustre._EL_SKIP_DESCRIPTION),
+            "el-dkms.conf.rerun": 2 * lustre.skip_artifact_block(
                 3, lustre._EL_SKIP_DESCRIPTION),
-            "el-dkms.conf": lustre.skip_artifact_block(3, lustre._EL_SKIP_DESCRIPTION)
-                            + lustre._LU20071_PATCH_LINE,
         }
         for name, text in cases.items():
             with self.subTest(fixture=name):
                 self.assertEqual(text, _fixture(name))
 
-    @unittest.skip(_STALE)
     def test_heredocs_match_the_bash_script(self):
         self.assertEqual(lustre._NO_O2IB_CONF, _heredoc("configure_lustre_dkms_no_o2ib"))
         self.assertEqual(lustre._NO_O2IB_TR_CONF,
                          _heredoc("configure_lustre_dkms_no_o2ib_with_tr_workaround"))
         self.assertEqual(lustre._LEGACY_DKMS_CONF,
                          _heredoc("configure_legacy_lustre_dkms_no_o2ib"))
-        self.assertEqual(lustre._LU20071_PATCH_LINE,
-                         _heredoc("configure_lustre_dkms_lu20071_patch"))
         # The literal (unexpanded) DKMS variable survives.
         self.assertIn("--with-linux=$kernel_source_dir ", lustre._LEGACY_DKMS_CONF)
 
-    @unittest.skip(_STALE)
     def test_constants_match_the_bash_script(self):
-        for text in [lustre._JAMMY_DKMS_URL, lustre._JAMMY_DKMS_SHA256,
-                     lustre._UBUNTU_SKIP_DESCRIPTION, lustre._EL_SKIP_DESCRIPTION,
-                     lustre._LU20071_PATCH_SOURCE, lustre._MICROSOFT_KEY_URL,
-                     *lustre._SIGNED_BY.values()]:
+        for text in [lustre._UBUNTU_SKIP_DESCRIPTION, lustre._EL_SKIP_DESCRIPTION,
+                     lustre._MICROSOFT_KEY_URL, *lustre._SIGNED_BY.values(),
+                     "Skipping Lustre client installation for kernel version ",
+                     'CURRENT_KERNEL_VERSION=${KERNEL_VERSION:-$(uname -r)}',
+                     f'"${{CURRENT_KERNEL_VERSION}}" == "{lustre._SKIPPED_KERNEL}"']:
             with self.subTest(text=text):
                 self.assertIn(text, _SCRIPT)
+
+    def test_bash_dropped_the_lu20071_patch_and_jammy_dkms_workaround(self):
+        # Upstream removed both (#610, #633/#643); the port must not bring them back.
+        for gone in ["lu20071", "lu-20071", "jammy_amd", "dkms_3_4_1"]:
+            with self.subTest(text=gone):
+                self.assertNotIn(gone, _SCRIPT)
+                self.assertEqual([name for name in vars(lustre) if gone in name.lower()], [])
+        self.assertFalse((_REPO / "components" / "patches" /
+                          "lustre-client-lu-20071-timer-container-of.patch").exists())
 
 
 # --------------------------------------------------------------------------- #
@@ -177,8 +188,6 @@ class InstallTests(unittest.TestCase):
             "_DKMS_CONF_DIR": "etc/dkms",
             "_UBUNTU_DKMS_SYSCONFIG": "etc/sysconfig/dkms-lustre",
             "_EL_SYSCONFIG": "etc/sysconfig/lustre",
-            "_MODULES_DIR": "lib/modules",
-            "_WORK_DIR": "work/lustre-build",
         }
         for name, rel in paths.items():
             patcher = mock.patch.object(lustre, name, self.p(rel))
@@ -196,16 +205,12 @@ class InstallTests(unittest.TestCase):
     def read(self, rel: str) -> str:
         return Path(self.p(rel)).read_text(encoding="utf-8")
 
-    def _system(self, distribution, codename=None, timer_h=None):
-        """Write the os-release/lsb-release (and timer.h) the step reads."""
+    def _system(self, distribution, codename=None):
+        """Write the os-release/lsb-release the step reads."""
         os.makedirs(self.p("etc"), exist_ok=True)
         Path(self.p("etc/os-release")).write_text(_OS_RELEASE[distribution])
         if codename:
             Path(self.p("etc/lsb-release")).write_text(_LSB[codename])
-        if timer_h is not None:
-            header = self.p(f"lib/modules/{_KERNEL}/build/include/linux/timer.h")
-            os.makedirs(os.path.dirname(header))
-            Path(header).write_text(timer_h)
 
     def _env(self, distribution, **extra):
         env = {"DISTRIBUTION": distribution, "ARCHITECTURE": "x86_64",
@@ -216,34 +221,14 @@ class InstallTests(unittest.TestCase):
         return env
 
     def _install(self, env, *, version=_UBUNTU_V, fail_on=None, dkms_ok=True,
-                 has_dkms=True, dkms_version="dkms-3.0.3\n", compare_rc=1,
-                 download_error=None, write_error=None):
+                 write_error=None):
         """Run install(env) with everything external mocked; return (rc, mocks)."""
         cfg = None if version is None else {"version": version}
-        seen = {}
-
-        def fake_download(url, sha256, dest_dir="."):
-            seen["work_dir_existed"] = os.path.isdir(dest_dir)
-            if download_error:
-                raise download_error
-            os.makedirs(dest_dir, exist_ok=True)
-            deb = Path(dest_dir) / Path(url).name
-            deb.write_bytes(b"deb")
-            return deb
-
-        def fake_capture(command, op, **kwargs):
-            if command[:2] == ["dkms", "--version"]:
-                return (0, dkms_version)
-            return (compare_rc, "")
 
         with mock.patch.object(lustre, "config_for", return_value=cfg) as config_for, \
              mock.patch.object(lustre, "exec_program",
                                side_effect=lambda c, op, **kw: 1 if c == fail_on else 0) \
                 as exec_program, \
-             mock.patch.object(lustre, "run_capture", side_effect=fake_capture) as capture, \
-             mock.patch.object(lustre, "_command_exists", return_value=has_dkms), \
-             mock.patch.object(lustre, "download_and_verify",
-                               side_effect=fake_download) as download, \
              mock.patch.object(lustre, "check_dkms_status",
                                return_value=dkms_ok) as check, \
              mock.patch.object(lustre, "write_component_version",
@@ -252,12 +237,12 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(lustre, "log_warn") as log_warn, \
              mock.patch.object(lustre, "log_error") as log_error:
             rc = lustre.install(env)
-        for call in exec_program.call_args_list + capture.call_args_list:
+        for call in exec_program.call_args_list:
             self.assertEqual(call.args[1], _OP)
             self.assertIs(call.kwargs["env"], env)
-        return rc, {"config_for": config_for, "exec": exec_program, "capture": capture,
-                    "download": download, "check": check, "record": record,
-                    "info": log_info, "warn": log_warn, "error": log_error, **seen}
+        return rc, {"config_for": config_for, "exec": exec_program, "check": check,
+                    "record": record, "info": log_info, "warn": log_warn,
+                    "error": log_error}
 
     @staticmethod
     def _commands(m):
@@ -299,14 +284,16 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read("etc/sysconfig/dkms-lustre"),
                          _fixture("sysconfig-dkms-lustre.conf"))
         self.assertFalse(os.path.exists(self.p("etc/dkms")))
-        m["capture"].assert_not_called()
-        m["download"].assert_not_called()
         m["check"].assert_called_once_with(["lustre-client-modules"], _OP, env,
                                            kernel=_KERNEL)
         m["record"].assert_called_once_with("LUSTRE", _NOBLE_V)
         m["warn"].assert_not_called()
         m["error"].assert_not_called()
 
+        self.assertEqual(
+            self._info_fields(m, f"Kernel version {_KERNEL} is not 7.0; installing "
+                                 "the Lustre client"),
+            {"kernel_version": _KERNEL, "kernel_source": "uname -r", "skipped": False})
         self.assertEqual(self._info_fields(m, f"Installing the Lustre client {_NOBLE_V}"),
                          {"version": _NOBLE_V, "distro": "ubuntu24.04", "arch": "aarch64",
                           "gpu": "NVIDIA", "kernel": _KERNEL, "family": "ubuntu"})
@@ -335,112 +322,35 @@ class InstallTests(unittest.TestCase):
         sysconfig = self.p("etc/sysconfig/dkms-lustre")
         self.assertEqual(self._info_fields(m, f"Replaced {sysconfig}")["action"], "replaced")
 
-    def test_ubuntu_2204_nvidia(self):
-        self._system("ubuntu22.04", "jammy")
-        env = self._env("ubuntu22.04")
-        rc, m = self._install(env)
+    def test_ubuntu_2204_same_for_every_gpu(self):
+        # The Jammy AMD dkms 3.4.1 upgrade is gone (#633/#643): AMD and NVIDIA
+        # builds now run the same commands and write the same files.
+        for gpu in ("NVIDIA", "AMD"):
+            with self.subTest(gpu=gpu):
+                self._system("ubuntu22.04", "jammy")
+                env = self._env("ubuntu22.04", GPU=gpu)
+                rc, m = self._install(env)
 
-        self.assertEqual(rc, 0)
-        self.assertEqual(self._commands(m), [
-            ["apt-get", "update"],
-            ["apt-get", "install", "-y", f"lustre-client-{_UBUNTU_V}"],
-            ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_UBUNTU_V}"],
-        ])
-        self.assertEqual(self.read("etc/apt/sources.list.d/amlfs.list"),
-                         _fixture("amlfs.list.jammy-amd64"))
-        self.assertEqual(self.read(f"etc/dkms/lustre-client-modules-{_UBUNTU_V}.conf"),
-                         _fixture("jammy-dkms.conf"))
-        self.assertFalse(os.path.exists(self.p("etc/sysconfig")))
-        m["capture"].assert_not_called()
-        m["download"].assert_not_called()
-        m["check"].assert_called_once_with(["lustre-client-modules"], _OP, env,
-                                           kernel=_KERNEL)
-        m["record"].assert_called_once_with("LUSTRE", _UBUNTU_V)
-        m["warn"].assert_not_called()
-        self.assertIn("dkms 3.4.1 workaround not needed (only for ubuntu22.04 with AMD GPUs)",
-                      self._messages(m["info"]))
-
-    def test_ubuntu_2204_amd_without_dkms_installs_dkms_341(self):
-        self._system("ubuntu22.04", "jammy")
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"), has_dkms=False)
-
-        self.assertEqual(rc, 0)
-        deb = os.path.join(self.p("work/lustre-build"), _DKMS_DEB)
-        self.assertEqual(self._commands(m), [
-            ["apt-get", "update"],
-            ["apt-get", "install", "-y", f"lustre-client-{_UBUNTU_V}"],
-            ["apt-get", "install", "-y", deb],
-            ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_UBUNTU_V}"],
-        ])
-        m["capture"].assert_not_called()
-        m["download"].assert_called_once_with(
-            lustre._JAMMY_DKMS_URL, lustre._JAMMY_DKMS_SHA256,
-            dest_dir=self.p("work/lustre-build"))
-        self.assertFalse(m["work_dir_existed"])
-        self.assertFalse(os.path.exists(self.p("work/lustre-build")))
-        self.assertEqual(self.read(f"etc/dkms/lustre-client-modules-{_UBUNTU_V}.conf"),
-                         _fixture("jammy-dkms.conf"))
-        self.assertIn("dkms is not installed yet", self._messages(m["info"]))
-
-    def test_ubuntu_2204_amd_old_dkms_installs_dkms_341(self):
-        self._system("ubuntu22.04", "jammy")
-        os.makedirs(self.p("work/lustre-build"))
-        Path(self.p("work/lustre-build/" + _DKMS_DEB)).write_text("stale")
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"),
-                              dkms_version="dkms-3.0.3\n", compare_rc=1)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual([c.args[0] for c in m["capture"].call_args_list], [
-            ["dkms", "--version"],
-            ["dpkg", "--compare-versions", "3.0.3", "ge", "3.4.1"],
-        ])
-        for call in m["capture"].call_args_list:
-            self.assertIs(call.kwargs["failure_is_error"], False)
-        self.assertFalse(m["work_dir_existed"])     # stale deb removed first
-        m["download"].assert_called_once()
-        self.assertEqual(self._info_fields(m, "dkms 3.0.3 is older than 3.4.1"),
-                         {"dkms_version": "3.0.3"})
-
-    def test_ubuntu_2204_amd_new_dkms_is_kept(self):
-        self._system("ubuntu22.04", "jammy")
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"),
-                              dkms_version="dkms-3.4.1\n", compare_rc=0)
-
-        self.assertEqual(rc, 0)
-        m["download"].assert_not_called()
-        self.assertEqual(len(self._commands(m)), 3)
-        self.assertIn("dkms 3.4.1 is at least 3.4.1; keeping it", self._messages(m["info"]))
-
-    def test_ubuntu_2204_amd_unparsable_dkms_version_installs(self):
-        self._system("ubuntu22.04", "jammy")
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"), dkms_version="")
-
-        self.assertEqual(rc, 0)
-        self.assertEqual([c.args[0] for c in m["capture"].call_args_list],
-                         [["dkms", "--version"]])
-        m["download"].assert_called_once()
-
-    def test_ubuntu_2204_amd_download_failure(self):
-        self._system("ubuntu22.04", "jammy")
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"), has_dkms=False,
-                              download_error=OSError("network down"))
-
-        self.assertEqual(rc, 3)
-        self.assertEqual(len(self._commands(m)), 2)            # no dkms package
-        m["check"].assert_not_called()
-        m["record"].assert_not_called()
-        self.assertFalse(os.path.exists(self.p("work/lustre-build")))
-
-    def test_ubuntu_2204_amd_deb_install_failure(self):
-        self._system("ubuntu22.04", "jammy")
-        deb = os.path.join(self.p("work/lustre-build"), _DKMS_DEB)
-        rc, m = self._install(self._env("ubuntu22.04", GPU="AMD"), has_dkms=False,
-                              fail_on=["apt-get", "install", "-y", deb])
-
-        self.assertEqual(rc, 3)
-        self.assertEqual(self._commands(m)[-1], ["apt-get", "install", "-y", deb])
-        self.assertFalse(os.path.exists(self.p("etc/dkms")))
-        self.assertFalse(os.path.exists(self.p("work/lustre-build")))
+                self.assertEqual(rc, 0)
+                self.assertEqual(self._commands(m), [
+                    ["apt-get", "update"],
+                    ["apt-get", "install", "-y", f"lustre-client-{_UBUNTU_V}"],
+                    ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_UBUNTU_V}"],
+                ])
+                self.assertEqual(self.read("etc/apt/sources.list.d/amlfs.list"),
+                                 _fixture("amlfs.list.jammy-amd64"))
+                self.assertEqual(
+                    self.read(f"etc/dkms/lustre-client-modules-{_UBUNTU_V}.conf"),
+                    _fixture("jammy-dkms.conf"))
+                self.assertFalse(os.path.exists(self.p("etc/sysconfig")))
+                m["check"].assert_called_once_with(["lustre-client-modules"], _OP, env,
+                                                   kernel=_KERNEL)
+                m["record"].assert_called_once_with("LUSTRE", _UBUNTU_V)
+                m["warn"].assert_not_called()
+                self.assertIn("Ubuntu 22.04: legacy DKMS config (--with-o2ib=no, "
+                              "skip record 11)", self._messages(m["info"]))
+                os.remove(self.p(f"etc/dkms/lustre-client-modules-{_UBUNTU_V}.conf"))
+                os.rmdir(self.p("etc/dkms"))
 
     def test_ubuntu_command_failures_stop(self):
         commands = [
@@ -514,8 +424,8 @@ class InstallTests(unittest.TestCase):
          f"lustre-client-dkms-{_EL_V}", f"lustre-client-{_EL_V}-devel"],
     ]
 
-    def test_rhel_with_from_timer_kernel(self):
-        self._system("almalinux9.8", timer_h="#define from_timer(var, t, f) x\n")
+    def test_rhel(self):
+        self._system("almalinux9.8")
         env = self._env("almalinux9.8")
         rc, m = self._install(env, version="2.15.8-35-gdf4872c")   # "-" -> "_"
 
@@ -523,52 +433,31 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(m), self._EL_COMMANDS)
         self.assertEqual(self.read("etc/yum.repos.d/amlfs.repo"), _fixture("amlfs.repo.el9"))
         self.assertEqual(self.read("etc/sysconfig/lustre"), _fixture("sysconfig-lustre.conf"))
+        # Only the record-3 skip: the LU-20071 PATCH line is gone (#610).
         self.assertEqual(self.read(f"etc/dkms/lustre-client-{_EL_V}.conf"),
-                         _fixture("el-dkms.conf.no-patch"))
-        self.assertFalse(os.path.exists(self.p("etc/dkms/lustre-client/patches")))
+                         _fixture("el-dkms.conf"))
+        self.assertEqual(os.listdir(self.p("etc/dkms")), [f"lustre-client-{_EL_V}.conf"])
         m["check"].assert_called_once_with(["lustre-client"], _OP, env, kernel=_KERNEL)
         m["record"].assert_called_once_with("LUSTRE", _EL_V)
         m["warn"].assert_not_called()
         m["error"].assert_not_called()
-        self.assertEqual(
-            self._info_fields(m, "LU-20071 patch not needed: the kernel still has "
-                                 "from_timer()")["lu20071_patch"], False)
         self.assertEqual(self._info_fields(m, f"RHEL family: el9, Lustre version {_EL_V}"),
                          {"distro": "almalinux9.8", "os_major": "9", "version": _EL_V})
         self.assertEqual(self._info_fields(m, "Lustre client installed")["dkms_module"],
                          "lustre-client")
 
-    @unittest.skip(_STALE)
-    def test_rhel_kernel_without_from_timer_gets_lu20071_patch(self):
-        self._system("almalinux9.8", timer_h="#define timer_container_of(v, t, f) x\n")
-        rc, m = self._install(self._env("almalinux9.8"), version=_EL_V)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(self._commands(m), self._EL_COMMANDS)
-        self.assertEqual(self.read(f"etc/dkms/lustre-client-{_EL_V}.conf"),
-                         _fixture("el-dkms.conf"))
-        copied = self.p("etc/dkms/lustre-client/patches/lu-20071-timer-container-of.patch")
-        self.assertEqual(Path(copied).read_bytes(), _PATCH.read_bytes())
-        self.assertTrue(self._info_fields(
-            m, "LU-20071 patch needed: the kernel's timer.h has no from_timer() "
-               "(RHEL 9.8 kernels 5.14.0-687+)")["lu20071_patch"])
-        m["warn"].assert_not_called()
-
-    def test_rhel_without_kernel_headers_skips_patch(self):
+    def test_rhel8(self):
         self._system("rocky8.10")
         rc, m = self._install(self._env("rocky8.10"), version=_EL_V)
 
         self.assertEqual(rc, 0)
+        self.assertEqual(self._commands(m), self._EL_COMMANDS)
         self.assertEqual(self.read("etc/yum.repos.d/amlfs.repo"), _fixture("amlfs.repo.el8"))
         self.assertEqual(self.read(f"etc/dkms/lustre-client-{_EL_V}.conf"),
-                         _fixture("el-dkms.conf.no-patch"))
-        header = self.p(f"lib/modules/{_KERNEL}/build/include/linux/timer.h")
-        self.assertIn(f"LU-20071 patch not needed: no kernel header {header}",
-                      self._messages(m["info"]))
+                         _fixture("el-dkms.conf"))
 
-    @unittest.skip(_STALE)
     def test_rhel_rerun_appends_again_and_warns(self):
-        self._system("almalinux9.8", timer_h="no timer helpers\n")
+        self._system("almalinux9.8")
         env = self._env("almalinux9.8")
         rc, first = self._install(env, version=_EL_V)
         self.assertEqual(rc, 0)
@@ -579,42 +468,14 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read(f"etc/dkms/lustre-client-{_EL_V}.conf"),
                          _fixture("el-dkms.conf.rerun"))
         conf = self.p(f"etc/dkms/lustre-client-{_EL_V}.conf")
-        warned = [c.kwargs["path"] for c in second["warn"].call_args_list]
-        self.assertEqual(warned, [conf, conf])        # skip block, then PATCH line
-        self.assertEqual(second["warn"].call_args_list[0].kwargs["appended"],
+        self.assertEqual([c.kwargs["path"] for c in second["warn"].call_args_list], [conf])
+        self.assertEqual(second["warn"].call_args.kwargs["appended"],
                          '# EL ko2iblnd is record 3; --with-o2ib=no intentionally '
                          'skips it. | BUILD_EXCLUSIVE_KERNEL[3]="^$"')
         self.assertEqual(self._info_fields(second, f"Appended {conf}"),
                          {"path": conf, "action": "appended"})
         self.assertEqual(self._info_fields(second, f"Replaced {self.p('etc/yum.repos.d/amlfs.repo')}")
                          ["action"], "replaced")
-
-    @unittest.skip(_STALE)
-    def test_rhel_unreadable_timer_header_applies_patch_with_warning(self):
-        self._system("almalinux9.8", timer_h="#define from_timer(a, b, c) x\n")
-        header = self.p(f"lib/modules/{_KERNEL}/build/include/linux/timer.h")
-        real_open = builtins.open
-
-        def fake_open(path, *args, **kwargs):
-            if path == header:
-                raise PermissionError(13, "Permission denied", header)
-            return real_open(path, *args, **kwargs)
-
-        with mock.patch("builtins.open", side_effect=fake_open):
-            rc, m = self._install(self._env("almalinux9.8"), version=_EL_V)
-
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.read(f"etc/dkms/lustre-client-{_EL_V}.conf"),
-                         _fixture("el-dkms.conf"))
-        self.assertEqual([c.kwargs["path"] for c in m["warn"].call_args_list], [header])
-
-    def test_rhel_missing_patch_file_fails(self):
-        self._system("almalinux9.8", timer_h="nothing\n")
-        rc, m = self._install(self._env("almalinux9.8", COMPONENT_DIR=self.p("nowhere")),
-                              version=_EL_V)
-        self.assertEqual(rc, 3)
-        self.assertEqual(self._commands(m), self._EL_COMMANDS[:1])   # no dnf install
-        m["record"].assert_not_called()
 
     def test_rhel_command_failures_stop(self):
         for index, failing in enumerate(self._EL_COMMANDS):
@@ -677,6 +538,70 @@ class InstallTests(unittest.TestCase):
                               self._messages(m["error"]))
                 m["warn"].assert_not_called()
 
+    # ---- kernel 7.0 skip ---------------------------------------------------------
+    def test_kernel_7_0_skips_without_changing_anything(self):
+        cases = [
+            # (distribution, lustre version, KERNEL_VERSION, uname -r, source)
+            ("ubuntu24.04", _NOBLE_V, "7.0", _KERNEL, "KERNEL_VERSION"),
+            ("ubuntu24.04", _NOBLE_V, None, "7.0.0-1004-azure", "uname -r"),
+            ("ubuntu24.04", _NOBLE_V, "", "7.0.0-1004-azure", "uname -r"),
+            # Ubuntu 26.04 has no "lustre" entry; bash skips before using it.
+            ("ubuntu26.04", None, "7.0", "7.0.0-14-generic", "KERNEL_VERSION"),
+            ("almalinux9.8", _EL_V, "7.0-rc1", _KERNEL, "KERNEL_VERSION"),
+        ]
+        for distro, version, requested, uname, source in cases:
+            with self.subTest(distro=distro, kernel_version=requested, uname=uname):
+                self._system(distro)
+                extra = {} if requested is None else {"KERNEL_VERSION": requested}
+                env = self._env(distro, **extra)
+                with mock.patch.object(lustre, "_kernel_release", return_value=uname):
+                    rc, m = self._install(env, version=version)
+
+                self.assertEqual(rc, 0)
+                m["config_for"].assert_called_once_with("lustre", env)   # looked up first
+                self._assert_no_side_effects(m)
+                m["check"].assert_not_called()
+                m["error"].assert_not_called()
+                current = requested or uname
+                self.assertEqual(
+                    self._info_fields(m, "Skipping Lustre client installation for "
+                                         f"kernel version {current}"),
+                    {"kernel_version": current, "kernel_source": source,
+                     "distro": distro, "skipped": True})
+
+    def test_kernel_version_overrides_uname(self):
+        # Packer's KERNEL_VERSION wins over the running kernel, as in bash; the
+        # DKMS check still uses `uname -r` (bash check_dkms_status does).
+        self._system("ubuntu24.04", "noble")
+        env = self._env("ubuntu24.04", KERNEL_VERSION="6.8")
+        with mock.patch.object(lustre, "_kernel_release", return_value="7.0.0-1004-azure"):
+            rc, m = self._install(env, version=_NOBLE_V)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._commands(m)), 3)
+        m["check"].assert_called_once_with(["lustre-client-modules"], _OP, env,
+                                           kernel="7.0.0-1004-azure")
+        self.assertEqual(
+            self._info_fields(m, "Kernel version 6.8 is not 7.0; installing the "
+                                 "Lustre client"),
+            {"kernel_version": "6.8", "kernel_source": "KERNEL_VERSION", "skipped": False})
+
+    def test_ubuntu_2604_without_a_7_0_kernel_fails_before_writing(self):
+        # Bash would write "signed-by=" (no SIGNED_BY for 26.04); with no
+        # "lustre" entry for 26.04 it would also install "lustre-client-null".
+        for version, message in [(None, "could not resolve lustre version from "
+                                        "versions.json"),
+                                 (_NOBLE_V, "no apt signing key known for Ubuntu "
+                                            "'26.04' (bash sets SIGNED_BY only for "
+                                            "22.04 and 24.04)")]:
+            with self.subTest(version=version):
+                self._system("ubuntu26.04", "resolute")
+                rc, m = self._install(self._env("ubuntu26.04", KERNEL_VERSION="6.17"),
+                                      version=version)
+                self.assertEqual(rc, 3)
+                self._assert_no_side_effects(m)
+                self.assertIn(message, self._messages(m["error"]))
+
     def test_record_failure(self):
         self._system("ubuntu24.04", "noble")
         rc, m = self._install(self._env("ubuntu24.04"), version=_NOBLE_V,
@@ -691,10 +616,6 @@ class KernelReleaseTests(unittest.TestCase):
         with mock.patch.object(lustre.platform, "release", return_value="6.8.0-1-azure"):
             self.assertEqual(lustre._kernel_release(), "6.8.0-1-azure")
 
-    def test_command_exists_uses_env_path(self):
-        with mock.patch.object(lustre.shutil, "which", return_value="/usr/sbin/dkms") as which:
-            self.assertTrue(lustre._command_exists("dkms", {"PATH": "/usr/sbin"}))
-        which.assert_called_once_with("dkms", path="/usr/sbin")
 
 
 class WiringTests(unittest.TestCase):

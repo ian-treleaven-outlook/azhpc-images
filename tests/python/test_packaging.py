@@ -538,55 +538,197 @@ class MonitoringToolsTests(unittest.TestCase):
                 install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
+    def test_install_deps_uses_python3_pip_package_on_24_04_26_04_and_azurelinux(self):
+        # bash: elif [[ $DISTRIBUTION == "ubuntu24.04" ]] || [[ $DISTRIBUTION == "ubuntu26.04" ]]
+        for distro in ("ubuntu24.04", "ubuntu26.04", "azurelinux3.0"):
+            with self.subTest(distro=distro):
+                with mock.patch.object(install_monitoring_tools, "PackageInstaller") as PI, \
+                     mock.patch.object(install_monitoring_tools, "exec_program") as ex:
+                    PI.return_value.manager = object()
+                    PI.return_value.install_package.return_value = True
+                    rc = install_monitoring_tools.install_deps({"DISTRIBUTION": distro})
+                self.assertEqual(rc, 0)
+                PI.return_value.install_package.assert_called_once_with(["python3-pip"])
+                ex.assert_not_called()
+
+    def test_install_deps_upgrades_pip_elsewhere(self):
+        for distro in ("ubuntu22.04", "almalinux9.8", "rhel8.10"):
+            with self.subTest(distro=distro):
+                env = {"DISTRIBUTION": distro}
+                with mock.patch.object(install_monitoring_tools, "PackageInstaller") as PI, \
+                     mock.patch.object(install_monitoring_tools, "exec_program",
+                                       return_value=0) as ex:
+                    rc = install_monitoring_tools.install_deps(env)
+                self.assertEqual(rc, 0)
+                PI.assert_not_called()
+                ex.assert_called_once_with(
+                    ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+                    "install-monitoring-tools", env=env)
+
 
 class AznfsTests(unittest.TestCase):
-    def test_install_ubuntu_uses_package_manager(self):
-        with mock.patch.object(install_aznfs, "PackageInstaller") as PI:
-            PI.return_value.manager = object()
-            PI.return_value.install_package.return_value = True
-            rc = install_aznfs.install({"DISTRIBUTION": "ubuntu24.04"})
-        self.assertEqual(rc, 0)
-        PI.return_value.install_package.assert_called_once_with(["aznfs"])
+    """install_aznfs.py. Commands and the download are mocked; the installer
+    is written into a temporary directory (the port's _DOWNLOAD_DIR)."""
 
-    def test_install_fails_without_package_manager(self):
-        with mock.patch.object(install_aznfs, "PackageInstaller") as PI:
-            PI.return_value.manager = None
-            rc = install_aznfs.install({"DISTRIBUTION": "ubuntu24.04"})
-        self.assertEqual(rc, 3)
+    _VERSIONS = json.dumps({"aznfs": {"common": {"version": "3.0.12", "sha256": "s"}}})
+    _URL = ("https://github.com/Azure/AZNFS-mount/releases/download/3.0.12/"
+            "aznfs_install.sh")
+    # One line per sed case; checked against real `sed -i 's/yum/dnf/'` in WSL.
+    _INSTALLER = (b"yum install -y yum-utils && yum update\n"
+                  b"no match here\n"
+                  b"  if command -v yum; then yum -y install aznfs; fi\n"
+                  b"yummy yum\r\n"
+                  b"\n"
+                  b"YUM yum\n"
+                  b"last line yum yum")
+    _PATCHED = (b"dnf install -y yum-utils && yum update\n"
+                b"no match here\n"
+                b"  if command -v dnf; then yum -y install aznfs; fi\n"
+                b"dnfmy yum\r\n"
+                b"\n"
+                b"YUM dnf\n"
+                b"last line dnf yum")
 
-    def test_install_azurelinux_runs_patched_installer(self):
-        env = {"DISTRIBUTION": "azurelinux3.0",
-               "COMPONENT_VERSIONS": json.dumps(
-                   {"aznfs": {"common": {"version": "2.0", "sha256": "s"}}})}
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.script = os.path.join(self.dir, "aznfs_install.sh")
+        patcher = mock.patch.object(install_aznfs, "_DOWNLOAD_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _install(self, distribution, *, versions=None, rcs=None, download_error=None):
+        """Run install() with exec_program and download_and_verify faked.
+
+        Returns (rc, commands, mocks). The fake installer run records the
+        script's contents at the moment bash would run it.
+        """
+        rcs = rcs or {}
+        commands, envs, self.seen_script = [], [], None
+
+        def fake_download(url, sha256, dest_dir="."):
+            if download_error:
+                raise download_error
+            path = os.path.join(dest_dir, os.path.basename(url))
+            with open(path, "wb") as handle:
+                handle.write(self._INSTALLER)
+            return path
+
+        def fake_exec(command, op, **kwargs):
+            self.assertEqual(op, "install-aznfs")
+            commands.append(command)
+            envs.append(kwargs["env"])
+            if command[0] == "bash":
+                with open(command[1], "rb") as handle:
+                    self.seen_script = handle.read()
+            return rcs.get(command[0], 0)
+
+        env = {"DISTRIBUTION": distribution, "ARCHITECTURE": "x86_64",
+               "COMPONENT_VERSIONS": versions or self._VERSIONS}
         with mock.patch.object(install_aznfs, "download_and_verify",
-                               return_value="/tmp/aznfs_install.sh") as dl, \
-             mock.patch("pathlib.Path.read_text", return_value="yum install x"), \
-             mock.patch("pathlib.Path.write_text") as wt, \
-             mock.patch.object(install_aznfs, "exec_program", return_value=0) as ex:
+                               side_effect=fake_download) as download, \
+             mock.patch.object(install_aznfs, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(install_aznfs, "log_info") as info, \
+             mock.patch.object(install_aznfs, "log_warn") as warn, \
+             mock.patch.object(install_aznfs, "log_error") as error:
             rc = install_aznfs.install(env)
-        self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        ex.assert_called_once()
-        self.assertIn("tdnf", wt.call_args[0][0])  # yum -> tdnf patch applied
+        for run_env in envs:
+            self.assertEqual(run_env["AZNFS_NONINTERACTIVE_INSTALL"], "1")
+            self.assertEqual(run_env["DISTRIBUTION"], distribution)
+        self.assertNotIn("AZNFS_NONINTERACTIVE_INSTALL", env)    # caller's env untouched
+        return rc, commands, {"download": download, "info": info, "warn": warn,
+                              "error": error}
 
-    def test_install_azurelinux_normalizes_installer_exit_code(self):
-        # exec_program passes through whatever the vendor script exited with
-        # (127 here = bash not found). We only ever hand back 0 or 3.
-        env = {"DISTRIBUTION": "azurelinux3.0",
-               "COMPONENT_VERSIONS": json.dumps(
-                   {"aznfs": {"common": {"version": "2.0", "sha256": "s"}}})}
-        with mock.patch.object(install_aznfs, "download_and_verify",
-                               return_value="/tmp/aznfs_install.sh"), \
-             mock.patch("pathlib.Path.read_text", return_value="yum install x"), \
-             mock.patch("pathlib.Path.write_text"), \
-             mock.patch.object(install_aznfs, "exec_program", return_value=127):
-            rc = install_aznfs.install(env)
+    # ---- pure helpers ----------------------------------------------------------
+    def test_install_branch(self):
+        cases = {"ubuntu22.04": "apt", "ubuntu24.04": "apt", "ubuntu26.04": "apt",
+                 "almalinux8.10": "dnf", "almalinux9.8": "dnf", "rocky9.8": "dnf",
+                 "rhel9.8": "dnf", "rhel8.10": "dnf", "azurelinux3.0": "installer",
+                 "sles15": "installer", "": "installer"}
+        for distro, branch in cases.items():
+            with self.subTest(distro=distro):
+                self.assertEqual(install_aznfs.install_branch(distro), branch)
+
+    def test_sed_replaces_only_the_first_yum_on_each_line(self):
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(self._INSTALLER), (self._PATCHED, 5))
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(b"yum\n"), (b"dnf\n", 1))
+        self.assertEqual(install_aznfs.sed_yum_to_dnf(b""), (b"", 0))
+
+    # ---- PMC branches ----------------------------------------------------------
+    def test_ubuntu_and_rhel_family_install_from_pmc(self):
+        cases = {"ubuntu24.04": "apt", "ubuntu26.04": "apt", "ubuntu22.04": "apt",
+                 "almalinux9.8": "dnf", "rocky8.10": "dnf", "rhel9.8": "dnf"}
+        for distro, manager in cases.items():
+            with self.subTest(distro=distro):
+                rc, commands, m = self._install(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [[manager, "install", "-y", "aznfs"]])
+                m["download"].assert_not_called()
+                m["warn"].assert_not_called()
+                m["error"].assert_not_called()
+                self.assertEqual(m["info"].call_args_list[0].kwargs,
+                                 {"distro": distro, "branch": manager,
+                                  "noninteractive": True})
+
+    def test_pmc_failure_returns_3(self):
+        rc, commands, m = self._install("ubuntu24.04", rcs={"apt": 100})
         self.assertEqual(rc, 3)
+        self.assertEqual(commands, [["apt", "install", "-y", "aznfs"]])
+        self.assertEqual(m["error"].call_args.kwargs["exit_code"], 100)
 
-    def test_install_unsupported_distro(self):
-        with mock.patch.object(install_aznfs, "log_error") as logged:
-            self.assertEqual(install_aznfs.install({"DISTRIBUTION": "gentoo"}), 3)
-        logged.assert_called_once()   # unsupported distro is reported as an error
+    # ---- installer branch ------------------------------------------------------
+    def test_azurelinux_runs_the_patched_installer_and_removes_it(self):
+        rc, commands, m = self._install("azurelinux3.0")
+
+        self.assertEqual(rc, 0)
+        m["download"].assert_called_once_with(self._URL, "s", dest_dir=self.dir)
+        self.assertEqual(commands, [["bash", self.script]])
+        self.assertEqual(self.seen_script, self._PATCHED)       # sed ran before bash
+        self.assertFalse(os.path.exists(self.script))           # rm -f aznfs_install.sh
+        m["warn"].assert_not_called()
+        m["error"].assert_not_called()
+        messages = [c.args[1] for c in m["info"].call_args_list]
+        self.assertIn(f"Removed {self.script}", messages)
+        patched = [c for c in m["info"].call_args_list if c.args[1].startswith("Patched ")]
+        self.assertEqual(patched[0].kwargs["lines_changed"], 5)
+
+    def test_other_distros_take_the_installer_branch_with_a_warning(self):
+        rc, commands, m = self._install("sles15")
+        self.assertEqual(rc, 0)
+        self.assertEqual(commands, [["bash", self.script]])
+        self.assertEqual(m["warn"].call_args.kwargs, {"distro": "sles15"})
+
+    def test_leftover_installer_is_overwritten_with_a_warning(self):
+        with open(self.script, "wb") as handle:
+            handle.write(b"old, already patched\n")
+        rc, _, m = self._install("azurelinux3.0")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.seen_script, self._PATCHED)
+        self.assertEqual(m["warn"].call_args.kwargs, {"path": self.script})
+
+    def test_installer_failure_leaves_the_script_and_returns_3(self):
+        rc, _, m = self._install("azurelinux3.0", rcs={"bash": 1})
+        self.assertEqual(rc, 3)
+        self.assertTrue(os.path.exists(self.script))            # set -e stops before rm
+        self.assertEqual(m["error"].call_args.kwargs["path"], self.script)
+
+    def test_installer_branch_missing_config_returns_3_before_downloading(self):
+        for versions in ("{}", json.dumps({"aznfs": {"common": {"version": "3.0.12"}}})):
+            with self.subTest(versions=versions):
+                rc, commands, m = self._install("azurelinux3.0", versions=versions)
+                self.assertEqual(rc, 3)
+                self.assertEqual(commands, [])
+                m["download"].assert_not_called()
+                m["error"].assert_called_once()
+
+    def test_download_failure_returns_3(self):
+        rc, commands, m = self._install("azurelinux3.0",
+                                        download_error=OSError("404"))
+        self.assertEqual(rc, 3)
+        self.assertEqual(commands, [])
+        self.assertIn("download/verify", m["error"].call_args.args[1])
 
 
 if __name__ == "__main__":

@@ -5,23 +5,32 @@ What this step does
 -------------------
 Gives the RDMA (InfiniBand / RoCE) devices of a VM stable, predictable names:
 mlx5_ib0, mlx5_ib1, ... for InfiniBand ports and mlx5_an0, ... for Ethernet
-(accelerated networking) ports. It does that at every boot with a systemd
-service:
+(accelerated networking) ports. It does that at boot, and again every minute,
+with a systemd service and timer:
 
   1. Build `rdma_rename` from the rdma-core source release named in
      versions.json ("rdma_core"), and install it as
      /usr/sbin/rdma_rename_<version>. (The distro's rdma_rename can't be used:
      we need its NAME_FIXED mode, so we build a known version.)
   2. Write /usr/sbin/azure_persistent_rdma_naming.sh, a small script that walks
-     the devices (`ibdev2netdev -v`) and renames each one with rdma_rename.
-  3. Write azure_persistent_rdma_naming.service, which runs that script once at
-     boot, then enable it and start it now.
-  4. Run the separate component script install_azure_persistent_rdma_naming_monitor.sh
-     (still bash), which installs a monitor service that restarts the naming
-     service if a device ever loses its name.
+     the devices (`ibdev2netdev -v`), skips those already named mlx5_ib<N> /
+     mlx5_an<N>, and renames the others with rdma_rename, numbering on from
+     the highest existing index.
+  3. Write azure_persistent_rdma_naming.service, which runs that script (after
+     udev has settled and openibd has started), and
+     azure_persistent_rdma_naming.timer, which runs the service 30s after boot
+     and then 60s after each run.
+  4. `systemctl daemon-reload`, enable the service and the timer, then start
+     the service and the timer now.
 
-The original bash, for comparison (the two heredoc texts are shortened here;
-they are in full below as _NAMING_SCRIPT_TEMPLATE and _SERVICE_UNIT):
+Upstream (#614, the Ubuntu 26.04 support) rewrote the naming script so it can
+run repeatedly, added the timer, and deleted the separate
+install_azure_persistent_rdma_naming_monitor.sh (a looping monitor service that
+restarted the naming service), which this step used to run.
+
+The original bash, for comparison (the three heredoc texts are shortened here;
+they are in full below as _NAMING_SCRIPT_TEMPLATE, _SERVICE_UNIT and
+_TIMER_UNIT):
 
     set -ex
     source ${UTILS_DIR}/utilities.sh
@@ -53,17 +62,22 @@ they are in full below as _NAMING_SCRIPT_TEMPLATE and _SERVICE_UNIT):
     ...
     EOF
 
-    systemctl enable azure_persistent_rdma_naming.service
-    systemctl start azure_persistent_rdma_naming.service
+    cat <<EOF >/etc/systemd/system/azure_persistent_rdma_naming.timer
+    ...
+    EOF
 
-    $COMPONENT_DIR/install_azure_persistent_rdma_naming_monitor.sh
+    systemctl daemon-reload
+    systemctl enable azure_persistent_rdma_naming.service
+    systemctl enable azure_persistent_rdma_naming.timer
+    systemctl start azure_persistent_rdma_naming.service
+    systemctl start azure_persistent_rdma_naming.timer
 
 About the generated script: `cat <<EOF` (an *unquoted* heredoc) expands
 variables while writing. Only `${RDMA_CORE_VERSION}` is meant to expand; every
 other `$` is escaped as `\\$` in the bash source so it reaches the file as a
 plain `$`. Our template is the text as it lands in the file, with the one
-`${RDMA_CORE_VERSION}` left in place and filled in by naming_script(). Its
-output was compared byte for byte with the file real bash writes.
+`${RDMA_CORE_VERSION}` left in place and filled in by naming_script(). It and
+the two units were compared byte for byte with the files real bash writes.
 
 How it fits into the Python build
 ---------------------------------
@@ -81,8 +95,7 @@ Which commands still run as programs
   * `tar`: --strip-components has no simple tarfile equivalent, and the tar
     command keeps the archive's symlinks and modes exactly as bash.
   * `bash build.sh`: rdma-core's own build script (cmake + ninja/make).
-  * `systemctl enable` / `systemctl start`.
-  * The nested monitor installer, which is a separate component.
+  * `systemctl daemon-reload` / `enable` / `start`.
 The copy, file writes, chmod and clean-up are plain Python.
 
 A bash subtlety we mirror: `mkdir rdma-core && tar ...`
@@ -130,7 +143,8 @@ _SBIN_DIR = "/usr/sbin"                  # where rdma_rename_<version> is instal
 _NAMING_SCRIPT = "/usr/sbin/azure_persistent_rdma_naming.sh"
 _SERVICE_NAME = "azure_persistent_rdma_naming.service"
 _SERVICE_FILE = "/etc/systemd/system/azure_persistent_rdma_naming.service"
-_MONITOR_SCRIPT = "install_azure_persistent_rdma_naming_monitor.sh"   # in COMPONENT_DIR
+_TIMER_NAME = "azure_persistent_rdma_naming.timer"
+_TIMER_FILE = "/etc/systemd/system/azure_persistent_rdma_naming.timer"
 
 _URL = "https://github.com/linux-rdma/rdma-core/archive/refs/tags/{tarball}"
 
@@ -148,10 +162,31 @@ _NAMING_SCRIPT_TEMPLATE = r"""#!/bin/bash
 
 rdma_rename=/usr/sbin/rdma_rename_${RDMA_CORE_VERSION}
 
-an_index=0
-ib_index=0
+mapfile -t all_devices < <(ibdev2netdev -v | sort -n | awk '{print $2}')
 
-for old_device in $(ibdev2netdev -v | sort -n | cut -f2 -d' '); do
+next_index() {
+	local prefix=$1
+	local max_index=-1
+	local dev suffix
+
+	for dev in "${all_devices[@]}"; do
+		suffix=${dev#$prefix}
+		if [[ "$dev" == "$prefix"* && "$suffix" =~ ^[0-9]+$ && "$suffix" -gt "$max_index" ]]; then
+			max_index=$suffix
+		fi
+	done
+
+	echo $((max_index + 1))
+}
+
+an_index=$(next_index mlx5_an)
+ib_index=$(next_index mlx5_ib)
+
+for old_device in "${all_devices[@]}"; do
+
+	case "$old_device" in
+		mlx5_ib*|mlx5_an*) continue ;;
+	esac
 
 	link_layer=$(ibv_devinfo -d $old_device | sed -n 's/^[\ \t]*link_layer:[\ \t]*\([a-zA-Z]*\)$/\1/p')
 	
@@ -167,7 +202,7 @@ for old_device in $(ibdev2netdev -v | sort -n | cut -f2 -d' '); do
 		
 	else
 	
-		echo "Unknown device type for $old_device - $device_type."
+		echo "Unknown device type for $old_device."
 		
 	fi
 	
@@ -181,16 +216,31 @@ _VERSION_PLACEHOLDER = "${RDMA_CORE_VERSION}"
 _SERVICE_UNIT = """\
 [Unit]
 Description=Azure persistent RDMA naming
-After=network.target
+After=network.target systemd-udev-settle.service openibd.service
+Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/azure_persistent_rdma_naming.sh
-RemainAfterExit=true
 StandardOutput=journal
 
 [Install]
 WantedBy=multi-user.target
+"""
+
+# The retry timer, exactly as bash writes it (nothing in it is expanded either).
+_TIMER_UNIT = """\
+[Unit]
+Description=Retry Azure persistent RDMA naming
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=azure_persistent_rdma_naming.service
+
+[Install]
+WantedBy=timers.target
 """
 
 
@@ -332,12 +382,6 @@ def install(env: dict[str, str]) -> int:
         return 3
     version = cfg["version"]
 
-    component_dir = env.get("COMPONENT_DIR", "")
-    if not component_dir:
-        log_error(_OP, "COMPONENT_DIR is not set; can't find the monitor installer")
-        return 3
-    monitor = os.path.join(component_dir, _MONITOR_SCRIPT)
-
     log_info(_OP, "Installing persistent RDMA naming",
              rdma_core_version=version,
              source=_URL.format(tarball=f"v{version}.tar.gz"),
@@ -347,23 +391,26 @@ def install(env: dict[str, str]) -> int:
     if not _build_rdma_rename(version, cfg["sha256"], env):
         return 3
 
-    # ---- 2. The boot-time naming script and its service --------------------
+    # ---- 2. The naming script, its service and the retry timer -------------
     if not _write_file(_NAMING_SCRIPT, naming_script(version), mode=0o755):
         return 3
     if not _write_file(_SERVICE_FILE, _SERVICE_UNIT):
         return 3
-
-    for action in ("enable", "start"):
-        if not _run(["systemctl", action, _SERVICE_NAME], env):
-            return 3
-    log_info(_OP, f"Enabled and started {_SERVICE_NAME}", service=_SERVICE_NAME)
-
-    # ---- 3. The monitor service (a separate component, still bash) ---------
-    log_info(_OP, "Running the nested monitor installer", script=monitor)
-    if not _run([monitor], env):
+    if not _write_file(_TIMER_FILE, _TIMER_UNIT):
         return 3
+
+    # ---- 3. Load the new units, enable both, start both (bash's order) -----
+    for command in (["systemctl", "daemon-reload"],
+                    ["systemctl", "enable", _SERVICE_NAME],
+                    ["systemctl", "enable", _TIMER_NAME],
+                    ["systemctl", "start", _SERVICE_NAME],
+                    ["systemctl", "start", _TIMER_NAME]):
+        if not _run(command, env):
+            return 3
+    log_info(_OP, f"Enabled and started {_SERVICE_NAME} and {_TIMER_NAME}",
+             service=_SERVICE_NAME, timer=_TIMER_NAME)
 
     log_info(_OP, "Persistent RDMA naming installed",
              rdma_core_version=version, rdma_rename=rdma_rename_path(version),
-             naming_script=_NAMING_SCRIPT, service=_SERVICE_NAME)
+             naming_script=_NAMING_SCRIPT, service=_SERVICE_NAME, timer=_TIMER_NAME)
     return 0
