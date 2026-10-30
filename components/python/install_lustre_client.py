@@ -133,6 +133,11 @@ Deliberate differences from bash
   * The DISTRIB_CODENAME assignment in /etc/lsb-release is read by a small
     parser (plain, "double"- or 'single'-quoted values; the last assignment
     wins) instead of `source`-ing the file. That covers how Ubuntu writes it.
+  * Package installs go through install_packages() (one call per bash
+    command, options kept), which writes `apt-get install -y -o
+    Dpkg::Use-Pty=0 ...` / `dnf install -y ...`, the documented
+    normalisation. On a distribution it doesn't know, bash's else branch would
+    try dnf; install_packages() logs an error and the step returns 3.
 """
 
 from __future__ import annotations
@@ -144,6 +149,7 @@ import re
 from utils.component_config import config_for, write_component_version
 from utils.dkms import check_dkms_status
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -167,6 +173,9 @@ _SIGNED_BY = {
 }
 
 _MICROSOFT_KEY_URL = "https://packages.microsoft.com/keys/microsoft.asc"
+
+# bash: dnf install -y --disableexcludes=main --refresh "${LUSTRE_PACKAGES[@]}"
+_EL_DNF_OPTIONS = ["--disableexcludes=main", "--refresh"]
 
 # Kernels whose version is exactly this, or starts with it plus "." or "-",
 # get no Lustre client (bash: == "7.0" || == 7.0.* || == 7.0-*).
@@ -492,9 +501,8 @@ def _install_ubuntu(env: dict[str, str], version: str, kernel: str) -> str | Non
     dkms_package = f"amlfs-lustre-client-dkms-{version}"
     # Install the userspace package first because it owns /etc/sysconfig/dkms-lustre.
     # Pre-creating that conffile makes noninteractive dpkg stop at a prompt.
-    if not _run(["apt-get", "install", "-y", client_package], env):
+    if not install_packages([client_package], env, _OP):
         return None
-    log_info(_OP, f"Installed {client_package}", package=client_package)
 
     if ubuntu_version == "22.04":
         log_info(_OP, "Ubuntu 22.04: legacy DKMS config (--with-o2ib=no, skip record 11)")
@@ -504,9 +512,8 @@ def _install_ubuntu(env: dict[str, str], version: str, kernel: str) -> str | Non
                       f"in {_UBUNTU_DKMS_SYSCONFIG}")
         configure_lustre_dkms_no_o2ib_with_tr_workaround(_UBUNTU_DKMS_SYSCONFIG)
 
-    if not _run(["apt-get", "install", "-y", dkms_package], env):
+    if not install_packages([dkms_package], env, _OP):
         return None
-    log_info(_OP, f"Installed {dkms_package}", package=dkms_package)
 
     if not check_dkms_status([_UBUNTU_DKMS_MODULE], _OP, env, kernel=kernel):
         return None
@@ -534,10 +541,8 @@ def _install_rhel(env: dict[str, str], version: str, kernel: str) -> str | None:
     configure_lustre_dkms_skip_artifact(_EL_DKMS_MODULE, version_us, _EL_SKIP_SLOT,
                                         _EL_SKIP_DESCRIPTION)
 
-    if not _run(["dnf", "install", "-y", "--disableexcludes=main", "--refresh",
-                 *packages], env):
+    if not install_packages(packages, env, _OP, options=_EL_DNF_OPTIONS):
         return None
-    log_info(_OP, f"Installed {' '.join(packages)}", packages=" ".join(packages))
 
     if not check_dkms_status([_EL_DKMS_MODULE], _OP, env, kernel=kernel):
         return None
