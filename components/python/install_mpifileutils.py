@@ -39,10 +39,10 @@ from __future__ import annotations
 
 import os
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths
+from utils.files import extract_tarball, make_dirs, remove_paths
 from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import run, run_script
@@ -167,22 +167,12 @@ def install(env: dict[str, str]) -> int:
                   f"{'found' if lustre == 'ON' else 'not found'}",
              lustre=lustre, header=_LUSTRE_USER_H)
 
-    if install_deps(env) != 0:
+    if not (install_deps(env) == 0
+            and make_dirs(_INSTALL_PREFIX, _BUILD_DIR, _SRC_DIR, op=_OP)
+            and _unpack_source(env, version, url, sha256)
+            and _build_and_install(env, version, lustre)
+            and record_version("MPIFILEUTILS", version, _OP)):
         return 3
-    try:
-        for directory in (_INSTALL_PREFIX, _BUILD_DIR, _SRC_DIR):
-            os.makedirs(directory, exist_ok=True)       # bash: mkdir -p
-        if not (_unpack_source(env, version, url, sha256)
-                and _build_and_install(env, version, lustre)):
-            return 3
-        write_component_version("MPIFILEUTILS", version)
-    except OSError as exc:
-        # mkdir -p of the three dirs, or the versions file.
-        log_error(_OP, f"file operation failed: {exc}", path=getattr(exc, "filename", None))
-        return 3
-
-    log_info(_OP, f"Recorded MPIFILEUTILS={version}", component="MPIFILEUTILS",
-             version=version)
     log_info(_OP, f"mpifileutils {version} installed to {_INSTALL_PREFIX}",
              version=version, path=_INSTALL_PREFIX, lustre=lustre)
     return 0

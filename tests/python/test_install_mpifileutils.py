@@ -133,8 +133,9 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(download, "download_and_verify",
                                side_effect=fake_download) as dl, \
-             mock.patch.object(mfu, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(component_config, "log_info") as recorded, \
              mock.patch.object(mfu, "log_info") as info, \
              mock.patch.object(mfu, "log_warn") as warn, \
              mock.patch.object(mfu, "log_error", new=error), \
@@ -145,7 +146,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(files, "log_error", new=error):
             rc = mfu.install(env)
         self.env, self.download, self.record = env, dl, record
-        self.info, self.warn, self.error = info, warn, error
+        self.info, self.warn, self.error, self.recorded = info, warn, error, recorded
         return rc
 
     def _commands(self):
@@ -181,7 +182,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("=== Installing mpifileutils 0.12 ===", messages)
         self.assertIn(f"=== mpifileutils installed to {self.prefix} ===", messages)
         self.assertIn(f"Lustre support OFF: {self.header} not found", messages)
-        self.assertIn("Recorded MPIFILEUTILS=0.12", messages)
+        self.assertEqual(self.recorded.call_args.args[1], "Recorded MPIFILEUTILS 0.12")
         self.warn.assert_not_called()
         self.error.assert_not_called()
 
@@ -245,13 +246,13 @@ class InstallTests(unittest.TestCase):
     def test_unwritable_versions_file_returns_3(self):
         self.assertEqual(self._install(write_error=PermissionError("denied")), 3)
         self.assertEqual(self._commands()[-1][0], "ls")
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not record MPIFILEUTILS 0.12", self.error.call_args.args[1])
 
     def test_mkdir_failure_returns_3(self):
         Path(self.root, "opt").write_text("a file, not a dir")
         self.assertEqual(self._install(), 3)
         self.assertEqual(len(self.calls), 1)           # only the deps
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not create directory", self.error.call_args.args[1])
 
 
 if __name__ == "__main__":
