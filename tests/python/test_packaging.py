@@ -449,121 +449,223 @@ class HpcdiagTests(unittest.TestCase):
 
 
 class MonitoringToolsTests(unittest.TestCase):
-    def _env(self):
+    """install_monitoring_tools.py, compared command by command with
+    install_monitoring_tools.sh. /opt/azurehpc/tools and /etc/bash.bashrc are
+    pointed at a temporary directory; commands and the download are faked."""
+
+    _ALIAS = "alias moneo='python3 /opt/azurehpc/tools/Moneo/moneo.py'"
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tools = os.path.join(tmp.name, "opt", "azurehpc", "tools")
+        os.makedirs(self.tools)
+        self.moneo = os.path.join(self.tools, "Moneo")
+        self.service_dir = os.path.join(self.moneo, "linux_service")
+        self.bashrc = os.path.join(tmp.name, "bash.bashrc")
+        for name, value in (("_MONITOR_DIR", self.tools), ("_BASHRC", self.bashrc)):
+            patcher = mock.patch.object(install_monitoring_tools, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _env(self, distribution="ubuntu24.04", versions=None):
         return {
-            "COMPONENT_VERSIONS": json.dumps({
-                "moneo": {"common": {"version": "1.2.3", "sha256": "s"}}
+            "COMPONENT_VERSIONS": versions or json.dumps({
+                "moneo": {"common": {"version": "0.3.5", "sha256": "s"}}
             }),
-            "DISTRIBUTION": "ubuntu24.04",
+            "DISTRIBUTION": distribution,
             "ARCHITECTURE": "x86_64",
             "GPU": "NVIDIA",
             "SKU": "A100",
             "TARGET_NODE_TYPE": "azure_vm_regular",
         }
 
-    def test_get_config_resolves_version(self):
-        self.assertEqual(
-            install_monitoring_tools.config_for("moneo", self._env())["version"], "1.2.3")
+    def _install(self, env, *, fail=None, script_mode=0o755, real_configure=False,
+                 download_error=None):
+        """Run install(env) with commands faked. The fake tar creates
+        Moneo/linux_service/configure_service.sh (mode `script_mode`).
+        fail: {first word of command: exit code}. Returns (rc, calls, mocks),
+        calls being [(command, cwd)]."""
+        fail = fail or {}
+        calls = []
+        real_exec = install_monitoring_tools.exec_program
 
-    def test_extract_stripped_drops_top_level_dir(self):
-        import io
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            tar_path = os.path.join(tmp, "moneo.tar.gz")
-            with tarfile.open(tar_path, "w:gz") as tar:
-                data = b"hi"
-                info = tarfile.TarInfo("Moneo-1.2.3/moneo.py")
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-            dest = os.path.join(tmp, "Moneo")
-            os.makedirs(dest)
-            install_monitoring_tools.extract_stripped(tar_path, dest)
-            self.assertTrue(os.path.exists(os.path.join(dest, "moneo.py")))
-            self.assertFalse(os.path.exists(os.path.join(dest, "Moneo-1.2.3")))
+        def fake_download(url, sha256, dest_dir="."):
+            if download_error:
+                raise download_error
+            path = os.path.join(dest_dir, os.path.basename(url))
+            with open(path, "wb") as handle:
+                handle.write(b"tarball")
+            return path
 
-    def test_ensure_line_appends_when_missing(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bashrc")
-            self.assertTrue(install_monitoring_tools.ensure_line(path, "alias x='y'"))
-            with open(path) as handle:
-                self.assertEqual(handle.read(), "alias x='y'\n")
+        def fake_exec(command, op, *, cwd=None, env=None):
+            self.assertEqual(op, "install-monitoring-tools")
+            self.assertIs(env, self.env)
+            calls.append((command, cwd))
+            if command[0] == "tar" and "tar" not in fail:
+                script = os.path.join(cwd, command[-1], "linux_service",
+                                      "configure_service.sh")
+                os.makedirs(os.path.dirname(script))
+                with open(script, "w") as handle:
+                    handle.write("#!/bin/sh\necho configured\n")
+                os.chmod(script, script_mode)
+            if command == ["./configure_service.sh"] and real_configure:
+                return real_exec(command, op, cwd=cwd, env=env)
+            return fail.get(command[0], 0)
 
-    def test_ensure_line_skips_when_present(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bashrc")
-            with open(path, "w") as handle:
-                handle.write("alias x='y'\n")
-            self.assertFalse(install_monitoring_tools.ensure_line(path, "alias x='y'"))
-
-    def test_install_orchestrates(self):
-        env = self._env()
-        with mock.patch.object(install_monitoring_tools, "install_deps", return_value=0), \
-             mock.patch.object(install_monitoring_tools, "download_and_verify",
-                               return_value="/opt/azurehpc/tools/v1.2.3.tar.gz") as dl, \
-             mock.patch.object(install_monitoring_tools, "extract_stripped") as ex, \
-             mock.patch.object(install_monitoring_tools, "exec_program", return_value=0), \
-             mock.patch.object(install_monitoring_tools, "ensure_line") as el, \
+        self.env = env
+        with mock.patch.object(install_monitoring_tools, "download_and_verify",
+                               side_effect=fake_download) as download, \
+             mock.patch.object(install_monitoring_tools, "exec_program",
+                               side_effect=fake_exec), \
              mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
-             mock.patch("os.makedirs"), \
-             mock.patch("os.chmod"), \
-             mock.patch("os.remove"):
+             mock.patch.object(install_monitoring_tools, "log_info") as info, \
+             mock.patch.object(install_monitoring_tools, "log_warn") as warn, \
+             mock.patch.object(install_monitoring_tools, "log_error") as error:
             rc = install_monitoring_tools.install(env)
+        return rc, calls, {"download": download, "record": wcv, "info": info,
+                           "warn": warn, "error": error}
+
+    def _expected(self, pip):
+        return [(pip, None),
+                (["tar", "-xvf", "v0.3.5.tar.gz", "--strip-components=1", "-C", "Moneo"],
+                 self.tools),
+                (["./configure_service.sh"], self.service_dir)]
+
+    # ---- pure helpers ----------------------------------------------------------
+    def test_pip_command_per_distro(self):
+        cases = {
+            "azurelinux3.0": ["dnf", "install", "-y", "python3-pip"],
+            "ubuntu24.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
+            "ubuntu26.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
+            "ubuntu22.04": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+            "almalinux9.8": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+            "rhel8.10": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+        }
+        for distro, command in cases.items():
+            with self.subTest(distro=distro):
+                self.assertEqual(install_monitoring_tools.pip_command(distro), command)
+
+    def test_ensure_line_matches_grep_qxF(self):
+        line = "alias x='y'"
+        cases = [
+            # (existing content, appended?, final content)
+            (None, True, b"alias x='y'\n"),
+            (b"alias x='y'\n", False, b"alias x='y'\n"),
+            (b"a\nalias x='y'", False, b"a\nalias x='y'"),              # no final newline
+            (b"alias x='y'\r\n", True, b"alias x='y'\r\nalias x='y'\n"),   # grep: \r is part of the line
+            (b"  alias x='y'\n", True, b"  alias x='y'\nalias x='y'\n"),   # -x: whole line
+            (b"last", True, b"lastalias x='y'\n"),                       # echo >> joins, like bash
+        ]
+        for before, appended, after in cases:
+            with self.subTest(before=before):
+                if os.path.exists(self.bashrc):
+                    os.remove(self.bashrc)
+                if before is not None:
+                    with open(self.bashrc, "wb") as handle:
+                        handle.write(before)
+                self.assertIs(install_monitoring_tools.ensure_line(self.bashrc, line),
+                              appended)
+                with open(self.bashrc, "rb") as handle:
+                    self.assertEqual(handle.read(), after)
+
+    # ---- install() -------------------------------------------------------------
+    def test_install_commands_per_distro(self):
+        cases = {
+            "ubuntu24.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
+            "ubuntu26.04": ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"],
+            "azurelinux3.0": ["dnf", "install", "-y", "python3-pip"],
+            "ubuntu22.04": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+            "almalinux9.8": ["python3", "-m", "pip", "install", "--upgrade", "pip"],
+        }
+        for distro, pip in cases.items():
+            with self.subTest(distro=distro):
+                self.tearDown_moneo()
+                rc, calls, m = self._install(self._env(distro))
+                self.assertEqual(rc, 0)
+                self.assertEqual(calls, self._expected(pip))
+                m["download"].assert_called_once_with(
+                    "https://github.com/Azure/Moneo/archive/refs/tags/v0.3.5.tar.gz",
+                    "s", dest_dir=self.tools)
+                m["record"].assert_called_once_with("MONEO", "0.3.5")
+                m["warn"].assert_not_called()
+                m["error"].assert_not_called()
+
+    def tearDown_moneo(self):
+        import shutil
+        shutil.rmtree(self.moneo, ignore_errors=True)
+
+    def test_install_files_and_logs(self):
+        rc, _, m = self._install(self._env())
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        ex.assert_called_once()
-        el.assert_called_once()
-        wcv.assert_called_once()
+        self.assertEqual(os.stat(self.moneo).st_mode & 0o777, 0o777)        # chmod 777 Moneo
+        self.assertTrue(os.path.exists(os.path.join(self.tools, "v0.3.5.tar.gz")))  # left, as bash
+        with open(self.bashrc) as handle:
+            self.assertEqual(handle.read(), self._ALIAS + "\n")
+        messages = [c.args[1] for c in m["info"].call_args_list]
+        self.assertIn(f"Appended the moneo alias to {self.bashrc}", messages)
+        self.assertIn("Recorded MONEO version 0.3.5", messages)
+        self.assertEqual(m["info"].call_args_list[-1].args[1], "Moneo 0.3.5 installed")
 
-    def test_install_fails_when_configure_fails(self):
-        env = self._env()
-        with mock.patch.object(install_monitoring_tools, "install_deps", return_value=0), \
-             mock.patch.object(install_monitoring_tools, "download_and_verify",
-                               return_value="/opt/azurehpc/tools/v1.2.3.tar.gz"), \
-             mock.patch.object(install_monitoring_tools, "extract_stripped"), \
-             mock.patch.object(install_monitoring_tools, "exec_program", return_value=1), \
-             mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
-             mock.patch.object(install_monitoring_tools, "log_error") as logged, \
-             mock.patch("os.makedirs"), \
-             mock.patch("os.chmod"):
-            rc = install_monitoring_tools.install(env)
+    def test_rerun_keeps_existing_moneo_dir_without_extracting(self):
+        # bash: `mkdir Moneo && tar ...` - mkdir fails, tar is skipped, set -e
+        # doesn't stop, and the rest runs on the old contents.
+        self._install(self._env())
+        rc, calls, m = self._install(self._env())
+        self.assertEqual(rc, 0)
+        pip = ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"]
+        self.assertEqual(calls, [(pip, None), (["./configure_service.sh"], self.service_dir)])
+        self.assertEqual(m["warn"].call_args.kwargs, {"path": self.moneo})
+        with open(self.bashrc) as handle:
+            self.assertEqual(handle.read(), self._ALIAS + "\n")      # not appended twice
+        self.assertIn(f"{self.bashrc} already has the moneo alias",
+                      [c.args[1] for c in m["info"].call_args_list])
+
+    @unittest.skipUnless(os.name == "posix", "runs a real script")
+    def test_configure_service_runs_from_its_folder_with_the_exec_bit(self):
+        rc, calls, m = self._install(self._env(), real_configure=True)
+        self.assertEqual(rc, 0)
+        m["error"].assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "runs a real script")
+    def test_configure_service_without_exec_bit_fails_clearly(self):
+        rc, calls, m = self._install(self._env(), script_mode=0o644, real_configure=True)
         self.assertEqual(rc, 3)
-        wcv.assert_not_called()
-        logged.assert_called()   # configure failure is reported as an error
+        m["record"].assert_not_called()
+        error = m["error"].call_args
+        self.assertIn("not executable", error.args[1])
+        self.assertEqual((error.kwargs["exists"], error.kwargs["executable"]), (True, False))
 
-    def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_monitoring_tools, "log_error") as logged:
-            self.assertEqual(
-                install_monitoring_tools.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
-        logged.assert_called_once()   # missing version is reported as an error
+    def test_each_failing_command_returns_3_and_stops(self):
+        expected = self._expected(["apt-get", "install", "-y", "--only-upgrade",
+                                   "python3-pip"])
+        for index, word in enumerate(["apt-get", "tar", "./configure_service.sh"]):
+            with self.subTest(failing=word):
+                self.tearDown_moneo()
+                rc, calls, m = self._install(self._env(), fail={word: 1})
+                self.assertEqual(rc, 3)
+                self.assertEqual(calls, expected[:index + 1])
+                m["record"].assert_not_called()
+                if word == "apt-get":
+                    m["download"].assert_not_called()
 
-    def test_install_deps_uses_python3_pip_package_on_24_04_26_04_and_azurelinux(self):
-        # bash: elif [[ $DISTRIBUTION == "ubuntu24.04" ]] || [[ $DISTRIBUTION == "ubuntu26.04" ]]
-        for distro in ("ubuntu24.04", "ubuntu26.04", "azurelinux3.0"):
-            with self.subTest(distro=distro):
-                with mock.patch.object(install_monitoring_tools, "PackageInstaller") as PI, \
-                     mock.patch.object(install_monitoring_tools, "exec_program") as ex:
-                    PI.return_value.manager = object()
-                    PI.return_value.install_package.return_value = True
-                    rc = install_monitoring_tools.install_deps({"DISTRIBUTION": distro})
-                self.assertEqual(rc, 0)
-                PI.return_value.install_package.assert_called_once_with(["python3-pip"])
-                ex.assert_not_called()
+    def test_download_failure_returns_3(self):
+        rc, calls, m = self._install(self._env(), download_error=OSError("404"))
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(calls), 1)                 # only the pip command
+        self.assertFalse(os.path.exists(self.moneo))
+        m["record"].assert_not_called()
 
-    def test_install_deps_upgrades_pip_elsewhere(self):
-        for distro in ("ubuntu22.04", "almalinux9.8", "rhel8.10"):
-            with self.subTest(distro=distro):
-                env = {"DISTRIBUTION": distro}
-                with mock.patch.object(install_monitoring_tools, "PackageInstaller") as PI, \
-                     mock.patch.object(install_monitoring_tools, "exec_program",
-                                       return_value=0) as ex:
-                    rc = install_monitoring_tools.install_deps(env)
-                self.assertEqual(rc, 0)
-                PI.assert_not_called()
-                ex.assert_called_once_with(
-                    ["python3", "-m", "pip", "install", "--upgrade", "pip"],
-                    "install-monitoring-tools", env=env)
+    def test_missing_version_or_sha256_returns_3_before_anything_runs(self):
+        for versions in (json.dumps({}),
+                         json.dumps({"moneo": {"common": {"version": "0.3.5"}}})):
+            with self.subTest(versions=versions):
+                rc, calls, m = self._install(self._env(versions=versions))
+                self.assertEqual(rc, 3)
+                self.assertEqual(calls, [])
+                m["download"].assert_not_called()
+                m["error"].assert_called_once()
 
 
 class AznfsTests(unittest.TestCase):
