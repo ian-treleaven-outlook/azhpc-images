@@ -20,6 +20,7 @@ import json
 import os
 import tarfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from utils import component_config
@@ -333,44 +334,67 @@ class LibfabricInstallTests(unittest.TestCase):
         }
 
     def test_get_config_resolves_version(self):
-        self.assertEqual(install_libfabric.config_for("libfabric", self._env())["version"], "2.5.0")
+        cfg = install_libfabric.require_config("libfabric", self._env(), "install-libfabric",
+                                               "version", "url", "sha256")
+        self.assertEqual(cfg["version"], "2.5.0")
+
+    _TARBALL = "/tmp/libfabric-2.5.0.tar.bz2"
+    _EXPECTED = [
+        (["tar", "-xf", "/tmp/libfabric-2.5.0.tar.bz2"], "/tmp"),
+        (["/tmp/libfabric-2.5.0/configure", "--prefix=/opt/libfabric", "--disable-psm3"],
+         "/tmp/libfabric-2.5.0"),
+        (["make", "-j", "8"], "/tmp/libfabric-2.5.0"),
+        (["make", "install"], "/tmp/libfabric-2.5.0"),
+    ]
+
+    def _install(self, rcs=None):
+        """Run install() with every command recorded (via exec_program) in order."""
+        commands = []
+        rcs = iter(rcs or [])
+
+        def record(command, op, *, cwd=None, env=None, **_):
+            commands.append((command, cwd))
+            return next(rcs, 0)
+
+        with mock.patch.object(install_libfabric, "fetch_verified",
+                               return_value=self._TARBALL) as dl, \
+             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
+             mock.patch.object(install_libfabric, "remove_paths") as rm, \
+             mock.patch.object(install_libfabric.os, "cpu_count", return_value=8), \
+             mock.patch("utils.process.exec_program", side_effect=record):
+            rc = install_libfabric.install(self._env())
+        return rc, commands, dl, wcv, rm
 
     def test_install_runs_all_build_steps(self):
-        env = self._env()
-        with mock.patch.object(install_libfabric, "download_and_verify",
-                               return_value="/tmp/libfabric-2.5.0.tar.bz2") as dl, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
-             mock.patch.object(install_libfabric, "exec_program", return_value=0) as ex, \
-             mock.patch("tarfile.open"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_libfabric.install(env)
+        rc, commands, dl, wcv, rm = self._install()
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        self.assertEqual(ex.call_count, 3)  # configure, make, make install
-        wcv.assert_called_once()
+        dl.assert_called_once_with("https://example/libfabric-2.5.0.tar.bz2", "s",
+                                   "install-libfabric", dest_dir="/tmp")
+        self.assertEqual(commands, self._EXPECTED)
+        wcv.assert_called_once_with("LIBFABRIC", "2.5.0")
+        rm.assert_called_once_with(Path("/tmp/libfabric-2.5.0"), self._TARBALL,
+                                   op="install-libfabric")
 
     def test_install_stops_on_build_failure(self):
-        env = self._env()
-        with mock.patch.object(install_libfabric, "download_and_verify",
-                               return_value="/tmp/libfabric-2.5.0.tar.bz2"), \
-             mock.patch.object(install_libfabric, "exec_program",
-                               side_effect=[0, 1]) as ex, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
-             mock.patch.object(install_libfabric, "log_error") as logged, \
-             mock.patch("tarfile.open"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_libfabric.install(env)
+        rc, commands, _, wcv, rm = self._install(rcs=[0, 0, 1])
         self.assertEqual(rc, 3)
-        self.assertEqual(ex.call_count, 2)  # stopped after make failed
+        self.assertEqual(commands, self._EXPECTED[:3])  # stopped after make failed
         wcv.assert_not_called()
-        logged.assert_called()   # build failure is reported as an error
+        rm.assert_not_called()
+
+    def test_install_stops_on_download_failure(self):
+        with mock.patch.object(install_libfabric, "fetch_verified", return_value=None), \
+             mock.patch("utils.process.exec_program") as ex, \
+             mock.patch.object(install_libfabric, "write_component_version") as wcv:
+            self.assertEqual(install_libfabric.install(self._env()), 3)
+        ex.assert_not_called()
+        wcv.assert_not_called()
 
     def test_install_fails_when_no_version(self):
-        with mock.patch.object(install_libfabric, "log_error") as logged:
+        with mock.patch("utils.component_config.log_error") as logged:
             self.assertEqual(
                 install_libfabric.install({"COMPONENT_VERSIONS": json.dumps({})}), 3)
         logged.assert_called_once()   # missing version is reported as an error
-
 
 class IntelLibsInstallTests(unittest.TestCase):
     def _env(self):
