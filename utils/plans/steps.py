@@ -32,6 +32,9 @@ from components.python import (
 )
 from components.python import azurelinux_network_config as azl_network_config
 from components.python import fix_setools_cyclecloud
+# Imported under a short name: the step function below is called
+# rhel_family_network_config, and would hide the module's own name.
+from components.python import rhel_family_network_config as rhel_net_config
 from utils.logger import log_info
 from utils.plans.step import Step
 from utils.process import exec_program
@@ -246,3 +249,8 @@ def setools_cyclecloud(**kw):
     """fix_setools_cyclecloud.sh, right after install_utils.sh."""
     return Step("fix-setools-cyclecloud", "fix_setools_cyclecloud.sh",
                 action=fix_setools_cyclecloud.install, **kw)
+
+def rhel_family_network_config(**kw):
+    """./network-config.sh (the same script in all six AlmaLinux, Rocky and RHEL folders)."""
+    return Step("network-config", "network-config.sh", base="distro",
+                action=rhel_net_config.install, **kw)
