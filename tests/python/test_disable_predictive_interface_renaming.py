@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 from components.python import disable_predictive_interface_renaming as renaming
+from utils import process
 from utils.build_config import BuildConfig, build_plan
 
 # What bash searches for when GRUB_CMDLINE_LINUX is unset (note the leading space).
@@ -100,7 +101,7 @@ class InstallTests(unittest.TestCase):
                 f.write(contents)
         env = {"DISTRIBUTION": "ubuntu24.04"} if env is None else env
         with mock.patch.object(renaming, "_GRUB_SETTINGS_FILE", self.path), \
-             mock.patch.object(renaming, "exec_program",
+             mock.patch.object(process, "exec_program",
                                return_value=grub_rc) as run, \
              mock.patch.object(renaming, "log_info") as log_info, \
              mock.patch.object(renaming, "log_warn") as log_warn, \
@@ -120,7 +121,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._read(), _CFG_UPDATED)
         run.assert_called_once_with(
-            ["update-grub"], "disable-predictive-interface-renaming", env=env)
+            ["update-grub"], "disable-predictive-interface-renaming", cwd=None, env=env)
         log_error.assert_not_called()
         self.log_warn.assert_not_called()
         added = self.log_info.call_args_list[0]
@@ -185,7 +186,7 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         run.assert_called_once()
-        log_error.assert_called_once()
+        log_error.assert_not_called()      # exec_program logs the failed command
 
 
 # --------------------------------------------------------------------------- #
