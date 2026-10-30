@@ -22,8 +22,14 @@ order: `install-rdma-core` (install_rdma_core) and `blacklist-mana-ib`
 cleanup step.
 
 Only Ubuntu 24.04's install.sh has this branch (NCv6 is built on Ubuntu 24.04
-only), so the apt-get command is Ubuntu's. The package-manager abstraction
-work in ADO 991 will move it behind utils/package_installer.py.
+only). The package list is the port's; install_packages()
+(utils/package_installer.py) picks apt-get from DISTRIBUTION and installs it
+in one command, as bash does.
+
+Deliberate differences
+----------------------
+  * install_packages() runs `apt-get install -y -o Dpkg::Use-Pty=0 ...`
+    (the documented normalisation; same packages, same single command).
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from utils.logger import log_error, log_info
-from utils.process import exec_program
+from utils.package_installer import install_packages
 
 RDMA_CORE_PACKAGES = ["rdma-core", "libibverbs-dev", "ibverbs-utils",
                       "librdmacm-dev", "pkg-config"]
@@ -43,14 +49,12 @@ BLACKLIST_TEXT = "blacklist mana_ib\n"
 
 
 def install_rdma_core(env: dict[str, str]) -> int:
-    """apt-get install the kernel-native RDMA userspace packages. 0, or 3 on failure."""
+    """Install the kernel-native RDMA userspace packages. 0, or 3 on failure."""
     op = "install-rdma-core"
     log_info(op, "Installing rdma-core for a no-RDMA SKU (kernel-native IB "
                  "modules, mana_ib support)",
              sku=env.get("SKU", ""), packages=" ".join(RDMA_CORE_PACKAGES))
-    rc = exec_program(["apt-get", "install", "-y", *RDMA_CORE_PACKAGES], op, env=env)
-    if rc != 0:
-        log_error(op, f"apt-get install failed with exit code {rc}", exit_code=rc)
+    if not install_packages(RDMA_CORE_PACKAGES, env, op):
         return 3
     return 0
 

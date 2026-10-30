@@ -107,6 +107,8 @@ Behaviour kept from bash
 
 Deliberate differences from bash
 --------------------------------
+  * Installs go through install_packages(), which spells them
+    `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y`.
   * Missing config fails up front: version always; url + sha256 for a public
     package; repo_file + sha256 for a private one.
   * OFED: a failing `ofed_info` or a first line with fewer than four
@@ -144,6 +146,7 @@ from utils.component_config import config_for, write_component_version
 from utils.dkms import check_dkms_status, running_kernel
 from utils.download import download_and_verify, verify_checksum
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 from utils.sku import sku_uses_ipoib
 
@@ -184,6 +187,11 @@ _NO_PEER_MEM_PATCH_SKU = "V100"
 
 # DOCA from this version on no longer needs the marker to provide sharp.
 _SHARP_PROVIDE_BEFORE = "3.3.0"
+
+_DOCA_OFED = "doca-ofed"
+# What builds the marker packages.
+_APT_MARKER_TOOLS = ["equivs"]
+_RPM_MARKER_TOOLS = ["rpm-build"]
 
 _UBUNTU_DKMS_MODULES = ["mlnx-ofed-kernel", "iser", "isert", "srp"]
 _RHEL_DKMS_MODULES = ["mlnx-ofa_kernel", "iser", "isert", "srp"]
@@ -497,7 +505,7 @@ def _install_apt_marker(env: dict[str, str], doca_version: str) -> bool:
     Provides Open MPI / UCX (and, before DOCA 3.3.0, SHARP), so doca-ofed's
     strict dependencies don't pull DOCA's own copies, and Conflicts with
     Canonical's Open MPI."""
-    if not _run(["apt-get", "install", "-y", "equivs"], env):
+    if not install_packages(_APT_MARKER_TOOLS, env, _OP):
         return False
     openmpi = _apt_cache_version("openmpi", env)
     if not openmpi:
@@ -530,7 +538,7 @@ def _install_apt_marker(env: dict[str, str], doca_version: str) -> bool:
     if not _run(["equivs-build", control], env, cwd=_MARKER_WORK_DIR):
         return False
     debs = expand_glob(os.path.join(_MARKER_WORK_DIR, f"{_MARKER}_*_all.deb"))
-    if not _run(["apt", "install", "-y", *debs], env, cwd=_MARKER_WORK_DIR):
+    if not install_packages(debs, env, _OP, cwd=_MARKER_WORK_DIR):
         return False
     # bash: rm -f <debs> <control>
     for path in [*debs, control]:
@@ -546,7 +554,7 @@ def _install_rpm_marker(env: dict[str, str], doca_version: str) -> bool:
     Open MPI / UCX / HCOLL / SHARP packages doca-ofed requires."""
     if not _command_exists("rpmbuild", env):
         log_info(_OP, "rpmbuild not found: installing rpm-build")
-        if not _run(["dnf", "-y", "install", "rpm-build"], env):
+        if not install_packages(_RPM_MARKER_TOOLS, env, _OP):
             return False
 
     topdir = os.path.join(_MARKER_WORK_DIR, f"{_MARKER}-rpmbuild")
@@ -651,7 +659,7 @@ def _check_dkms(env: dict[str, str], modules: list[str]) -> bool:
 # --------------------------------------------------------------------------- #
 def _install_ubuntu(env, doca_version: str, doca_file: str, work_dir: str) -> bool:
     deb = os.path.realpath(os.path.join(work_dir, doca_file))   # "$(realpath ...)"
-    if not _run(["apt", "install", "-y", deb], env, cwd=work_dir):
+    if not install_packages([deb], env, _OP, cwd=work_dir):
         return False
     _write_file(_DKMS_PIN, _DKMS_PIN_CONTENT)
     if not _run(["apt-get", "update"], env):
@@ -660,7 +668,7 @@ def _install_ubuntu(env, doca_version: str, doca_file: str, work_dir: str) -> bo
         return False
     _configure_doca_dkms_patches(env, "mlnx-ofed-kernel")
     _configure_xdp_patch(env, doca_version)
-    if not _run(["apt-get", "-y", "install", "doca-ofed"], env):
+    if not install_packages([_DOCA_OFED], env, _OP):
         return False
     return _check_dkms(env, _UBUNTU_DKMS_MODULES)
 
@@ -673,7 +681,7 @@ def _install_azurelinux(env, doca_version: str, doca_file: str, work_dir: str,
         return False
     if not _install_rpm_marker(env, doca_version):
         return False
-    return _run(["dnf", "-y", "install", "doca-ofed"], env)
+    return install_packages([_DOCA_OFED], env, _OP)
 
 
 def _install_rhel(env, doca_version: str, doca_file: str, work_dir: str,
@@ -704,7 +712,7 @@ def _install_rhel(env, doca_version: str, doca_file: str, work_dir: str,
 
 def _configure_rhel_dkms_and_install(env) -> bool:
     _configure_doca_dkms_patches(env, "mlnx-ofa_kernel")
-    if not _run(["dnf", "-y", "install", "doca-ofed"], env):
+    if not install_packages([_DOCA_OFED], env, _OP):
         return False
     return _check_dkms(env, _RHEL_DKMS_MODULES)
 

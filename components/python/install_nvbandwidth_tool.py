@@ -76,6 +76,9 @@ install() returns 0 for success or 3 for failure. It logs problems and returns
 
 Deliberate differences from bash
 --------------------------------
+  * The dependency installs go through install_packages(), which normalises
+    the spellings: `apt install -y` -> `apt-get install -y -o Dpkg::Use-Pty=0`,
+    `dnf -y install` -> `dnf install -y`.
   * Checks first: a missing version or url fails before anything is
     installed. Bash would install the dependencies, then try
     `git clone --branch vnull null`.
@@ -105,6 +108,7 @@ import shutil
 
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program
 from utils.repo_source import write_repo_source_info
 
@@ -128,18 +132,18 @@ _AZURE_LINUX = "azurelinux3.0"
 # --------------------------------------------------------------------------- #
 # Pure helpers: no side effects, so tests call them directly.
 # --------------------------------------------------------------------------- #
-def dependency_commands(distribution: str, arch: str) -> tuple[list[str], ...]:
-    """The dependency install commands bash runs, in order; () if bash has no
-    branch for this distro (it then installs nothing and carries on)."""
+def dependency_packages(distribution: str, arch: str) -> tuple[list[str], ...]:
+    """The dependency package lists bash installs, one per install command, in
+    order; () if bash has no branch for this distro (it then installs nothing
+    and carries on)."""
     if "ubuntu" in distribution:                       # == *"ubuntu"*
-        return (["apt", "install", "-y", "libboost-program-options-dev"],)
+        return (["libboost-program-options-dev"],)
     if distribution.startswith("almalinux"):           # == almalinux*
-        return (["dnf", "-y", "install", "boost-devel"],)
+        return (["boost-devel"],)
     if distribution == _AZURE_LINUX and arch != "aarch64":
-        return (["dnf", "-y", "install", "boost-devel"],)
+        return (["boost-devel"],)
     if distribution == _AZURE_LINUX and arch == "aarch64":
-        return (["dnf", "install", "-y", "boost-devel", "boost-program-options"],
-                ["dnf", "install", "-y", "cmake"])
+        return (["boost-devel", "boost-program-options"], ["cmake"])
     return ()
 
 
@@ -305,12 +309,13 @@ def install(env: dict[str, str]) -> int:
         return 3
 
     # ---- 2. Build dependencies --------------------------------------------
-    deps = dependency_commands(distribution, arch)
+    deps = dependency_packages(distribution, arch)
     if deps:
         log_info(_OP, f"Installing the build dependencies for {distribution}/{arch}",
                  distro=distribution, arch=arch,
-                 packages=" ".join(word for command in deps for word in command[3:]))
-        if not _run_all(deps, env):
+                 packages=" ".join(package for packages in deps for package in packages))
+        # One install per bash command, stopping at the first failure.
+        if not all(install_packages(packages, env, _OP) for packages in deps):
             return 3
     else:
         # BASH QUIRK (kept): no branch for this distro, so no Boost; the build

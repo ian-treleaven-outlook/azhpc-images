@@ -1,7 +1,9 @@
 """Unit tests for components/python/install_mpifileutils.py.
 
 install() runs with every external effect mocked (config lookup, download,
-exec_program, versions file) and its directories and the Lustre header path
+exec_program - in install_mpifileutils and, for the apt-get/dnf dependency
+install, in utils.package_installer - and the versions file) and its
+directories and the Lustre header path
 pointed into a temporary directory. The expected commands are the ones
 components/install_mpifileutils.sh (upstream 0c2b8f9) runs, in its order and
 working directories. install_deps' per-distro commands are also covered in
@@ -21,9 +23,13 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_mpifileutils as mfu
+from utils import package_installer
 
 _OP = "install-mpifileutils"
 _URL = "https://github.com/hpc/mpifileutils/releases/download/v0.12/mpifileutils-v0.12.tgz"
+# What install_packages() runs for bash's `apt-get install -y` / `dnf install -y`.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
 
 
 class PureHelperTests(unittest.TestCase):
@@ -51,13 +57,21 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(mfu._SRC_DIR, "/tmp/mpifileutils-src")
         self.assertEqual(mfu.tarball_name("0.12"), "mpifileutils-v0.12.tgz")
 
-    def test_deps_command_branches(self):
-        self.assertEqual(mfu.deps_command("ubuntu24.04"), (
-            ["apt-get", "install", "-y", "libbz2-dev", "libattr1-dev", "libarchive-dev",
-             "libssl-dev", "libcap-dev"], "ubuntu"))
-        rpm = ["dnf", "install", "-y", "bzip2-devel", "libattr-devel", "libarchive-devel"]
-        self.assertEqual(mfu.deps_command("azurelinux3.0"), (rpm, "azurelinux"))
-        self.assertEqual(mfu.deps_command("rocky9.6"), (rpm, "rhel-family"))
+    def test_deps_packages_branches(self):
+        self.assertEqual(mfu.deps_packages("ubuntu24.04"), (
+            ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"],
+            "ubuntu"))
+        rpm = ["bzip2-devel", "libattr-devel", "libarchive-devel"]
+        self.assertEqual(mfu.deps_packages("azurelinux3.0"), (rpm, "azurelinux"))
+        self.assertEqual(mfu.deps_packages("rocky9.6"), (rpm, "rhel-family"))
+
+    def test_deps_packages_match_bash(self):
+        bash = (Path(__file__).resolve().parents[2] / "components"
+                / "install_mpifileutils.sh").read_text(encoding="utf-8")
+        for line in ("apt-get install -y " + " ".join(mfu._UBUNTU_DEPS),
+                     "dnf install -y " + " ".join(mfu._RPM_DEPS)):
+            with self.subTest(line=line):
+                self.assertIn(line + "\n", bash)
 
     def test_build_script_is_the_bash_build_lines(self):
         with mock.patch.multiple(mfu, _SRC_DIR="/s", _INSTALL_PREFIX="/p"):
@@ -113,13 +127,18 @@ class InstallTests(unittest.TestCase):
             path.write_bytes(b"tgz")
             return path
 
+        # The dependency install runs in utils.package_installer; the same fake
+        # records it in self.calls, and its failure log goes to `error`.
         with mock.patch.object(mfu, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(mfu, "download_and_verify", side_effect=fake_download) as dl, \
              mock.patch.object(mfu, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(mfu, "log_info") as info, \
              mock.patch.object(mfu, "log_warn") as warn, \
-             mock.patch.object(mfu, "log_error") as error:
+             mock.patch.object(mfu, "log_error") as error, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error", new=error):
             rc = mfu.install(env)
         self.env, self.download, self.record = env, dl, record
         self.info, self.warn, self.error = info, warn, error
@@ -139,7 +158,7 @@ class InstallTests(unittest.TestCase):
 
     def test_ubuntu_full_command_list(self):
         self.assertEqual(self._install(), 0)
-        deps = ["apt-get", "install", "-y", "libbz2-dev", "libattr1-dev", "libarchive-dev",
+        deps = [*_APT, "libbz2-dev", "libattr1-dev", "libarchive-dev",
                 "libssl-dev", "libcap-dev"]
         self.assertEqual([(c[0], c[1]) for c in self.calls], self._expected(deps))
         for _, _, env in self.calls:
@@ -158,7 +177,7 @@ class InstallTests(unittest.TestCase):
         self.error.assert_not_called()
 
     def test_rpm_distros_use_the_dnf_command(self):
-        rpm = ["dnf", "install", "-y", "bzip2-devel", "libattr-devel", "libarchive-devel"]
+        rpm = [*_DNF, "bzip2-devel", "libattr-devel", "libarchive-devel"]
         for distro in ("azurelinux3.0", "almalinux9.8", "rhel8.10"):
             with self.subTest(distro=distro):
                 self.assertEqual(self._install(distro=distro), 0)

@@ -9,8 +9,9 @@ step installs nmap from the distro's package repositories instead:
 
   * page size is not 64 KB         ->  nothing to do
   * 64 KB and nmap already on PATH ->  nothing to do (log its version)
-  * 64 KB, no nmap                 ->  Ubuntu:          apt-get install -y nmap
-                                       everything else: dnf install -y nmap
+  * 64 KB, no nmap                 ->  install_packages(["nmap"]):
+                                       Ubuntu: apt-get, Azure Linux and the
+                                       RHEL family: dnf;
                                        then nmap must be on PATH
 
 The original bash, for comparison (added upstream in #598; #614 only removed
@@ -74,6 +75,11 @@ Deliberate differences
     function or alias named nmap; a non-interactive build script has none).
   * Exit codes: 3 instead of bash's 1 (from `set -e` or `exit 1`), as for every
     action.
+  * nmap is installed with install_packages(), which picks the manager from
+    DISTRIBUTION (`apt-get install -y -o Dpkg::Use-Pty=0 nmap` on Ubuntu,
+    `dnf install -y nmap` otherwise). Bash's else branch would also try dnf
+    on a distribution it doesn't know (or an empty one); install_packages()
+    logs an error and the step returns 3 instead.
 """
 
 from __future__ import annotations
@@ -82,7 +88,8 @@ import os
 import shutil
 
 from utils.logger import log_error, log_info
-from utils.process import exec_program, run_capture
+from utils.package_installer import install_packages
+from utils.process import run_capture
 
 # The Step's `op` label in build_config.py. Every log line from this module uses it.
 _OP = "install-azsecpack-prereqs"
@@ -91,12 +98,9 @@ _OP = "install-azsecpack-prereqs"
 # AzSecPack's own nmap fails.
 _PAGE_SIZE_64K = 65536
 
+# The command and the package have the same name on every distro. Bash runs
+# no `apt-get update` first: earlier build steps have refreshed the lists.
 _NMAP = "nmap"
-
-# The package-manager commands bash runs (no `apt-get update` first, as in bash:
-# earlier build steps have already refreshed the package lists).
-_APT_INSTALL = ["apt-get", "install", "-y", _NMAP]
-_DNF_INSTALL = ["dnf", "install", "-y", _NMAP]
 
 
 def page_size() -> int:
@@ -106,17 +110,6 @@ def page_size() -> int:
     turns that into a logged error.
     """
     return os.sysconf("SC_PAGE_SIZE")
-
-
-def install_command(distribution: str) -> list[str]:
-    """The command that installs nmap on `distribution`.
-
-    Mirrors bash's `[[ $DISTRIBUTION == *"ubuntu"* ]]`: any distribution name
-    that CONTAINS "ubuntu" uses apt-get; everything else (Azure Linux,
-    AlmaLinux, Rocky, RHEL, or an empty name) uses dnf.
-    """
-    # list(...) returns a copy, so a caller can't change the constant.
-    return list(_APT_INSTALL if "ubuntu" in distribution else _DNF_INSTALL)
 
 
 def first_line(output: str) -> str:
@@ -151,7 +144,8 @@ def install(env: dict[str, str]) -> int:
     """On a 64 KB-page kernel, make sure the distro's nmap is installed.
 
     `env` is the build environment made by component_env() in build_config.py.
-    DISTRIBUTION picks apt-get or dnf; PATH is searched for nmap.
+    DISTRIBUTION picks apt-get or dnf (in install_packages()); PATH is
+    searched for nmap.
 
     Returns 0 on success and 3 on failure.
     """
@@ -180,25 +174,23 @@ def install(env: dict[str, str]) -> int:
 
     # ---- 3. Install from the distro ----------------------------------------
     distribution = env.get("DISTRIBUTION", "")
-    command = install_command(distribution)
     log_info(_OP, "nmap not found on PATH; installing it from the distro",
-             distribution=distribution, package_manager=command[0])
-    rc = exec_program(command, _OP, env=env)
-    if rc != 0:
-        # exec_program has already logged the command's output; say what it means.
+             distribution=distribution)
+    if not install_packages([_NMAP], env, _OP):
+        # install_packages has already logged the command and its exit code;
+        # say what the failure means.
         log_error(_OP, "could not install nmap; AzSecPack would be left without "
                        "a working nmap on this 64 KB-page kernel",
-                  command=" ".join(command), exit_code=rc)
+                  package=_NMAP, distribution=distribution)
         return 3
 
     # ---- 4. Check the install worked (bash: second command -v nmap) --------
     path = _nmap_path(env)
     if path is None:
         log_error(_OP, "nmap package installed but nmap binary is not available",
-                  command=" ".join(command), search_path=env.get("PATH"))
+                  package=_NMAP, search_path=env.get("PATH"))
         return 3
 
     version = _nmap_version(env)
-    log_info(_OP, f"OK - nmap installed: {version}", path=path, version=version,
-             package_manager=command[0])
+    log_info(_OP, f"OK - nmap installed: {version}", path=path, version=version)
     return 0

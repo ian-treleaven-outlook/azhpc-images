@@ -66,6 +66,11 @@ Behaviour kept from bash
 
 Deliberate differences from bash
 --------------------------------
+  * The dependency install goes through install_packages()
+    (utils/package_installer.py), which runs `apt-get install -y -o
+    Dpkg::Use-Pty=0` / `dnf install -y` (bash: `apt-get install -y` /
+    `dnf install -y`). A DISTRIBUTION it has no manager for fails there (3);
+    bash's else branch would run dnf anyway.
   * A missing version, url or sha256 in versions.json fails up front (3),
     before anything is installed. Bash carries on with empty values and fails
     later (or builds "mpifileutils-v").
@@ -82,6 +87,7 @@ import os
 from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -97,10 +103,10 @@ _SRC_DIR = "/tmp/mpifileutils-src"
 # Building with Lustre support needs this header from the Lustre client.
 _LUSTRE_USER_H = "/usr/include/lustre/lustre_user.h"
 
-# bash's dependency commands, one per distro branch.
-_UBUNTU_DEPS = ["apt-get", "install", "-y", "libbz2-dev", "libattr1-dev",
-                "libarchive-dev", "libssl-dev", "libcap-dev"]
-_RPM_DEPS = ["dnf", "install", "-y", "bzip2-devel", "libattr-devel", "libarchive-devel"]
+# bash's build dependencies, one list per distro branch. The lists differ
+# deliberately (libbz2-dev is Ubuntu's name for bzip2-devel).
+_UBUNTU_DEPS = ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"]
+_RPM_DEPS = ["bzip2-devel", "libattr-devel", "libarchive-devel"]
 
 
 # --------------------------------------------------------------------------- #
@@ -111,11 +117,11 @@ def lustre_cmake_flag(header: str) -> str:
     return "ON" if os.path.isfile(header) else "OFF"
 
 
-def deps_command(distribution: str) -> tuple[list[str], str]:
-    """bash's dependency install command for this distro, and the branch name.
+def deps_packages(distribution: str) -> tuple[list[str], str]:
+    """bash's dependency packages for this distro, and the branch name.
 
-    bash: *"ubuntu"* -> apt-get; "azurelinux3.0" -> dnf; anything else (RHEL
-    family) -> the same dnf command.
+    bash: *"ubuntu"* -> the Ubuntu list; "azurelinux3.0" -> the RPM list;
+    anything else (RHEL family) -> the same RPM list.
     """
     if "ubuntu" in distribution:
         return list(_UBUNTU_DEPS), "ubuntu"
@@ -162,16 +168,17 @@ def _run(command: list[str], what: str, env: dict[str, str], cwd: str | None = N
 
 
 def install_deps(env: dict[str, str]) -> int:
-    """Install mpifileutils' build dependencies with bash's exact command.
+    """Install mpifileutils' build dependencies: bash's list for this distro,
+    in one install_packages() call (which logs the command and any failure).
 
     Returns 0 on success, 3 on failure.
     """
     distribution = env.get("DISTRIBUTION", "")
-    command, branch = deps_command(distribution)
+    packages, branch = deps_packages(distribution)
     log_info(_OP, f"Installing mpifileutils build dependencies ({branch} branch of "
                   "install_mpifileutils.sh)", distro=distribution, branch=branch,
-             packages=command[3:])
-    return 0 if _run(command, "installing the build dependencies", env) else 3
+             packages=packages)
+    return 0 if install_packages(packages, env, _OP) else 3
 
 
 def install(env: dict[str, str]) -> int:

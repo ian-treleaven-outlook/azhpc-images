@@ -90,6 +90,12 @@ install() receives the build environment (a dict) and returns 0 for success or
 
 Deliberate differences from bash
 --------------------------------
+  * Package installs go through install_packages() (utils/package_installer.py),
+    which spells them `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y`
+    (bash: `apt install -y` / `dnf -y install`). `rpm -i`, `apt update`,
+    `apt-mark hold`, `dnf config-manager` and `dnf update` are run as in bash.
+    (A RHEL-like distro install_packages() doesn't know, e.g. CentOS, now
+    fails at the pmix install; bash's else branch would use dnf.)
   * OS versions come from DISTRIBUTION, not from re-reading /etc/os-release.
     DISTRIBUTION is built from the same file as $ID$VERSION_ID (see
     set_properties.sh / _detect_distribution), so "ubuntu24.04" gives "24.04"
@@ -119,6 +125,7 @@ import shutil
 
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -153,6 +160,12 @@ _UBUNTU_REPOS = {
 # AlmaLinux/Rocky. Other majors enable nothing, exactly like bash's if/elif.
 # RHEL itself uses rhel_codeready_repo() instead.
 _RHEL_EXTRA_REPOS = {"9": "crb", "8": "powertools"}
+
+# Azure Linux: the two `dnf -y install` commands, one list per command.
+_AZURE_LINUX_PACKAGES = [
+    ["pmix", "pmix-devel", "pmix-tools"],
+    ["hwloc-devel", "libevent-devel", "munge-devel"],
+]
 
 # The sed expression bash uses to cut the version out of a `dnf list installed`
 # line, as a Python regex:
@@ -193,6 +206,23 @@ def apt_source_line(architecture_distro: str, repo: str, signed_by: str) -> str:
     """The exact line bash's `echo ... > slurm.list` writes (echo adds the newline)."""
     return (f"deb [arch={architecture_distro} signed-by={signed_by}] "
             f"https://packages.microsoft.com/repos/{repo}/ insiders main\n")
+
+
+def ubuntu_packages(version: str) -> list[str]:
+    """What bash installs and then holds on Ubuntu, pmix pinned to `version`.
+
+    bash: apt install -y pmix=${PMIX_VERSION} libevent-dev libhwloc-dev
+    """
+    return [f"pmix={version}", "libevent-dev", "libhwloc-dev"]
+
+
+def rhel_packages(version: str, major: str) -> list[str]:
+    """What bash installs on the RHEL family, e.g. pmix-4.2.9-2.el9 + -devels.
+
+    bash: dnf -y install pmix-${PMIX_VERSION}.el${OS_MAJOR_VERSION} hwloc-devel \\
+              libevent-devel munge-devel
+    """
+    return [f"pmix-{version}.el{major}", "hwloc-devel", "libevent-devel", "munge-devel"]
 
 
 def rhel_extra_repo(distribution: str, major: str, architecture: str) -> str | None:
@@ -278,28 +308,33 @@ def _run_all(commands: list[list[str]], env: dict[str, str]) -> bool:
     return True
 
 
-def _install_ms_repo_package(url: str, install_command: list[str],
-                             env: dict[str, str]) -> bool:
+def _install_ms_repo_package(url: str, env: dict[str, str], *, with_rpm: bool) -> bool:
     """Download a packages-microsoft-prod package, install it, delete it.
 
-    Mirrors bash's  curl -sSL -O <url>; <install_command>; rm <file>  — run
-    inside our scratch work directory. `install_command` is the full install
-    command, e.g. ["apt", "install", "-y", "./packages-microsoft-prod.deb"]
-    (apt needs the "./" to treat the argument as a local file, not a package
-    name) or ["rpm", "-i", "packages-microsoft-prod.rpm"].
+    Mirrors bash's  curl -sSL -O <url>; <install>; rm <file>  — run inside our
+    scratch work directory. The install is
+      * Ubuntu: `apt install -y ./packages-microsoft-prod.deb`, through
+        install_packages() (apt needs the "./" to treat the argument as a
+        local file, not a package name);
+      * RHEL family (with_rpm=True): `rpm -i packages-microsoft-prod.rpm`,
+        run as is.
     """
     # The file name curl -O saves to: the last part of the URL.
     filename = url.rsplit("/", 1)[-1]
     log_info(_OP, f"Installing the Microsoft repo package {filename} (sets up the "
                   "packages.microsoft.com signing key)", url=url,
-             installer=" ".join(install_command))
+             installer="rpm -i" if with_rpm else "install_packages")
     os.makedirs(_WORK_DIR, exist_ok=True)
     try:
         if exec_program(["curl", "-sSL", "-O", url], _OP, cwd=_WORK_DIR, env=env) != 0:
             log_error(_OP, f"could not download {url}", url=url)
             return False
-        if exec_program(install_command, _OP, cwd=_WORK_DIR, env=env) != 0:
-            log_error(_OP, f"could not install {filename}", command=install_command[0])
+        if with_rpm:
+            if exec_program(["rpm", "-i", filename], _OP, cwd=_WORK_DIR, env=env) != 0:
+                log_error(_OP, f"could not install {filename}", command="rpm")
+                return False
+        # install_packages() logs its own failure.
+        elif not install_packages([f"./{filename}"], env, _OP, cwd=_WORK_DIR):
             return False
         # Mirrors `rm <file>`, which would stop the bash script if it failed.
         os.remove(os.path.join(_WORK_DIR, filename))
@@ -344,21 +379,20 @@ def _install_ubuntu(env: dict[str, str], version: str) -> str | None:
     if not os.path.exists(_MS_PROD_APT_LIST):
         url = (f"https://packages.microsoft.com/config/ubuntu/{ubuntu}/"
                "packages-microsoft-prod.deb")
-        if not _install_ms_repo_package(
-                url, ["apt", "install", "-y", "./packages-microsoft-prod.deb"], env):
+        if not _install_ms_repo_package(url, env, with_rpm=False):
             return None
     else:
         log_info(_OP, f"{_MS_PROD_APT_LIST} exists; the Microsoft repo package is "
                       "already installed", path=_MS_PROD_APT_LIST)
 
-    packages = [f"pmix={version}", "libevent-dev", "libhwloc-dev"]
-    if not _run_all([
-        ["apt", "update"],
-        ["apt", "install", "-y", *packages],
-        # Hold the packages so routine upgrades don't replace them. Bash passes
-        # "pmix=<version>" to apt-mark too (not just "pmix"), so we do the same.
-        ["apt-mark", "hold", *packages],
-    ], env):
+    packages = ubuntu_packages(version)
+    if not _run_all([["apt", "update"]], env):
+        return None
+    if not install_packages(packages, env, _OP):
+        return None
+    # Hold the packages so routine upgrades don't replace them. Bash passes
+    # "pmix=<version>" to apt-mark too (not just "pmix"), so we do the same.
+    if not _run_all([["apt-mark", "hold", *packages]], env):
         return None
     return version
 
@@ -367,11 +401,9 @@ def _install_azurelinux(env: dict[str, str], version: str) -> str | None:
     log_info(_OP, "Azure Linux: installing pmix from the distro repos; recording the "
                   "installed version, not versions.json's", handler="azurelinux",
              versions_json_version=version)
-    if not _run_all([
-        ["dnf", "-y", "install", "pmix", "pmix-devel", "pmix-tools"],
-        ["dnf", "-y", "install", "hwloc-devel", "libevent-devel", "munge-devel"],
-    ], env):
-        return None
+    for packages in _AZURE_LINUX_PACKAGES:
+        if not install_packages(packages, env, _OP):
+            return None
 
     # On Azure Linux bash records the version dnf actually installed, replacing
     # the versions.json value. `version` is deliberately unused here.
@@ -419,8 +451,7 @@ def _install_rhel(env: dict[str, str], version: str) -> str | None:
     if not os.path.exists(_MS_PROD_YUM_REPO):
         url = (f"https://packages.microsoft.com/config/rhel/{major}/"
                "packages-microsoft-prod.rpm")
-        if not _install_ms_repo_package(url, ["rpm", "-i", "packages-microsoft-prod.rpm"],
-                                        env):
+        if not _install_ms_repo_package(url, env, with_rpm=True):
             return None
     else:
         log_info(_OP, f"{_MS_PROD_YUM_REPO} exists; the Microsoft repo package is "
@@ -429,12 +460,10 @@ def _install_rhel(env: dict[str, str], version: str) -> str | None:
     commands = []
     if extra_repo:
         commands.append(["dnf", "config-manager", "--set-enabled", extra_repo])
-    commands += [
-        ["dnf", "update", "-y"],
-        ["dnf", "-y", "install", f"pmix-{version}.el{major}",
-         "hwloc-devel", "libevent-devel", "munge-devel"],
-    ]
+    commands.append(["dnf", "update", "-y"])
     if not _run_all(commands, env):
+        return None
+    if not install_packages(rhel_packages(version, major), env, _OP):
         return None
     return version
 

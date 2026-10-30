@@ -27,21 +27,29 @@ build. But it also changes the system, before install_utils.sh runs:
         dnf install -y jq
     fi
 
-`prepare_system(env)` runs exactly those commands, in that order, and is
-called by ImageBuilder._bootstrap() before install_utils.sh. jq is still
-needed: install_utils.sh and the nested bash scripts read versions.json with
-it. The `apt upgrade -y` matters for image equivalence: it brings every
-package the marketplace image shipped up to date, as the bash build does.
+`prepare_system(env)` runs those steps in that order, and is called by
+ImageBuilder._bootstrap() before install_utils.sh. jq is still needed:
+install_utils.sh and the nested bash scripts read versions.json with it. The
+`apt upgrade -y` matters for image equivalence: it brings every package the
+marketplace image shipped up to date, as the bash build does.
 
-The commands are kept exactly as bash writes them (`apt`, not `apt-get`) for
-now; the package-manager abstraction work in ADO 991 will move them behind
-utils/package_installer.py.
+`apt update`, `apt upgrade -y` and `rpm --import` run exactly as bash writes
+them. The jq install goes through install_packages()
+(utils/package_installer.py), which picks the manager from DISTRIBUTION.
+
+Deliberate differences
+----------------------
+  * `apt install -y jq` runs as `apt-get install -y -o Dpkg::Use-Pty=0 jq`
+    (the documented normalisation; `dnf install -y jq` is unchanged). On a
+    distribution install_packages() doesn't know, bash's else branch would
+    try dnf; here the jq install logs an error and the step returns 3.
 """
 
 from __future__ import annotations
 
 from utils.component_config import DEFAULT_NODE_TYPE
 from utils.logger import log_error, log_info
+from utils.package_installer import install_packages
 from utils.process import exec_program
 
 _OP = "prepare-system"
@@ -49,28 +57,30 @@ _OP = "prepare-system"
 ALMA8_GPG_KEY = "https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux"
 ALMA9_GPG_KEY = "https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux-9"
 
+# Installed on every distro, last, in one command (bash: `apt install -y jq` /
+# `dnf install -y jq`).
+PREREQUISITE_PACKAGES = ["jq"]
+
 
 def prepare_commands(distribution: str, node_type: str) -> list[list[str]]:
-    """The commands set_properties.sh runs for this distro and node type, in order.
+    """The commands set_properties.sh runs for this distro and node type
+    before installing jq (PREREQUISITE_PACKAGES), in order.
 
     A pure function (no side effects), so tests can check every branch.
     """
     if "ubuntu" in distribution:
-        commands = []
         if (node_type or DEFAULT_NODE_TYPE) != "baremetal_3p":
-            commands += [["apt", "update"], ["apt", "upgrade", "-y"]]
-        return commands + [["apt", "install", "-y", "jq"]]
+            return [["apt", "update"], ["apt", "upgrade", "-y"]]
+        return []
 
-    if distribution.startswith("almalinux"):
-        commands = []
-        if distribution == "almalinux8.10":
-            commands.append(["rpm", "--import", ALMA8_GPG_KEY])
-        elif distribution.startswith("almalinux9"):
-            commands.append(["rpm", "--import", ALMA9_GPG_KEY])
-        return commands + [["dnf", "install", "-y", "jq"]]
+    if distribution == "almalinux8.10":
+        return [["rpm", "--import", ALMA8_GPG_KEY]]
+    if distribution.startswith("almalinux9"):
+        return [["rpm", "--import", ALMA9_GPG_KEY]]
 
-    # Azure Linux 3.0, Rocky Linux, RHEL and other RHEL-family distros.
-    return [["dnf", "install", "-y", "jq"]]
+    # Other AlmaLinux, Azure Linux 3.0, Rocky Linux, RHEL and other
+    # RHEL-family distros: only jq.
+    return []
 
 
 def prepare_system(env: dict[str, str]) -> int:
@@ -85,7 +95,8 @@ def prepare_system(env: dict[str, str]) -> int:
     upgrade = any(command[:2] == ["apt", "upgrade"] for command in commands)
     log_info(_OP, f"Preparing {distribution} as set_properties.sh does",
              distribution=distribution, node_type=node_type,
-             commands=len(commands), apt_upgrade=upgrade)
+             commands=len(commands), apt_upgrade=upgrade,
+             packages=" ".join(PREREQUISITE_PACKAGES))
     if "ubuntu" in distribution and not upgrade:
         # The same message bash echoes, so both builds' logs say why.
         log_info(_OP, "Skipping apt update/upgrade on baremetal 3P node",
@@ -98,5 +109,9 @@ def prepare_system(env: dict[str, str]) -> int:
                            "stopping, as set_properties.sh's set -e would",
                       command=" ".join(command), exit_code=rc)
             return 3
+    if not install_packages(PREREQUISITE_PACKAGES, env, _OP):
+        log_error(_OP, "installing jq failed; stopping, as set_properties.sh's "
+                       "set -e would", packages=" ".join(PREREQUISITE_PACKAGES))
+        return 3
     log_info(_OP, "System prepared", distribution=distribution)
     return 0

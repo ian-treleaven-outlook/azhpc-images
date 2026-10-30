@@ -150,7 +150,8 @@ install() returns 0 for success or 3 for failure. It logs problems and returns
 
 Behaviour kept from bash
 ------------------------
-  * Commands, arguments and order are the same, and the first failing command
+  * Commands, arguments and order are the same (installs spelled the
+    install_packages() way, see below), and the first failing command
     stops the step (bash's `set -e`).
   * The ref is chosen like `jq -r '.ref // .branch // empty'`: "ref" unless it
     is missing/null/false, then "branch" likewise, else "" (checked against
@@ -183,6 +184,9 @@ Behaviour kept from bash
 
 Deliberate differences from bash
 --------------------------------
+  * Package installs go through install_packages() (utils/package_installer.py),
+    which spells them `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y`
+    (bash: `apt install -y` / `dnf install -y`).
   * Work directory: bash clones/downloads/builds in its current directory (the
     distro build dir). We use _WORK_DIR, emptied first (so leftovers from a
     failed run can't break `git clone` / `mkdir build`) and removed at the end.
@@ -222,6 +226,7 @@ import shutil
 from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 from utils.repo_source import write_repo_source_info
 
@@ -251,6 +256,11 @@ _PERFTEST_GIT_URL = "https://github.com/linux-rdma/perftest.git"
 # Ubuntu 26.04); the source build installs into /opt/rccl (everything else).
 _PACKAGED_RCCL_PREFIX = "/opt/rocm"
 _SOURCE_RCCL_PREFIX = "/opt/rccl"
+
+# Package installs, one list per bash command.
+_AZURE_LINUX_RCCL_PACKAGES = ["rccl", "rccl-devel", "rccl-unittests"]
+_PERFTEST_UBUNTU_PACKAGES = ["libpci-dev"]
+_PERFTEST_UBUNTU2604_PACKAGES = ["libibumad-dev"]
 
 # Bash's AMD_GPU_TARGETS: Azure's AMD GPUs are MI300X (gfx942); gfx90a (MI200)
 # is kept for compatibility. Building only these instead of upstream's 10-13
@@ -549,7 +559,7 @@ def _ubuntu2604_rccl_version() -> str | None:
 
 
 def _install_packaged(env: dict[str, str]) -> str | None:
-    if not _run_all([["dnf", "install", "-y", "rccl", "rccl-devel", "rccl-unittests"]], env):
+    if not install_packages(_AZURE_LINUX_RCCL_PACKAGES, env, _OP):
         return None
     rc, output = run_capture(
         ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", "rccl"], _OP, env=env)
@@ -770,12 +780,12 @@ def _build_rccl_tests(env: dict[str, str], distribution: str, rccl_prefix: str,
 
 def _build_perftest(env: dict[str, str], distribution: str, is_ubuntu: bool,
                     nproc: int) -> bool:
-    if is_ubuntu and not _run_all([["apt", "install", "-y", "libpci-dev"]], env):
+    if is_ubuntu and not install_packages(_PERFTEST_UBUNTU_PACKAGES, env, _OP):
         return False
     if distribution == _UBUNTU_2604:
         log_info(_OP, "Ubuntu 26.04: perftest also needs libibumad-dev",
                  package="libibumad-dev")
-        if not _run_all([["apt", "install", "-y", "libibumad-dev"]], env):
+        if not install_packages(_PERFTEST_UBUNTU2604_PACKAGES, env, _OP):
             return False
 
     log_info(_OP, "Building perftest with ROCm support",

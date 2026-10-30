@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_dcgm
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-dcgm"
@@ -58,8 +59,11 @@ _TAIL = [
     ["systemctl", "restart", "nvidia-dcgm"],
     ["systemctl", "is-active", "--quiet", "nvidia-dcgm"],
 ]
-_RHEL_INSTALL = ["dnf", "install", "--assumeyes", "--setopt=install_weak_deps=True"]
-_RHEL_MULTINODE = ["dnf", "install", "--assumeyes"]
+# What install_packages() runs on Ubuntu / the RPM distros.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
+_RHEL_INSTALL = [*_DNF, "--setopt=install_weak_deps=True"]
+_RHEL_MULTINODE = _DNF
 
 
 def _pinned(names, version=_UBUNTU_DCGM):
@@ -67,14 +71,14 @@ def _pinned(names, version=_UBUNTU_DCGM):
 
 
 def _ubuntu13():
-    return ["apt-get", "install", "-y", *_pinned(
+    return [*_APT, *_pinned(
         [f"{_DCGM}-cuda13", f"{_DCGM}-core", f"{_DCGM}-proprietary",
          f"{_DCGM}-proprietary-cuda13", f"{_DCGM}-multinode", f"{_DCGM}-multinode-cuda13",
          "dcgmi", "libdcgm4"])]
 
 
 def _ubuntu12_extra():
-    return ["apt-get", "install", "-y", *_pinned(
+    return [*_APT, *_pinned(
         [f"{_DCGM}-cuda12", f"{_DCGM}-proprietary-cuda12", f"{_DCGM}-multinode-cuda12",
          f"{_DCGM}-core", "dcgmi", "libdcgm4"])]
 
@@ -252,8 +256,13 @@ class InstallTests(unittest.TestCase):
         def fake_config(component, env):
             return {"cuda": cuda_cfg, "dcgm": dcgm_cfg}[component]
 
-        with mock.patch.object(install_dcgm, "exec_program",
-                               side_effect=fake_exec) as exec_program, \
+        # One mock for both modules' exec_program keeps every command,
+        # installs included, in one ordered list.
+        exec_program = mock.Mock(side_effect=fake_exec)
+        with mock.patch.object(install_dcgm, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_dcgm, "run_capture",
                                side_effect=fake_capture) as run_capture, \
              mock.patch.object(install_dcgm, "config_for",
@@ -315,7 +324,7 @@ class InstallTests(unittest.TestCase):
         rc, m = self._install(_env())
         self.assertEqual(rc, 0)
         shown = [c[2] for c in self._captures(m, "apt-cache")]
-        self.assertEqual(shown, _ubuntu13()[3:])     # BFS order, no repeats
+        self.assertEqual(shown, _ubuntu13()[len(_APT):])     # BFS order, no repeats
 
     def test_ubuntu_lower_sku_cuda_adds_packages(self):
         rc, m = self._install(_env(SKU="V100"), cuda_cfg=_CUDA_12)
@@ -347,8 +356,8 @@ class InstallTests(unittest.TestCase):
                               dcgm_cfg={})
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m), [
-            ["apt-get", "install", "-y", *install_dcgm.ubuntu_packages(13)],
-            ["apt-get", "install", "-y", *install_dcgm.ubuntu_extra_packages(12)],
+            [*_APT, *install_dcgm.ubuntu_packages(13)],
+            [*_APT, *install_dcgm.ubuntu_extra_packages(12)],
             *_TAIL])
         self.assertEqual(self._captures(m, "apt-cache"), [])
         self.assertEqual(self._captures(m, "dpkg-query"), [
@@ -377,7 +386,7 @@ class InstallTests(unittest.TestCase):
              os.path.join(topdir, f"{_MARKER}.spec")],
             ["rpm", "-Uvh", "--replacepkgs",
              os.path.join(topdir, "RPMS", "noarch", f"{_MARKER}-1.0-1.noarch.rpm")],
-            ["dnf", "install", "-y", f"{_DCGM}-cuda13-4.7.0", f"{_DCGM}-multinode-4.7.0",
+            [*_DNF, f"{_DCGM}-cuda13-4.7.0", f"{_DCGM}-multinode-4.7.0",
              f"{_DCGM}-multinode-cuda13-4.7.0"],
             *_TAIL,
         ])
@@ -394,7 +403,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m)[:2], [
             ["rpm", "-q", _MARKER],
-            ["dnf", "install", "-y", *install_dcgm.azure_linux_packages(13, _AZL_DCGM)]])
+            [*_DNF, *install_dcgm.azure_linux_packages(13, _AZL_DCGM)]])
         m["warn"].assert_not_called()
 
     def test_azure_linux_marker_not_built_returns_3(self):
@@ -441,9 +450,9 @@ class InstallTests(unittest.TestCase):
 
     # ---- nv-hostengine under screen ------------------------------------------
     def test_screen_installed_when_missing(self):
-        for distro, command in (("ubuntu24.04", ["apt-get", "install", "-y", "screen"]),
-                                ("almalinux9.8", ["dnf", "install", "-y", "screen"]),
-                                ("azurelinux3.0", ["dnf", "install", "-y", "screen"])):
+        for distro, command in (("ubuntu24.04", [*_APT, "screen"]),
+                                ("almalinux9.8", [*_DNF, "screen"]),
+                                ("azurelinux3.0", [*_DNF, "screen"])):
             with self.subTest(distro=distro):
                 rc, m = self._install(_env(distro), screen=False,
                                       dcgm_cfg={"version": _AZL_DCGM}
@@ -499,7 +508,7 @@ class InstallTests(unittest.TestCase):
         ubuntu = [c for c in calls if c.args[1].startswith("Ubuntu:")]
         self.assertEqual(ubuntu[0].kwargs["version_source"], "versions.json")
         resolved = by_message[f"Resolved 8 DCGM packages pinned to {_UBUNTU_DCGM}"]
-        self.assertEqual(resolved["packages"], _ubuntu13()[3:])
+        self.assertEqual(resolved["packages"], _ubuntu13()[len(_APT):])
         self.assertEqual(by_message[f"Recorded DCGM version {_UBUNTU_DCGM}"],
                          {"component": "DCGM", "version": _UBUNTU_DCGM})
         self.assertEqual(by_message[f"nv-hostengine command from {self.unit}: {_HOSTENGINE}"]
@@ -563,8 +572,8 @@ class InstallTests(unittest.TestCase):
         sequences = {
             "ubuntu24.04": [_ubuntu13(), _ubuntu12_extra()],
             "ubuntu26.04": [
-                ["apt-get", "install", "-y", *install_dcgm.ubuntu_packages(13)],
-                ["apt-get", "install", "-y", *install_dcgm.ubuntu_extra_packages(12)]],
+                [*_APT, *install_dcgm.ubuntu_packages(13)],
+                [*_APT, *install_dcgm.ubuntu_extra_packages(12)]],
             "almalinux9.8": [
                 ["dnf", "clean", "expire-cache"],
                 [*_RHEL_INSTALL, f"{_DCGM}-cuda13"],
@@ -603,6 +612,9 @@ class InstallTests(unittest.TestCase):
                         (rpms / f"{_MARKER}-1.0-1.noarch.rpm").touch()
                     return 1 if command[0] == _name else 0
                 with mock.patch.object(install_dcgm, "exec_program", side_effect=fail), \
+                     mock.patch.object(package_installer, "exec_program", side_effect=fail), \
+                     mock.patch.object(package_installer, "log_info"), \
+                     mock.patch.object(package_installer, "log_error"), \
                      mock.patch.object(install_dcgm, "run_capture",
                                        return_value=(0, "13000\n")), \
                      mock.patch.object(install_dcgm, "config_for",

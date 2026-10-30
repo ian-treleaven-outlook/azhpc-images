@@ -7,8 +7,10 @@
     real GNU sed/awk/jq/bash. Key lines are also compared with the bash script
     itself (components/install_rccl.sh), so an upstream change shows up here.
   * install() runs with every external effect mocked: config lookup, download,
-    exec_program, run_capture (nproc, rpm, git rev-parse), write_repo_source_info
-    and the versions file. A fake exec_program creates the directories that
+    exec_program (in install_rccl, and in utils.package_installer for the
+    apt-get/dnf installs), run_capture (nproc, rpm, git rev-parse),
+    write_repo_source_info and the versions file. A fake exec_program creates
+    the directories that
     `git clone` / `git init` / `tar` would, so the real Python file handling
     (CMakeLists.txt edit, sysctl.conf append, cleanup) runs against a temporary
     directory. Nothing touches /etc, /opt, /proc or the network.
@@ -27,6 +29,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_rccl
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _BASH = Path(__file__).resolve().parents[2] / "components" / "install_rccl.sh"
@@ -76,8 +79,11 @@ _THEROCK_COMMANDS = [
      "origin", _THEROCK_PIN],
     ["git", "-C", "rocm-systems", "checkout", "--detach", "FETCH_HEAD"],
 ]
-_LIBPCI = ["apt", "install", "-y", "libpci-dev"]
-_LIBIBUMAD = ["apt", "install", "-y", "libibumad-dev"]
+# What install_packages() runs (bash: `apt install -y` / `dnf install -y`).
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
+_LIBPCI = [*_APT, "libpci-dev"]
+_LIBIBUMAD = [*_APT, "libibumad-dev"]
 
 
 def _perftest():
@@ -259,6 +265,9 @@ class BashTextTests(unittest.TestCase):
                 "rccl_tests_commit=$(git -C TheRock rev-parse HEAD:rocm-systems)",
                 '-DCMAKE_PREFIX_PATH="$RCCL_PREFIX;/opt/rocm;$HPCX_MPI_DIR"',
                 "apt install -y libibumad-dev",
+                "apt install -y " + " ".join(install_rccl._PERFTEST_UBUNTU_PACKAGES),
+                "apt install -y " + " ".join(install_rccl._PERFTEST_UBUNTU2604_PACKAGES),
+                "dnf install -y " + " ".join(install_rccl._AZURE_LINUX_RCCL_PACKAGES),
                 install_rccl._THEROCK_GIT_URL):
             with self.subTest(line=line):
                 self.assertIn(line, self.bash)
@@ -354,10 +363,14 @@ class InstallTests(unittest.TestCase):
                 raise write_error
 
         env = {"DISTRIBUTION": distro, "PATH": "/usr/bin"}
+        # Installs run in utils.package_installer; the same fake records them
+        # in self.calls, in order with every other command, and its failure
+        # log goes to the module's log_error mock.
         with mock.patch.object(install_rccl, "config_for", side_effect=fake_config) as config, \
              mock.patch.object(install_rccl, "download_and_verify",
                                side_effect=fake_download) as download, \
              mock.patch.object(install_rccl, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(install_rccl, "run_capture", side_effect=fake_capture) as cap, \
              mock.patch.object(install_rccl, "write_repo_source_info",
                                side_effect=fake_repo) as repo, \
@@ -365,7 +378,9 @@ class InstallTests(unittest.TestCase):
                                side_effect=fake_record) as record, \
              mock.patch.object(install_rccl, "log_info") as info, \
              mock.patch.object(install_rccl, "log_warn") as warn, \
-             mock.patch.object(install_rccl, "log_error") as error:
+             mock.patch.object(install_rccl, "log_error") as error, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error", new=error):
             result = install_rccl.install(env)
         self.config, self.download, self.capture, self.record = config, download, cap, record
         self.repo = repo
@@ -404,7 +419,7 @@ class InstallTests(unittest.TestCase):
                 + _perftest())
 
     def _azl_all(self):
-        return ([["dnf", "install", "-y", "rccl", "rccl-devel", "rccl-unittests"],
+        return ([[*_DNF, "rccl", "rccl-devel", "rccl-unittests"],
                  _ROCM_SYSTEMS_CLONE, _rccl_tests("/opt/rocm")] + _perftest())
 
     # ---- success paths ------------------------------------------------------

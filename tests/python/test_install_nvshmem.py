@@ -6,7 +6,8 @@ Two kinds of test:
     parse_apt_version) are tested directly with realistic inputs. Their
     results were also compared once against real bash grep/awk/cut in WSL.
   * install() is tested with its external effects mocked: running dnf/apt
-    (exec_program), listing installed packages (run_capture) and writing the
+    (exec_program, both the module's and utils.package_installer's, which
+    runs the Azure Linux install, as one mock), listing installed packages (run_capture) and writing the
     versions file. The cuda config comes from a small COMPONENT_VERSIONS JSON in
     the env, so the real config_for() resolves it. Nothing touches /opt or runs
     a package manager.
@@ -23,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvshmem
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nvshmem"
@@ -54,7 +56,10 @@ _DNF_INSTALL = [
     "https://developer.download.nvidia.com/compute/cuda/repos/rhel9/sbsa",
     "libnvshmem3-cuda-13", "libnvshmem3-devel-cuda-13", "libnvshmem3-static-cuda-13",
 ]
-_APT_INSTALL = ["apt", "install", "libnvshmem3-cuda-13", "libnvshmem3-dev-cuda-13"]
+# Bash: `apt install ...` without -y; install_packages() writes apt-get and,
+# with assume_yes=False, also leaves out -y.
+_APT_INSTALL = ["apt-get", "install", "-o", "Dpkg::Use-Pty=0",
+                "libnvshmem3-cuda-13", "libnvshmem3-dev-cuda-13"]
 
 
 def _env(distribution, driver_version="13.0"):
@@ -168,12 +173,15 @@ class InstallTests(unittest.TestCase):
 
         Returns the exit code plus the mocks: run (exec_program), capture
         (run_capture), record (write_component_version) and log_error.
+        install_packages()'s own error log is kept as self.pkg_error.
         """
         if list_result is None:
             output = _DNF_LIST if env["DISTRIBUTION"] == "azurelinux3.0" else _APT_LIST
             list_result = (0, output)
-        with mock.patch.object(install_nvshmem, "exec_program",
-                               return_value=exec_rc) as run, \
+        run = mock.Mock(return_value=exec_rc)
+        with mock.patch.object(package_installer, "exec_program", run), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(install_nvshmem, "run_capture",
                                return_value=list_result) as capture, \
              mock.patch.object(install_nvshmem, "write_component_version",
@@ -182,6 +190,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_nvshmem, "log_error") as log_error:
             rc = install_nvshmem.install(env)
         self.log_warn = log_warn
+        self.pkg_error = pkg_error
         return rc, run, capture, record, log_error
 
     # ---- success paths -----------------------------------------------------
@@ -190,7 +199,7 @@ class InstallTests(unittest.TestCase):
         rc, run, capture, record, log_error = self._install(env)
 
         self.assertEqual(rc, 0)
-        run.assert_called_once_with(_DNF_INSTALL, _OP, env=env)
+        run.assert_called_once_with(_DNF_INSTALL, _OP, cwd=None, env=env)
         capture.assert_called_once_with(["dnf", "list", "installed"], _OP, env=env)
         record.assert_called_once_with("NVSHMEM", "3.4.5-1")
         log_error.assert_not_called()
@@ -201,14 +210,14 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         # Exactly as bash: no -y (see _install_ubuntu for why it is kept).
-        run.assert_called_once_with(_APT_INSTALL, _OP, env=env)
+        run.assert_called_once_with(_APT_INSTALL, _OP, cwd=None, env=env)
         capture.assert_called_once_with(["apt", "list", "--installed"], _OP, env=env)
         record.assert_called_once_with("NVSHMEM", "3.4.5-1")
         log_error.assert_not_called()
         # The missing -y is announced before apt runs.
         self.log_warn.assert_called_once()
-        self.assertEqual(self.log_warn.call_args.kwargs["command"],
-                         " ".join(_APT_INSTALL))
+        self.assertEqual(self.log_warn.call_args.kwargs["packages"],
+                         "libnvshmem3-cuda-13 libnvshmem3-dev-cuda-13")
 
     def test_azure_linux_does_not_warn_about_apt(self):
         self._install(_env("azurelinux3.0"))
@@ -221,8 +230,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         run.assert_called_once_with(
-            ["apt", "install", "libnvshmem3-cuda-12", "libnvshmem3-dev-cuda-12"],
-            _OP, env=env)
+            ["apt-get", "install", "-o", "Dpkg::Use-Pty=0",
+             "libnvshmem3-cuda-12", "libnvshmem3-dev-cuda-12"],
+            _OP, cwd=None, env=env)
         record.assert_called_once_with("NVSHMEM", "3.2.5-1")
 
     def test_real_versions_json_gives_cuda_13_for_gb200(self):
@@ -271,7 +281,9 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 capture.assert_not_called()
                 record.assert_not_called()
-                log_error.assert_called()
+                # install_packages() logs the Azure Linux failure itself.
+                errors = self.pkg_error if distribution == "azurelinux3.0" else log_error
+                errors.assert_called()
 
     def test_list_failure_returns_3(self):
         for distribution in ("ubuntu24.04", "azurelinux3.0"):

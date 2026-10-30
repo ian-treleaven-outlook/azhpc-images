@@ -110,6 +110,9 @@ install() receives the build environment (a dict) and returns 0 for success or
 
 Deliberate differences from bash
 --------------------------------
+  * Installs go through install_packages(), which spells them
+    `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y` (RHEL family:
+    `dnf install -y --setopt=install_weak_deps=True` for bash's `--assumeyes`).
   * A missing "dcgm" version (Ubuntu 22.04/24.04, Azure Linux) or a
     missing/non-numeric CUDA driver version for the SKU (Ubuntu, RHEL family,
     where it is compared) fails before installing anything. Bash would look
@@ -126,7 +129,7 @@ Deliberate differences from bash
     directory is removed in all cases too (bash leaves it behind on failure).
   * resolve_exact_version_deps sorts each package's dependencies in plain
     character order (bash: `sort -u`, locale order). That only changes the
-    order of the arguments to `apt-get install`.
+    order of the packages in the apt install.
   * If `screen` is still not on PATH after installing it, the step fails;
     bash would write a drop-in whose ExecStart has no program.
 """
@@ -141,6 +144,7 @@ import tempfile
 
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -204,10 +208,8 @@ _AZURE_LINUX_CUDA_MAJOR = 13
 # The one Ubuntu that installs DCGM unpinned and reads the version back.
 _UNPINNED_UBUNTU = "ubuntu26.04"
 
-# The dnf options bash passes on the RHEL family.
-_RHEL_DNF_INSTALL = ["dnf", "install", "--assumeyes",
-                     "--setopt=install_weak_deps=True"]
-_RHEL_DNF_INSTALL_MULTINODE = ["dnf", "install", "--assumeyes"]
+# The extra dnf option bash passes when installing cuda<N> on the RHEL family.
+_RHEL_CUDA_OPTIONS = ["--setopt=install_weak_deps=True"]
 
 # bash: DCGM_VERSION=$(dpkg-query -W -f='${Version}' datacenter-gpu-manager-4-core)
 _DPKG_QUERY_DCGM = ["dpkg-query", "-W", "-f=${Version}", "datacenter-gpu-manager-4-core"]
@@ -505,14 +507,14 @@ def _resolve_exact_version_deps(version: str, packages: list[str],
 
 
 def _apt_install_dcgm(env, packages: list[str], dcgm: str | None) -> bool:
-    """apt-get install -y the packages: pinned with their exact-version
+    """Install the packages in one command: pinned with their exact-version
     dependencies (dcgm version given), or unpinned (Ubuntu 26.04, dcgm None)."""
     if dcgm is not None:
         resolved = _resolve_exact_version_deps(dcgm, packages, env)
         if resolved is None:
             return False
         packages = resolved
-    return _run_all([["apt-get", "install", "-y", *packages]], env)
+    return install_packages(packages, env, _OP)
 
 
 def _install_azure_linux_marker(env) -> bool:
@@ -622,13 +624,14 @@ def _install_azurelinux(env, cuda: int, sku_cuda: int | None) -> str | None:
                       "because install.sh passes no SKU argument to "
                       "install_dcgm.sh (kept for bash parity)",
                  sku=sku, packages=packages)
-    return dcgm if _run_all([["dnf", "install", "-y", *packages]], env) else None
+    return dcgm if install_packages(packages, env, _OP) else None
 
 
-def _rhel_commands(cuda: int) -> list[list[str]]:
-    """The cuda<N> and multinode-cuda<N> installs bash runs on the RHEL family."""
-    return [[*_RHEL_DNF_INSTALL, f"datacenter-gpu-manager-4-cuda{cuda}"],
-            [*_RHEL_DNF_INSTALL_MULTINODE, f"datacenter-gpu-manager-4-multinode-cuda{cuda}"]]
+def rhel_installs(cuda: int) -> list[tuple[list[str], list[str]]]:
+    """The cuda<N> and multinode-cuda<N> installs bash runs on the RHEL family,
+    as (packages, dnf options), one per bash command."""
+    return [([f"datacenter-gpu-manager-4-cuda{cuda}"], _RHEL_CUDA_OPTIONS),
+            ([f"datacenter-gpu-manager-4-multinode-cuda{cuda}"], [])]
 
 
 def _install_rhel(env, cuda: int, sku_cuda: int | None) -> str | None:
@@ -639,11 +642,14 @@ def _install_rhel(env, cuda: int, sku_cuda: int | None) -> str | None:
     log_info(_OP, f"RHEL family: installing the latest DCGM for CUDA {cuda} from dnf",
              distro=env.get("DISTRIBUTION", ""), cuda_major=cuda)
 
-    commands = [["dnf", "clean", "expire-cache"], *_rhel_commands(cuda)]
+    installs = rhel_installs(cuda)
     if _needs_sku_packages(cuda, sku_cuda):
-        commands.extend(_rhel_commands(sku_cuda))
-    if not _run_all(commands, env):
+        installs.extend(rhel_installs(sku_cuda))
+    if not _run_all([["dnf", "clean", "expire-cache"]], env):
         return None
+    for packages, options in installs:
+        if not install_packages(packages, env, _OP, options=options):
+            return None
 
     # The RHEL family installs unpinned, so record what dcgmi reports.
     rc, output = run_capture(["dcgmi", "--version"], _OP, env=env)
@@ -670,12 +676,9 @@ def _configure_hostengine(env) -> bool:
     Restart=always; UCX needs unlimited memlock. Attach with
     `sudo SCREENDIR=/run/nvidia-dcgm-screen screen -r nvidia-dcgm`.
     """
-    distribution = env.get("DISTRIBUTION", "")
     if _command_path("screen", env) is None:
-        command = (["apt-get", "install", "-y", "screen"] if "ubuntu" in distribution
-                   else ["dnf", "install", "-y", "screen"])
         log_info(_OP, "screen not found: installing it", package="screen")
-        if not _run_all([command], env):
+        if not install_packages(["screen"], env, _OP):
             return False
     screen = _command_path("screen", env)
     if screen is None:

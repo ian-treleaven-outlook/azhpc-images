@@ -1,12 +1,13 @@
 """Unit tests for components/python/install_azsecpack_prereqs.py.
 
-  * The pure helpers (install_command, first_line) are tested directly.
+  * The pure helper first_line is tested directly.
   * page_size() is checked against real `getconf PAGE_SIZE` on the machine
     running the tests (read-only), and its error handling with a mock.
   * install() runs with page_size() mocked, PATH pointed at a temporary
-    directory, exec_program replaced by a fake that "installs" nmap by creating
-    an executable file there, and run_capture (`nmap --version`) mocked. So the
-    real shutil.which() search is exercised, and no package manager runs.
+    directory, install_packages()'s exec_program replaced by a fake that
+    "installs" nmap by creating an executable file there, and run_capture
+    (`nmap --version`) mocked. So the real shutil.which() search and the real
+    install_packages() are exercised, and no package manager runs.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_azsecpack_prereqs -v
@@ -23,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_azsecpack_prereqs as m
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-azsecpack-prereqs"
@@ -35,32 +37,14 @@ _VERSION_OUTPUT = ("Nmap version 7.94SVN ( https://nmap.org )\n"
                    "Platform: aarch64-unknown-linux-gnu\n")
 _VERSION_LINE = "Nmap version 7.94SVN ( https://nmap.org )"
 
+# What install_packages() runs for bash's `apt-get install -y nmap` / `dnf install -y nmap`.
+_APT_NMAP = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "nmap"]
+_DNF_NMAP = ["dnf", "install", "-y", "nmap"]
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers.
 # --------------------------------------------------------------------------- #
-class InstallCommandTests(unittest.TestCase):
-    def test_ubuntu_uses_apt_get(self):
-        for distro in ("ubuntu22.04", "ubuntu24.04", "ubuntu26.04"):
-            with self.subTest(distro=distro):
-                self.assertEqual(m.install_command(distro),
-                                 ["apt-get", "install", "-y", "nmap"])
-
-    def test_everything_else_uses_dnf(self):
-        # bash's else branch: Azure Linux and the RHEL family, and also an
-        # empty DISTRIBUTION (it doesn't contain "ubuntu").
-        for distro in ("azurelinux3.0", "almalinux8.10", "almalinux9.x",
-                       "rhel8.10", "rhel9.x", "rocky8.10", "rocky9.x", ""):
-            with self.subTest(distro=distro):
-                self.assertEqual(m.install_command(distro),
-                                 ["dnf", "install", "-y", "nmap"])
-
-    def test_returns_a_copy(self):
-        m.install_command("ubuntu24.04").append("extra")
-        self.assertEqual(m.install_command("ubuntu24.04"),
-                         ["apt-get", "install", "-y", "nmap"])
-
-
 class FirstLineTests(unittest.TestCase):
     def test_first_line_of_nmap_version(self):
         self.assertEqual(m.first_line(_VERSION_OUTPUT), _VERSION_LINE)
@@ -130,7 +114,9 @@ class InstallTests(unittest.TestCase):
         """Run install(); return (rc, fake exec, run_capture mock, log mocks)."""
         fake = fake or _FakeExec(self.bin_dir)
         with mock.patch.object(m, "page_size", return_value=size), \
-             mock.patch.object(m, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(m, "run_capture",
                                return_value=(0, _VERSION_OUTPUT)) as capture, \
              mock.patch.object(m, "log_info") as log_info, \
@@ -174,15 +160,13 @@ class InstallTests(unittest.TestCase):
         rc, fake, capture, log_info, log_error = self._install(env)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(fake.calls,
-                         [(["apt-get", "install", "-y", "nmap"], _OP, env)])
+        self.assertEqual(fake.calls, [(_APT_NMAP, _OP, env)])
         capture.assert_called_once_with(["nmap", "--version"], _OP, env=env,
                                         failure_is_error=False)
         log_error.assert_not_called()
         msg, fields = log_info.call_args.args[1], log_info.call_args.kwargs
         self.assertEqual(msg, f"OK - nmap installed: {_VERSION_LINE}")
         self.assertEqual(fields["path"], os.path.join(self.bin_dir, "nmap"))
-        self.assertEqual(fields["package_manager"], "apt-get")
 
     def test_64k_installs_with_dnf_on_rpm_distros(self):
         for distro in ("azurelinux3.0", "almalinux9.x", "rhel9.x", "rocky8.10"):
@@ -194,11 +178,10 @@ class InstallTests(unittest.TestCase):
                 rc, fake, _, log_info, log_error = self._install(env)
 
                 self.assertEqual(rc, 0)
-                self.assertEqual(fake.calls,
-                                 [(["dnf", "install", "-y", "nmap"], _OP, env)])
+                self.assertEqual(fake.calls, [(_DNF_NMAP, _OP, env)])
                 log_error.assert_not_called()
-                self.assertEqual(log_info.call_args.kwargs["package_manager"],
-                                 "dnf")
+                self.assertTrue(log_info.call_args.args[1].startswith(
+                    "OK - nmap installed"))
 
     def test_install_failure_returns_3(self):
         env = self._env()
@@ -208,10 +191,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertEqual(len(fake.calls), 1)
         capture.assert_not_called()
+        self.assertEqual(fake.calls[0][0], _APT_NMAP)
         log_error.assert_called_once()
-        self.assertEqual(log_error.call_args.kwargs["exit_code"], 100)
-        self.assertEqual(log_error.call_args.kwargs["command"],
-                         "apt-get install -y nmap")
+        self.assertEqual(log_error.call_args.kwargs["package"], "nmap")
+
+    def test_unknown_distribution_returns_3_without_installing(self):
+        # Bash's else branch would try dnf; install_packages() knows no
+        # manager for these, so nothing runs and the step fails.
+        for distro in ("", "sles15"):
+            with self.subTest(distro=distro):
+                rc, fake, capture, _, log_error = self._install(self._env(distro))
+                self.assertEqual(rc, 3)
+                self.assertEqual(fake.calls, [])
+                capture.assert_not_called()
+                log_error.assert_called_once()
 
     def test_nmap_missing_after_install_returns_3(self):
         env = self._env("rocky9.x")
@@ -250,7 +243,7 @@ class InstallTests(unittest.TestCase):
         for exc in (OSError("sysconf failed"), ValueError("unknown name")):
             with self.subTest(exc=type(exc).__name__):
                 with mock.patch.object(m, "page_size", side_effect=exc), \
-                     mock.patch.object(m, "exec_program") as run, \
+                     mock.patch.object(package_installer, "exec_program") as run, \
                      mock.patch.object(m, "log_error") as log_error:
                     rc = m.install(self._env())
                 self.assertEqual(rc, 3)
@@ -266,8 +259,8 @@ class BashSourceTests(unittest.TestCase):
         self.script = _BASH_SCRIPT.read_text(encoding="utf-8")
 
     def test_commands_match_the_script(self):
-        self.assertIn("        " + " ".join(m._APT_INSTALL) + "\n", self.script)
-        self.assertIn("        " + " ".join(m._DNF_INSTALL) + "\n", self.script)
+        self.assertIn(f"        apt-get install -y {m._NMAP}\n", self.script)
+        self.assertIn(f"        dnf install -y {m._NMAP}\n", self.script)
         self.assertIn('[[ $DISTRIBUTION == *"ubuntu"* ]]', self.script)
         self.assertIn("PAGE_SIZE=$(getconf PAGE_SIZE)\n", self.script)
         self.assertIn(f'if [ "$PAGE_SIZE" = "{m._PAGE_SIZE_64K}" ]; then',

@@ -87,8 +87,10 @@ utils/build_config.py sets this module's install() as the `action=` of the
 "install-nccl" Step (NVIDIA images only). Deleting `action=` from that Step
 makes the build run the bash script again, which is why the .sh file is kept.
 
-Single commands run with exec_program. The SHARP plugin and nccl-tests builds
-need `module load mpi/hpcx` (and the HPCX_* variables it sets), and `module`
+Package installs go through install_packages() (utils/package_installer.py),
+one call per bash install command; other single commands run with
+exec_program. The SHARP plugin and nccl-tests builds need `module load
+mpi/hpcx` (and the HPCX_* variables it sets), and `module`
 only affects the shell it runs in, so those parts run as `bash -c` scripts
 with `set -e` (like install_rccl.py). Bash records the repo sources
 (write_repo_source_info) in the middle of those parts, so the scripts are
@@ -101,14 +103,12 @@ script succeeded.
 install() returns 0 for success or 3 for failure. It logs problems and returns
 3; it never lets an exception escape to the build loop.
 
-Dependencies: exact bash commands, installed once
--------------------------------------------------
-install_deps() runs the exact bash commands with exec_program, and install()
-calls it exactly once. We chose that over PackageInstaller because
-PackageInstaller installs one package at a time and carries on after a
-failure, whereas bash runs one `apt`/`dnf` command per line under `set -e`
-and stops at the first failure. Same commands, same order, same fail-fast
-behaviour.
+Dependencies: bash's package lists, installed once
+--------------------------------------------------
+install_deps() installs bash's package lists, one install_packages() call
+per bash `apt`/`dnf` line, and install() calls it exactly once. Same
+grouping, same order, and the first failure stops the step, as under bash's
+`set -e`.
 
 Behaviour kept from bash
 ------------------------
@@ -128,6 +128,8 @@ Behaviour kept from bash
 
 Deliberate differences from bash
 --------------------------------
+  * Installs go through install_packages(), which spells them
+    `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y`.
   * Work directory: bash downloads and builds in /tmp itself. We use
     _WORK_DIR (/tmp/azhpc-nccl), emptied first so leftovers from an earlier,
     interrupted run can't break the download/tar/git clone, and removed at
@@ -176,6 +178,7 @@ import shutil
 from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.package_pinning import dnf_pin_packages
 from utils.process import exec_program, run_capture
 from utils.repo_source import write_repo_source_info
@@ -208,29 +211,27 @@ _NCCL_TESTS_GIT_URL = "https://github.com/NVIDIA/nccl-tests.git"
 _SHARP_COMPONENT = "NCCL-RDMA_SHARP_PLUGIN"
 _NCCL_TESTS_COMPONENT = "NCCL_TESTS"
 
-# Build dependencies: the exact bash commands for each distro.
+# Build dependencies for each distro: one package list per bash install command.
 _UBUNTU2604_DEPS = [
-    ["apt", "install", "-y", "build-essential", "patchelf", "zlib1g-dev"],
+    ["build-essential", "patchelf", "zlib1g-dev"],
 ]
 _UBUNTU_DEPS = [
-    ["apt", "install", "-y", "build-essential", "devscripts", "debhelper",
-     "fakeroot", "patchelf"],
+    ["build-essential", "devscripts", "debhelper", "fakeroot", "patchelf"],
     # libibverbs-dev is deliberately NOT installed (it's commented out in
     # bash): it conflicts on bare-metal 1P builds, and on VMs it's already
     # installed by install_utils.sh or install_doca.sh.
-    ["apt", "install", "-y", "zlib1g-dev"],
+    ["zlib1g-dev"],
 ]
 _AZURE_LINUX_DEPS = [
-    ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "autoconf", "automake",
-     "git", "libtool", "patchelf"],
+    ["rpm-build", "rpmdevtools", "autoconf", "automake", "git", "libtool", "patchelf"],
 ]
 _RHEL_DEPS = [   # RHEL family: AlmaLinux, Rocky Linux, RHEL, ...
-    ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "patchelf"],
+    ["rpm-build", "rpmdevtools", "patchelf"],
 ]
 
 # Ubuntu 26.04: install and hold the packaged NCCL.
-_APT_NCCL_COMMANDS = [
-    ["apt-get", "install", "-y", "libnccl2", "libnccl-dev"],
+_APT_NCCL_PACKAGES = ["libnccl2", "libnccl-dev"]
+_APT_NCCL_HOLDS = [
     ["apt-mark", "hold", "libnccl2"],
     ["apt-mark", "hold", "libnccl-dev"],
 ]
@@ -261,8 +262,8 @@ def nccl_from_apt(distribution: str) -> bool:
     return distribution == _APT_NCCL_DISTRIBUTION
 
 
-def deps_commands(distribution: str) -> list[list[str]]:
-    """The dependency install commands bash runs on `distribution`."""
+def deps_packages(distribution: str) -> list[list[str]]:
+    """The package lists bash installs on `distribution`, one per install command."""
     if nccl_from_apt(distribution):
         return _UBUNTU2604_DEPS
     return {"ubuntu": _UBUNTU_DEPS, "azurelinux": _AZURE_LINUX_DEPS,
@@ -478,29 +479,34 @@ def _record_source(component: str, repo_dir: str, env: dict[str, str], *,
 # The phases. Each returns True on success, False after logging a failure.
 # --------------------------------------------------------------------------- #
 def install_deps(env: dict[str, str]) -> int:
-    """Install NCCL's build dependencies with bash's exact commands.
+    """Install NCCL's build dependencies, one install per bash command.
 
-    Returns 0 on success, 3 on failure (stopping at the first failing command).
+    Returns 0 on success, 3 on failure (stopping at the first failing install).
     install() calls this exactly once.
     """
     distribution = env.get("DISTRIBUTION", "")
-    commands = deps_commands(distribution)
+    package_lists = deps_packages(distribution)
     branch = distribution if nccl_from_apt(distribution) else distro_family(distribution)
     log_info(_OP, f"Installing NCCL build dependencies ({branch} branch of "
                   "install_nccl.sh)",
              distro=distribution, branch=branch,
-             packages=[p for command in commands for p in command[3:]])
-    return 0 if _run_all(commands, env) else 3
+             packages=[p for packages in package_lists for p in packages])
+    for packages in package_lists:
+        if not install_packages(packages, env, _OP):
+            return 3
+    return 0
 
 
 def _install_apt_nccl(env: dict[str, str]) -> str | None:
     """Ubuntu 26.04: install + hold the packaged NCCL; return its version."""
     log_info(_OP, f"{_APT_NCCL_DISTRIBUTION}: installing NCCL from apt (no source "
-                  "build)", packages=["libnccl2", "libnccl-dev"], source="apt")
-    if not _run_all(_APT_NCCL_COMMANDS, env):
+                  "build)", packages=_APT_NCCL_PACKAGES, source="apt")
+    if not install_packages(_APT_NCCL_PACKAGES, env, _OP):
+        return None
+    if not _run_all(_APT_NCCL_HOLDS, env):
         return None
     log_info(_OP, "Held libnccl2 and libnccl-dev with apt-mark",
-             packages=["libnccl2", "libnccl-dev"], held=True)
+             packages=_APT_NCCL_PACKAGES, held=True)
     rc, output = run_capture(_DPKG_QUERY_NCCL, _OP, env=env)
     version = apt_nccl_version(output) if rc == 0 else ""
     if not version:
@@ -543,8 +549,9 @@ def _package_ubuntu(env, source_dir, version, cuda, arch_distro) -> bool:
         return False
     deb_dir = os.path.join(source_dir, "build", "pkg", "deb")
     for deb, package in deb_packages(version, cuda, arch_distro):
-        if not _run_all([["apt", "install", "-y", f"./{deb}"],
-                         ["apt-mark", "hold", package]], env, cwd=deb_dir):
+        if not install_packages([f"./{deb}"], env, _OP, cwd=deb_dir):
+            return False
+        if not _run_all([["apt-mark", "hold", package]], env, cwd=deb_dir):
             return False
         log_info(_OP, f"Installed {deb} and held {package} with apt-mark",
                  package=package, file=deb, held=True)
@@ -560,9 +567,8 @@ def _package_azure_linux(env, source_dir, version, architecture) -> bool:
         if files == [pattern]:
             log_warn(_OP, f"no rpm matched {pattern}; passing it to dnf literally, "
                           "as bash does", pattern=pattern)
-        if not _run_all([["dnf", "install", "-y", *files]], env, cwd=source_dir):
+        if not install_packages(files, env, _OP, cwd=source_dir):
             return False
-        log_info(_OP, f"Installed {' '.join(files)} with dnf", files=files)
     return _pin_libnccl(env)
 
 

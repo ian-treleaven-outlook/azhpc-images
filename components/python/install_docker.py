@@ -123,6 +123,10 @@ Deliberate differences from bash
   * The "Waiting for containerd socket" lines are logged at DEBUG, and a socket
     that never appears is logged as a warning. Like bash, it does not fail the
     step by itself (the following `ctr plugin ls` usually will).
+  * Package installs go through install_packages(), one call per bash command:
+    `apt-get install -y -o Dpkg::Use-Pty=0 ...` / `dnf install -y ...` (the
+    documented normalisation). On a distribution it doesn't know, bash's else
+    branch would try dnf; install_packages() logs an error and returns 3.
 
 Bash's unquoted ${moby_version} is split into words, and write_component_version
 records only its first argument. When several lines match (e.g. on Azure Linux
@@ -141,6 +145,7 @@ import time
 
 from utils.component_config import DEFAULT_NODE_TYPE, config_for, write_component_version
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -166,12 +171,12 @@ _SOCKET_WAIT_SECONDS = 1
 # The nested component script that installs the NVIDIA Container Toolkit.
 _TOOLKIT_SCRIPT = "install_nvidia_container_toolkit.sh"
 
-# Package install commands per distro family, in bash's order. Each package is
-# installed by its own command, as in bash (so one failure names one package).
+# Packages per distro family, in bash's order. Each package is installed by its
+# own command, as in bash (so one failure names one package).
 _UBUNTU_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
 _UBUNTU_PINNED_PACKAGES = ["moby-engine", "moby-cli"]          # baremetal_3p
 # Ubuntu 26.04: both packages in ONE apt-get command, as in bash.
-_UBUNTU_DOCKER_IO_COMMAND = ["apt-get", "install", "-y", "docker.io", "docker-buildx"]
+_UBUNTU_DOCKER_IO_PACKAGES = ["docker.io", "docker-buildx"]
 _AZURE_LINUX_PACKAGES = ["moby-engine", "moby-cli", "docker-buildx"]
 _RHEL_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
 
@@ -364,9 +369,10 @@ def _wait_for_containerd_socket() -> int | None:
     return None
 
 
-def _moby_commands(env: dict[str, str]) -> list[list[str]] | None:
-    """The package install commands for this distro/node type, or None (logged)
-    if the baremetal_3p moby version is missing from versions.json."""
+def _moby_installs(env: dict[str, str]) -> list[list[str]] | None:
+    """The package lists to install for this distro/node type, one list per
+    bash install command, or None (logged) if the baremetal_3p moby version is
+    missing from versions.json."""
     distribution = env.get("DISTRIBUTION", "")
     # Mirrors ${TARGET_NODE_TYPE:-azure_vm_regular}: unset or empty -> default.
     node_type = env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
@@ -377,7 +383,7 @@ def _moby_commands(env: dict[str, str]) -> list[list[str]] | None:
                           "docker-buildx (no Microsoft moby packages), on every "
                           "node type", distro=distribution, node_type=node_type,
                      packages="docker.io docker-buildx")
-            return [list(_UBUNTU_DOCKER_IO_COMMAND)]
+            return [list(_UBUNTU_DOCKER_IO_PACKAGES)]
         if node_type == _BAREMETAL_3P:
             cfg = config_for("moby", env)
             # isinstance() guards against a config that isn't a JSON object.
@@ -390,11 +396,10 @@ def _moby_commands(env: dict[str, str]) -> list[list[str]] | None:
             log_info(_OP, "Ubuntu baremetal_3p: pinning moby-engine and moby-cli "
                           "to the versions.json version (no moby-buildx)",
                      distro=distribution, node_type=node_type, moby_version=moby)
-            return [["apt-get", "install", "-y", f"{package}={moby}"]
-                    for package in _UBUNTU_PINNED_PACKAGES]
+            return [[f"{package}={moby}"] for package in _UBUNTU_PINNED_PACKAGES]
         log_info(_OP, "Ubuntu: installing the latest moby-engine, moby-cli and "
                       "moby-buildx from apt", distro=distribution, node_type=node_type)
-        return [["apt-get", "install", "-y", package] for package in _UBUNTU_PACKAGES]
+        return [[package] for package in _UBUNTU_PACKAGES]
 
     if distribution == _AZURE_LINUX:
         packages = _AZURE_LINUX_PACKAGES
@@ -404,7 +409,7 @@ def _moby_commands(env: dict[str, str]) -> list[list[str]] | None:
         branch = "RHEL family"
     log_info(_OP, f"{branch}: installing {', '.join(packages)} from dnf",
              distro=distribution)
-    return [["dnf", "install", "-y", package] for package in packages]
+    return [[package] for package in packages]
 
 
 def _record(component: str, version: str) -> bool:
@@ -435,12 +440,13 @@ def install(env: dict[str, str]) -> int:
              container_toolkit=toolkit)
 
     # ---- 1. moby packages ----------------------------------------------------
-    commands = _moby_commands(env)
-    if commands is None:
-        return 3                 # already logged by _moby_commands
-    if not _run_all(commands, env):
-        log_error(_OP, "moby package installation failed", distro=distribution)
-        return 3
+    installs = _moby_installs(env)
+    if installs is None:
+        return 3                 # already logged by _moby_installs
+    for packages in installs:
+        if not install_packages(packages, env, _OP):
+            log_error(_OP, "moby package installation failed", distro=distribution)
+            return 3
 
     # ---- 2. NVIDIA Container Toolkit (nested bash component) -----------------
     if toolkit:

@@ -5,8 +5,9 @@ Two kinds of test:
   * The pure helpers (version parsing, the apt source line, and the
     `dnf list installed | grep | sed` port) are tested directly with real inputs.
   * install() is tested per distro with its external effects mocked:
-    exec_program / run_capture (apt, dnf, curl, rpm) and
-    write_component_version. The /etc paths and the scratch work directory are
+    exec_program / run_capture (apt, dnf, curl, rpm; the apt-get/dnf installs
+    run through utils.package_installer, whose exec_program shares the mock)
+    and write_component_version. The /etc paths and the scratch work directory are
     module-level constants, which the tests point at a temporary directory, so
     the real repo/pin files are genuinely copied but nothing under /etc is touched.
 
@@ -18,18 +19,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from components.python import install_pmix
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-pmix"
 # The real components/ directory, so the shipped slurm-repo files are used.
 _COMPONENT_DIR = str(Path(__file__).resolve().parents[2] / "components")
 _VERSION = "4.2.9-2"
+# What install_packages() runs (bash: `apt install -y` / `dnf -y install`).
+_APT_INSTALL = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF_INSTALL = ["dnf", "install", "-y"]
 
 _DNF_LIST = (
     "Installed Packages\n"
@@ -91,6 +97,25 @@ class VersionHelperTests(unittest.TestCase):
         self.assertEqual(install_pmix.rhel_extra_repo("rocky9.6", "9", "x86_64"), "crb")
         self.assertEqual(install_pmix.rhel_extra_repo("rocky8.10", "8", "x86_64"), "powertools")
         self.assertIsNone(install_pmix.rhel_extra_repo("almalinux10.0", "10", "x86_64"))
+
+
+class BashPackageListTests(unittest.TestCase):
+    """The package lists, against the install lines of components/install_pmix.sh."""
+
+    def test_package_lists_match_bash(self):
+        bash = (Path(_COMPONENT_DIR) / "install_pmix.sh").read_text(encoding="utf-8")
+        cases = [
+            ("apt install -y ", install_pmix.ubuntu_packages("${PMIX_VERSION}")),
+            ("dnf -y install ", install_pmix._AZURE_LINUX_PACKAGES[0]),
+            ("dnf -y install ", install_pmix._AZURE_LINUX_PACKAGES[1]),
+            ("dnf -y install ", install_pmix.rhel_packages("${PMIX_VERSION}",
+                                                           "${OS_MAJOR_VERSION}")),
+        ]
+        for prefix, packages in cases:
+            line = prefix + " ".join(packages)
+            with self.subTest(line=line):
+                # Bash's Ubuntu line ends with a "# libmunge-dev" comment.
+                self.assertRegex(bash, re.escape(line) + r"( #[^\n]*)?\n")
 
 
 class AzureLinuxPmixVersionTests(unittest.TestCase):
@@ -184,12 +209,17 @@ class _InstallTestBase(unittest.TestCase):
                 Path(cwd, command[-1].rsplit("/", 1)[-1]).write_text("pkg", encoding="utf-8")
             return 0
 
+        # Installs run in utils.package_installer; patching its exec_program
+        # with the same mock keeps one ordered record of every command.
         with mock.patch.object(install_pmix, "exec_program", side_effect=fake_exec) as ex, \
+             mock.patch.object(package_installer, "exec_program", new=ex), \
              mock.patch.object(install_pmix, "run_capture", return_value=capture) as cap, \
              mock.patch.object(install_pmix, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_pmix, "log_warn") as log_warn, \
-             mock.patch.object(install_pmix, "log_error"):
+             mock.patch.object(install_pmix, "log_error"), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"):
             rc = install_pmix.install(env)
         self.log_warn = log_warn
         return rc, commands, ex, cap, record
@@ -201,7 +231,7 @@ class _InstallTestBase(unittest.TestCase):
 class UbuntuTests(_InstallTestBase):
     _APT = [
         ["apt", "update"],
-        ["apt", "install", "-y", f"pmix={_VERSION}", "libevent-dev", "libhwloc-dev"],
+        [*_APT_INSTALL, f"pmix={_VERSION}", "libevent-dev", "libhwloc-dev"],
         ["apt-mark", "hold", f"pmix={_VERSION}", "libevent-dev", "libhwloc-dev"],
     ]
 
@@ -219,7 +249,7 @@ class UbuntuTests(_InstallTestBase):
         self.assertEqual(commands, [
             ["curl", "-sSL", "-O",
              "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb"],
-            ["apt", "install", "-y", "./packages-microsoft-prod.deb"],
+            [*_APT_INSTALL, "./packages-microsoft-prod.deb"],
             *self._APT,
         ])
         # The downloads run in the work dir, with the build env.
@@ -261,10 +291,10 @@ class UbuntuTests(_InstallTestBase):
     def test_ms_package_install_failure_returns_3_and_stops(self):
         # bash (#622): apt install -y ./packages-microsoft-prod.deb (was dpkg -i).
         rc, commands, _, _, record = self._install(
-            _env("ubuntu24.04"), fail_on=["apt", "install", "-y", "./packages-microsoft-prod.deb"])
+            _env("ubuntu24.04"), fail_on=[*_APT_INSTALL, "./packages-microsoft-prod.deb"])
 
         self.assertEqual(rc, 3)
-        self.assertEqual([c[0] for c in commands], ["curl", "apt"])
+        self.assertEqual([c[0] for c in commands], ["curl", "apt-get"])
         self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
         record.assert_not_called()
 
@@ -286,7 +316,7 @@ class UbuntuTests(_InstallTestBase):
     def test_apt_install_failure_returns_3_and_skips_the_hold(self):
         self._touch("_MS_PROD_APT_LIST")
         rc, commands, _, _, record = self._install(_env("ubuntu24.04"),
-                                                   fail_on=["apt", "install"])
+                                                   fail_on=["apt-get", "install"])
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, self._APT[:2])
@@ -318,8 +348,8 @@ class UbuntuTests(_InstallTestBase):
 
 class AzureLinuxTests(_InstallTestBase):
     _DNF = [
-        ["dnf", "-y", "install", "pmix", "pmix-devel", "pmix-tools"],
-        ["dnf", "-y", "install", "hwloc-devel", "libevent-devel", "munge-devel"],
+        [*_DNF_INSTALL, "pmix", "pmix-devel", "pmix-tools"],
+        [*_DNF_INSTALL, "hwloc-devel", "libevent-devel", "munge-devel"],
     ]
 
     def test_records_the_installed_version_not_versions_json(self):
@@ -355,7 +385,7 @@ class AzureLinuxTests(_InstallTestBase):
 
     def test_first_dnf_install_failure_returns_3_and_stops(self):
         rc, commands, _, cap, record = self._install(_env("azurelinux3.0"),
-                                                     fail_on=["dnf", "-y", "install", "pmix"])
+                                                     fail_on=[*_DNF_INSTALL, "pmix"])
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, self._DNF[:1])
@@ -364,7 +394,7 @@ class AzureLinuxTests(_InstallTestBase):
 
     def test_second_dnf_install_failure_returns_3(self):
         rc, _, _, cap, record = self._install(_env("azurelinux3.0"),
-                                              fail_on=["dnf", "-y", "install", "hwloc-devel"])
+                                              fail_on=[*_DNF_INSTALL, "hwloc-devel"])
 
         self.assertEqual(rc, 3)
         cap.assert_not_called()
@@ -389,7 +419,7 @@ class RhelTests(_InstallTestBase):
         commands = [["dnf", "config-manager", "--set-enabled", extra]] if extra else []
         return commands + [
             ["dnf", "update", "-y"],
-            ["dnf", "-y", "install", f"pmix-{_VERSION}.el{major}",
+            [*_DNF_INSTALL, f"pmix-{_VERSION}.el{major}",
              "hwloc-devel", "libevent-devel", "munge-devel"],
         ]
 
@@ -449,19 +479,21 @@ class RhelTests(_InstallTestBase):
              "codeready-builder-for-rhel-9-x86_64-rhui-rpms"]])
 
     def test_other_major_enables_no_extra_repo(self):
-        # Fake component dir with a slurm-el7.repo, so the copy succeeds.
+        # Fake component dir with a slurm-el10.repo, so the copy succeeds.
+        # (A distro install_packages() has no manager for, e.g. centos7.9,
+        # would now fail at the pmix install; bash's else branch used dnf.)
         component_dir = os.path.join(self.root, "components")
         os.makedirs(os.path.join(component_dir, "slurm-repo"))
-        Path(component_dir, "slurm-repo", "slurm-el7.repo").write_text("[el7]\n",
-                                                                       encoding="utf-8")
+        Path(component_dir, "slurm-repo", "slurm-el10.repo").write_text("[el10]\n",
+                                                                        encoding="utf-8")
         self._touch("_MS_PROD_YUM_REPO")
-        env = _env("centos7.9")
+        env = _env("almalinux10.0")
         env["COMPONENT_DIR"] = component_dir
         rc, commands, _, _, _ = self._install(env)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(self._read("_SLURM_YUM_REPO"), "[el7]\n")
-        self.assertEqual(commands, self._expected("7", None))
+        self.assertEqual(self._read("_SLURM_YUM_REPO"), "[el10]\n")
+        self.assertEqual(commands, self._expected("10", None))
 
     def test_major_without_a_repo_file_returns_3(self):
         rc, commands, _, _, record = self._install(_env("rhel10.0"))
@@ -503,7 +535,7 @@ class RhelTests(_InstallTestBase):
     def test_dnf_install_failure_returns_3(self):
         self._touch("_MS_PROD_YUM_REPO")
         rc, _, _, _, record = self._install(_env("almalinux9.8"),
-                                            fail_on=["dnf", "-y", "install"])
+                                            fail_on=_DNF_INSTALL)
 
         self.assertEqual(rc, 3)
         record.assert_not_called()

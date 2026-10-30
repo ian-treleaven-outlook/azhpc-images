@@ -2,11 +2,12 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_commands, configured_ref, patch_path,
+  * The pure helpers (dependency_packages, configured_ref, patch_path,
     build_script) are tested directly. configured_ref was also compared with
     real jq/bash in WSL on the same configs.
-  * install() is tested with exec_program replaced by a fake that records each
-    command and imitates its effect on disk: `git clone` creates the source
+  * install() is tested with exec_program (the module's and
+    utils.package_installer's, which runs the dependency installs) replaced
+    by one fake that records each command and imitates its effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvloom_cli binary. The
     install paths (_DEST_DIR, _WORK_DIR) point into a temporary directory, so
     the real file moves and cleanup run without touching /opt or /tmp, and
@@ -29,6 +30,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvloom
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nvloom"
@@ -38,16 +40,20 @@ _COMMIT = "bc0983828805d9ef2a912768fdae1465d581ef7c"
 # tests/python/<this file> -> parents[2] is the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_AZL_DEPS = [
-    ["dnf", "install", "-y", "build-essential"],
-    ["dnf", "install", "-y", "boost-devel", "boost-program-options"],
-    ["dnf", "install", "-y", "cmake"],
+_AZL_PACKAGES = [
+    ["build-essential"],
+    ["boost-devel", "boost-program-options"],
+    ["cmake"],
 ]
-_UBUNTU_DEPS = [
-    ["apt", "install", "-y", "build-essential"],
-    ["apt", "install", "-y", "libboost-program-options-dev"],
-    ["apt", "install", "-y", "cmake"],
+_UBUNTU_PACKAGES = [
+    ["build-essential"],
+    ["libboost-program-options-dev"],
+    ["cmake"],
 ]
+# The commands install_packages() runs for them.
+_AZL_DEPS = [["dnf", "install", "-y", *p] for p in _AZL_PACKAGES]
+_UBUNTU_DEPS = [["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", *p]
+                for p in _UBUNTU_PACKAGES]
 
 
 class _FakeExec:
@@ -118,13 +124,14 @@ def _env(distribution, sandbox, *, config=None, node_type=None):
 # Pure helpers.
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
-    def test_dependency_commands_follow_bash_distro_tests(self):
-        self.assertEqual(list(install_nvloom.dependency_commands("azurelinux3.0")), _AZL_DEPS)
-        self.assertEqual(list(install_nvloom.dependency_commands("ubuntu24.04")), _UBUNTU_DEPS)
-        self.assertEqual(list(install_nvloom.dependency_commands("ubuntu22.04")), _UBUNTU_DEPS)
+    def test_dependency_packages_follow_bash_distro_tests(self):
+        packages = install_nvloom.dependency_packages
+        self.assertEqual(list(packages("azurelinux3.0")), _AZL_PACKAGES)
+        self.assertEqual(list(packages("ubuntu24.04")), _UBUNTU_PACKAGES)
+        self.assertEqual(list(packages("ubuntu22.04")), _UBUNTU_PACKAGES)
         for other in ("almalinux9.8", "rocky8.10", "azurelinux3.1", ""):
             with self.subTest(distribution=other):
-                self.assertIsNone(install_nvloom.dependency_commands(other))
+                self.assertIsNone(install_nvloom.dependency_packages(other))
 
     def test_configured_ref_follows_jq_and_bash_defaults(self):
         ref = install_nvloom.configured_ref
@@ -206,6 +213,9 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(install_nvloom, "_DEST_DIR", str(self.box.dest)), \
              mock.patch.object(install_nvloom, "_WORK_DIR", str(self.box.work)), \
              mock.patch.object(install_nvloom, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as self.pkg_error, \
              mock.patch.object(install_nvloom, "write_repo_source_info",
                                side_effect=fake_source), \
              mock.patch.object(install_nvloom, "write_component_version",
@@ -381,7 +391,9 @@ class InstallTests(unittest.TestCase):
                 self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.box.dest / "nvloom_cli").exists())
                 record.assert_not_called()
-                log_error.assert_called_once()
+                # install_packages() logs a failing dependency install itself.
+                errors = self.pkg_error if fail_at < 3 else log_error
+                errors.assert_called_once()
 
     def test_clone_without_an_nvloom_directory_returns_3(self):
         rc, fake, record, log_error = self._install(

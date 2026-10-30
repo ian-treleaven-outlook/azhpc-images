@@ -3,8 +3,9 @@
   * The pure parse helpers are tested directly with realistic command output.
     Their results were also compared against the real bash pipelines
     (grep/awk/cut and bash word splitting) in WSL.
-  * install() is tested with its external effects mocked: exec_program (apt,
-    dnf, systemctl, ctr, the nested toolkit script), run_capture (docker
+  * install() is tested with its external effects mocked: exec_program (here
+    and in utils.package_installer, one mock so the order of all commands is
+    kept: apt-get, dnf, systemctl, ctr, the nested toolkit script), run_capture (docker
     --version, the package listings), write_component_version, config_for and
     time.sleep. The containerd socket path is pointed at a temporary directory;
     one test creates a real Unix socket there.
@@ -22,9 +23,13 @@ import unittest
 from unittest import mock
 
 from components.python import install_docker
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-docker"
+# What install_packages() runs for bash's `apt-get install -y` / `dnf install -y`.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
 _COMPONENT_DIR = "/repo/components"
 _TOOLKIT = f"{_COMPONENT_DIR}/install_nvidia_container_toolkit.sh"
 
@@ -182,8 +187,11 @@ class InstallTests(unittest.TestCase):
         def fake_capture(command, op, **kwargs):
             return captures[command[0]]
 
-        with mock.patch.object(install_docker, "exec_program",
-                               side_effect=fake_exec) as exec_program, \
+        exec_program = mock.Mock(side_effect=fake_exec)
+        with mock.patch.object(install_docker, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(install_docker, "run_capture",
                                side_effect=fake_capture) as run_capture, \
              mock.patch.object(install_docker, "config_for",
@@ -214,9 +222,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m), [
-            ["apt-get", "install", "-y", "moby-engine"],
-            ["apt-get", "install", "-y", "moby-cli"],
-            ["apt-get", "install", "-y", "moby-buildx"],
+            [*_APT, "moby-engine"],
+            [*_APT, "moby-cli"],
+            [*_APT, "moby-buildx"],
             [_TOOLKIT],
             *_SERVICES,
             *_CONTAINERD,
@@ -243,7 +251,7 @@ class InstallTests(unittest.TestCase):
 
                 self.assertEqual(rc, 0)
                 self.assertEqual(self._commands(m), [
-                    ["apt-get", "install", "-y", "docker.io", "docker-buildx"],
+                    [*_APT, "docker.io", "docker-buildx"],
                     [_TOOLKIT],
                     *_SERVICES,
                     *_CONTAINERD,
@@ -268,7 +276,7 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu_2604_docker_io_failures_return_3(self):
         rc, m = self._install(
             _env("ubuntu26.04"),
-            fail_on=["apt-get", "install", "-y", "docker.io", "docker-buildx"])
+            fail_on=[*_APT, "docker.io", "docker-buildx"])
         self.assertEqual(rc, 3)
         self.assertEqual(len(self._commands(m)), 1)
         m["record"].assert_not_called()
@@ -284,8 +292,8 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m)[:3], [
-            ["apt-get", "install", "-y", "moby-engine=29.1.4-ubuntu24.04u1"],
-            ["apt-get", "install", "-y", "moby-cli=29.1.4-ubuntu24.04u1"],
+            [*_APT, "moby-engine=29.1.4-ubuntu24.04u1"],
+            [*_APT, "moby-cli=29.1.4-ubuntu24.04u1"],
             [_TOOLKIT],
         ])
         m["config_for"].assert_called_once()
@@ -296,9 +304,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m)[:3], [
-            ["dnf", "install", "-y", "moby-engine"],
-            ["dnf", "install", "-y", "moby-cli"],
-            ["dnf", "install", "-y", "docker-buildx"],
+            [*_DNF, "moby-engine"],
+            [*_DNF, "moby-cli"],
+            [*_DNF, "docker-buildx"],
         ])
         self.assertEqual(m["capture"].call_args_list[1].args[0], ["rpm", "-qa"])
         m["record"].assert_called_with("MOBY_ENGINE", "25.0.3-11.azl3.x86_64")
@@ -333,9 +341,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m)[:3], [
-            ["dnf", "install", "-y", "moby-engine"],
-            ["dnf", "install", "-y", "moby-cli"],
-            ["dnf", "install", "-y", "moby-buildx"],
+            [*_DNF, "moby-engine"],
+            [*_DNF, "moby-cli"],
+            [*_DNF, "moby-buildx"],
         ])
         self.assertEqual(m["capture"].call_args_list[1].args[0],
                          ["dnf", "list", "installed"])
@@ -344,7 +352,7 @@ class InstallTests(unittest.TestCase):
     def test_baremetal_3p_only_affects_ubuntu(self):
         rc, m = self._install(_env("almalinux9.8", TARGET_NODE_TYPE="baremetal_3p"))
         self.assertEqual(rc, 0)
-        self.assertEqual(self._commands(m)[2], ["dnf", "install", "-y", "moby-buildx"])
+        self.assertEqual(self._commands(m)[2], [*_DNF, "moby-buildx"])
         m["config_for"].assert_not_called()
 
     def test_amd_skips_the_container_toolkit_and_containerd(self):
@@ -352,9 +360,9 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m), [
-            ["apt-get", "install", "-y", "moby-engine"],
-            ["apt-get", "install", "-y", "moby-cli"],
-            ["apt-get", "install", "-y", "moby-buildx"],
+            [*_APT, "moby-engine"],
+            [*_APT, "moby-cli"],
+            [*_APT, "moby-buildx"],
             *_SERVICES,
         ])
         m["sleep"].assert_not_called()
@@ -442,11 +450,20 @@ class InstallTests(unittest.TestCase):
         m["exec"].assert_not_called()
         self.assertIn("moby version", m["error"].call_args.args[1])
 
+    def test_unknown_distribution_installs_nothing_and_returns_3(self):
+        # Bash's else branch would try dnf; install_packages() knows no
+        # manager for this distribution.
+        rc, m = self._install(_env("sles15"))
+        self.assertEqual(rc, 3)
+        m["exec"].assert_not_called()
+        m["record"].assert_not_called()
+        self.assertEqual(m["error"].call_args.args[1], "moby package installation failed")
+
     def test_each_failing_command_returns_3_and_stops(self):
         sequence = [
-            ["apt-get", "install", "-y", "moby-engine"],
-            ["apt-get", "install", "-y", "moby-cli"],
-            ["apt-get", "install", "-y", "moby-buildx"],
+            [*_APT, "moby-engine"],
+            [*_APT, "moby-cli"],
+            [*_APT, "moby-buildx"],
             [_TOOLKIT],
             *_SERVICES,
             *_CONTAINERD,

@@ -5,8 +5,10 @@
     grep/sed/echo and grep/awk/cut in bash (WSL), and CUDA_PROFILE_CONTENT
     against the file the two `echo | tee` lines render.
   * install() is tested with its external effects mocked: config_for,
-    download_and_verify, exec_program (the fake performs `cp` so the licensing
-    edits run on real temporary files), run_capture (nvcc),
+    download_and_verify, exec_program (the module's and
+    utils.package_installer's, which runs the toolkit install, share one fake
+    that performs `cp` so the licensing edits run on real temporary files),
+    run_capture (nvcc),
     write_component_version and install_cuda_samples.install. Every path
     constant points into a temporary directory.
 
@@ -25,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvidiagriddriver as grid
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -38,6 +41,7 @@ _GRID_CFG = {"url": _GRID_URL, "sha256": "abc123", "version": _GRID_VERSION}
 _CUDA_CFG = {"driver": {"version": "13.2", "distribution": "ubuntu2404"},
              "samples": {"version": "13.2", "sha256": "def"}}
 _INSTALLER = f"NVIDIA-Linux-x86_64-{_GRID_VERSION}-grid-azure.run"
+_TOOLKIT_INSTALL = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0", "cuda-toolkit-13-2"]
 
 _NVCC_OUT = ("nvcc: NVIDIA (R) Cuda compiler driver\n"
              "Copyright (c) 2005-2025 NVIDIA Corporation\n"
@@ -198,11 +202,15 @@ class InstallTests(unittest.TestCase):
         def fake_download(url, sha256, dest_dir="."):
             return Path(dest_dir) / os.path.basename(url)
 
+        exec_program = mock.Mock(side_effect=fake_exec)
         with mock.patch.object(grid, "config_for",
                                side_effect=lambda c, e: configs.get(c)) as config_for, \
              mock.patch.object(grid, "download_and_verify",
                                side_effect=download or fake_download) as dl, \
-             mock.patch.object(grid, "exec_program", side_effect=fake_exec) as exec_program, \
+             mock.patch.object(grid, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(grid, "run_capture", return_value=nvcc) as run_capture, \
              mock.patch.object(grid, "write_component_version",
                                side_effect=write_error) as record, \
@@ -216,6 +224,7 @@ class InstallTests(unittest.TestCase):
         return rc, {"config_for": config_for, "download": dl, "exec": exec_program,
                     "capture": run_capture, "record": record, "samples": samples,
                     "info": log_info, "warn": log_warn, "error": log_error,
+                    "pkg_error": pkg_error,
                     "work_dir_existed": seen_work_dir}
 
     @staticmethod
@@ -230,7 +239,7 @@ class InstallTests(unittest.TestCase):
         return [
             ["bash", _INSTALLER, "--silent", "--dkms", "--kernel-module-type=open"],
             ["cp", self.template, self.conf],
-            ["apt", "install", "-y", "cuda-toolkit-13-2"],
+            _TOOLKIT_INSTALL,
             [_PERSISTENCE],
         ]
 
@@ -328,18 +337,22 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("glued" in msg for msg in self._messages(m["warn"])))
 
     # ---- warnings --------------------------------------------------------------
-    def test_non_ubuntu_warns_and_fails_at_apt_like_bash(self):
-        rc, m = self._install(_env("almalinux9.8"), fail_on="apt")
+    def test_non_ubuntu_warns_and_fails_at_the_toolkit_like_bash(self):
+        # Bash's apt fails here; the port fails at the same point without
+        # running an install (install_packages() would pick dnf).
+        rc, m = self._install(_env("almalinux9.8"))
         self.assertEqual(rc, 3)
         self.assertTrue(any("assumes Ubuntu" in msg for msg in self._messages(m["warn"])))
-        self.assertEqual(self._commands(m)[-1], ["apt", "install", "-y", "cuda-toolkit-13-2"])
+        self.assertEqual(self._commands(m)[-1], ["cp", self.template, self.conf])
+        self.assertIn("installs it with apt", m["error"].call_args.args[1])
+        m["samples"].assert_not_called()
         self.assertFalse(os.path.exists(self.work))
 
     def test_missing_cuda_apt_source_warns_and_continues(self):
         os.remove(self.cuda_source)
         rc, m = self._install()
         self.assertEqual(rc, 0)          # the (mocked) apt decides, as in bash
-        self.assertIn(["apt", "install", "-y", "cuda-toolkit-13-2"], self._commands(m))
+        self.assertIn(_TOOLKIT_INSTALL, self._commands(m))
         self.assertTrue(any("no CUDA apt source" in msg and "install_cuda_repo_and_dkms.sh"
                             in msg for msg in self._messages(m["warn"])))
 
@@ -415,7 +428,9 @@ class InstallTests(unittest.TestCase):
                 # The fake fails every command with that first word; "bash" is
                 # first, the persistence script last.
                 self.assertEqual(self._commands(m), expected[:index + 1])
-                m["error"].assert_called()
+                # install_packages() logs its own failure.
+                errors = m["pkg_error"] if command is _TOOLKIT_INSTALL else m["error"]
+                errors.assert_called()
                 self.assertFalse(os.path.exists(self.work))
 
     def test_nvcc_failure_or_empty_version(self):

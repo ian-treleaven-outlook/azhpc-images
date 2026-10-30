@@ -7,8 +7,9 @@
   * The text helpers mirroring grep/cut/sed pipelines, and the kernel 7.0
     skip pattern, were compared against real bash in WSL on representative
     input.
-  * install() runs with exec_program, config_for, check_dkms_status and
-    write_component_version mocked, `uname -r` replaced, and every /etc path
+  * install() runs with exec_program (one mock for this module's and
+    utils.package_installer's, so all commands are recorded in order),
+    config_for, check_dkms_status and write_component_version mocked, `uname -r` replaced, and every /etc path
     redirected into a temporary directory.
 
 Run from the repo root:
@@ -25,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_lustre_client as lustre
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-lustre"
@@ -36,6 +38,10 @@ _KERNEL = "5.14.0-687.el9.x86_64"
 _UBUNTU_V = "2.15.8-35-gdf4872c"
 _NOBLE_V = "2.17.0-24-gf517bc4"
 _EL_V = "2.15.8_35_gdf4872c"
+
+# What install_packages() runs for bash's `apt-get install -y` / `dnf install -y`.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
 
 _LSB = {
     "jammy": ('DISTRIB_ID=Ubuntu\nDISTRIB_RELEASE=22.04\nDISTRIB_CODENAME=jammy\n'
@@ -158,7 +164,9 @@ class HelperTests(unittest.TestCase):
                      lustre._MICROSOFT_KEY_URL, *lustre._SIGNED_BY.values(),
                      "Skipping Lustre client installation for kernel version ",
                      'CURRENT_KERNEL_VERSION=${KERNEL_VERSION:-$(uname -r)}',
-                     f'"${{CURRENT_KERNEL_VERSION}}" == "{lustre._SKIPPED_KERNEL}"']:
+                     f'"${{CURRENT_KERNEL_VERSION}}" == "{lustre._SKIPPED_KERNEL}"',
+                     "dnf install -y " + " ".join(lustre._EL_DNF_OPTIONS)
+                     + ' "${LUSTRE_PACKAGES[@]}"']:
             with self.subTest(text=text):
                 self.assertIn(text, _SCRIPT)
 
@@ -225,10 +233,12 @@ class InstallTests(unittest.TestCase):
         """Run install(env) with everything external mocked; return (rc, mocks)."""
         cfg = None if version is None else {"version": version}
 
+        exec_program = mock.Mock(side_effect=lambda c, op, **kw: 1 if c == fail_on else 0)
         with mock.patch.object(lustre, "config_for", return_value=cfg) as config_for, \
-             mock.patch.object(lustre, "exec_program",
-                               side_effect=lambda c, op, **kw: 1 if c == fail_on else 0) \
-                as exec_program, \
+             mock.patch.object(lustre, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "exec_program", exec_program), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(lustre, "check_dkms_status",
                                return_value=dkms_ok) as check, \
              mock.patch.object(lustre, "write_component_version",
@@ -275,8 +285,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self._commands(m), [
             ["apt-get", "update"],
-            ["apt-get", "install", "-y", f"lustre-client-{_NOBLE_V}"],
-            ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_NOBLE_V}"],
+            [*_APT, f"lustre-client-{_NOBLE_V}"],
+            [*_APT, f"amlfs-lustre-client-dkms-{_NOBLE_V}"],
         ])
         m["config_for"].assert_called_once_with("lustre", env)
         self.assertEqual(self.read("etc/apt/sources.list.d/amlfs.list"),
@@ -334,8 +344,8 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertEqual(self._commands(m), [
                     ["apt-get", "update"],
-                    ["apt-get", "install", "-y", f"lustre-client-{_UBUNTU_V}"],
-                    ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_UBUNTU_V}"],
+                    [*_APT, f"lustre-client-{_UBUNTU_V}"],
+                    [*_APT, f"amlfs-lustre-client-dkms-{_UBUNTU_V}"],
                 ])
                 self.assertEqual(self.read("etc/apt/sources.list.d/amlfs.list"),
                                  _fixture("amlfs.list.jammy-amd64"))
@@ -355,8 +365,8 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu_command_failures_stop(self):
         commands = [
             ["apt-get", "update"],
-            ["apt-get", "install", "-y", f"lustre-client-{_NOBLE_V}"],
-            ["apt-get", "install", "-y", f"amlfs-lustre-client-dkms-{_NOBLE_V}"],
+            [*_APT, f"lustre-client-{_NOBLE_V}"],
+            [*_APT, f"amlfs-lustre-client-dkms-{_NOBLE_V}"],
         ]
         for index, failing in enumerate(commands):
             with self.subTest(failing=failing):
@@ -369,7 +379,8 @@ class InstallTests(unittest.TestCase):
                 m["record"].assert_not_called()
                 self.assertIn("Lustre client installation failed",
                               self._messages(m["error"]))
-                # A command failure is logged by exec_program, not repeated.
+                # A command failure is logged by exec_program (and
+                # install_packages), not repeated here.
                 self.assertEqual(len(m["error"].call_args_list), 1)
 
     def test_ubuntu_dkms_check_failure(self):
@@ -420,7 +431,7 @@ class InstallTests(unittest.TestCase):
     # ---- RHEL family ---------------------------------------------------------------
     _EL_COMMANDS = [
         ["rpm", "--import", "https://packages.microsoft.com/keys/microsoft.asc"],
-        ["dnf", "install", "-y", "--disableexcludes=main", "--refresh",
+        [*_DNF, "--disableexcludes=main", "--refresh",
          f"lustre-client-dkms-{_EL_V}", f"lustre-client-{_EL_V}-devel"],
     ]
 

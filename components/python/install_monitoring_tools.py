@@ -86,6 +86,9 @@ Deliberate differences from bash
     bash would carry on and fail at the download of "vnull.tar.gz".
   * Bash's download_and_verify downloads into the current directory and then
     moves the file into /opt/azurehpc/tools; we download straight there.
+  * python3-pip is installed with install_packages(), which writes
+    `apt-get install -y -o Dpkg::Use-Pty=0 --only-upgrade python3-pip` /
+    `dnf install -y python3-pip` (the documented normalisation).
 """
 
 from __future__ import annotations
@@ -95,6 +98,7 @@ import os
 from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -110,17 +114,27 @@ _BASHRC = "/etc/bash.bashrc"
 _URL = "https://github.com/Azure/Moneo/archive/refs/tags/{tarball}"
 _ALIAS = "alias moneo='python3 /opt/azurehpc/tools/Moneo/moneo.py'"
 
+# Step 2, bash's if/elif/else (exact matches). On these distros python3-pip
+# comes from the package manager, with these install options; on any other,
+# pip upgrades itself.
+_PIP_PACKAGE = "python3-pip"
+_PIP_PACKAGE_OPTIONS = {
+    "azurelinux3.0": [],
+    "ubuntu24.04": ["--only-upgrade"],
+    "ubuntu26.04": ["--only-upgrade"],
+}
+_PIP_SELF_UPGRADE = ["python3", "-m", "pip", "install", "--upgrade", "pip"]
+
 
 # --------------------------------------------------------------------------- #
 # Pure helpers.
 # --------------------------------------------------------------------------- #
-def pip_command(distribution: str) -> list[str]:
-    """The command bash's dependency if/elif/else runs for `distribution`."""
-    if distribution == "azurelinux3.0":
-        return ["dnf", "install", "-y", "python3-pip"]
-    if distribution in ("ubuntu24.04", "ubuntu26.04"):
-        return ["apt-get", "install", "-y", "--only-upgrade", "python3-pip"]
-    return ["python3", "-m", "pip", "install", "--upgrade", "pip"]
+def pip_package_options(distribution: str) -> list[str] | None:
+    """The install_packages() options for python3-pip on `distribution`, or
+    None where bash runs `python3 -m pip install --upgrade pip` instead."""
+    options = _PIP_PACKAGE_OPTIONS.get(distribution)
+    # list(...) returns a copy, so a caller can't change the constant.
+    return None if options is None else list(options)
 
 
 def ensure_line(path: str, line: str) -> bool:
@@ -164,9 +178,18 @@ def _run(command: list[str], env: dict[str, str], what: str,
 def install_deps(env: dict[str, str]) -> bool:
     """Make sure pip is usable before installing Moneo (step 2)."""
     distribution = env.get("DISTRIBUTION", "")
-    command = pip_command(distribution)
-    log_info(_OP, "Preparing pip", distro=distribution, command=" ".join(command))
-    return _run(command, env, "the pip dependency command")
+    options = pip_package_options(distribution)
+    if options is None:
+        log_info(_OP, "Preparing pip: upgrading it with pip itself",
+                 distro=distribution, command=" ".join(_PIP_SELF_UPGRADE))
+        return _run(_PIP_SELF_UPGRADE, env, "the pip dependency command")
+    log_info(_OP, f"Preparing pip: installing {_PIP_PACKAGE} from the distro",
+             distro=distribution, package=_PIP_PACKAGE, options=" ".join(options))
+    if not install_packages([_PIP_PACKAGE], env, _OP, options=options):
+        log_error(_OP, f"installing {_PIP_PACKAGE} failed; Moneo is not installed",
+                  package=_PIP_PACKAGE)
+        return False
+    return True
 
 
 def _unpack(tarball_name: str, env: dict[str, str]) -> bool:

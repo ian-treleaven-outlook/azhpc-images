@@ -229,46 +229,55 @@ if not cfg or not cfg.get("version"):  # explicit miss, not a silent blank
 
 ---
 
-## 6. Package management: three jobs, separated
+## 6. Package management: one function, the distro decides the command
 
-The tangled `if/elif` from Problem 1 decomposes into three independently
-testable pieces.
+The tangled `if/elif` from Problem 1 comes apart into three pieces.
 
-**1 — What the component needs is data, and lives with the component:**
-
-```python
-_DEPS = {
-    "apt-get": ["build-essential", "zlib1g-dev", "libibverbs-dev"],
-    "tdnf":    ["rpm-build", "rpmdevtools", "autoconf", "libtool"],
-    "yum":     ["rpm-build", "rpmdevtools"],
-}
-```
-
-The lists differ deliberately — `build-essential` doesn't exist on RHEL, and
-Azure Linux needs packages RHEL doesn't. Note this table *names* package
-managers but never runs one, and contains no distro check.
-
-**2 — Which manager is a single shared function.** It walks `PATH` and finds the
-first manager actually **installed**, in a fixed order:
+**1 — What the component needs is data, and lives with the component.** Bash
+installs different packages per family, so a port keeps those lists next to
+its code:
 
 ```python
-_MANAGER_ORDER = ["apt-get", "apt", "dnf", "tdnf", "yum", "zypper", "pacman", "apk"]
+_UBUNTU_DEPS = ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"]
+_RPM_DEPS    = ["bzip2-devel", "libattr-devel", "libarchive-devel"]
 ```
 
-Order matters: RHEL has both `yum` and `dnf`, and `dnf` wins every time. A new
-Azure Linux version needs **zero changes** — it finds `tdnf` and carries on,
-instead of falling through to a `yum` that isn't there.
+The lists differ deliberately (`libbz2-dev` is Ubuntu's name for
+`bzip2-devel`). Choosing a list is the only distro decision a port makes.
 
-**3 — One execution gateway** runs the command, logs it, and returns the code:
+**2 — How to install is one shared function,** `install_packages()` in
+[`utils/package_installer.py`](../utils/package_installer.py):
 
 ```python
-rc = exec_program(manager.install_command(package), "install-package")
-if rc != 0:
-    log_warn("install-package", f"failed (exit {rc})")
+if not install_packages(_UBUNTU_DEPS if ubuntu else _RPM_DEPS, env, _OP):
+    return 3
 ```
 
-**So: don't write distro `if/elif` chains.** Declare a manager-keyed dict and
-hand it to `PackageInstaller`.
+It picks the manager the bash scripts use on the build's distro
+(`env["DISTRIBUTION"]`, via `manager_for_distribution()`): `apt-get` on Ubuntu,
+`dnf` on Azure Linux, AlmaLinux, Rocky and RHEL. It installs the whole list in
+**one command**, as bash's `apt-get install -y a b c` does, so dependency
+resolution and all-or-nothing failure match. Version pins (`pkg=1.2`), local
+files (`./foo.deb`) and extra flags (`options=["--only-upgrade"]`,
+`options=["--disableexcludes=main", "--refresh"]`) pass straight through. For
+the rare bash command written without `-y`, `assume_yes=False` keeps that quirk
+(log a warning: the manager aborts if it needs to ask).
+
+Make one call per bash command, so the grouping into transactions stays
+bash's. Bash spells the same install several ways (`apt` / `apt-get`,
+`dnf -y install` / `dnf install -y`, `--assumeyes`); the function always
+writes `apt-get install -y` / `dnf install -y`. That is a documented,
+behaviour-neutral difference, except that `apt-get` keeps downloaded `.deb`
+files in `/var/cache/apt/archives` where `apt` deletes them.
+
+**3 — One execution gateway** runs the command and logs it: the manager,
+packages and options, then (from `exec_program`) the exit code, duration and,
+on failure, the last 50 output lines.
+
+**So: don't build `apt-get` / `dnf` command lists in a port.** Choose the list,
+call `install_packages()`. (The `azhpc install` command uses
+`PackageInstaller`, which instead detects whatever manager is on `PATH`, for
+use on any system.)
 
 ---
 

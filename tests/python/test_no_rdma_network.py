@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import no_rdma_network as m
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _INSTALL_SH = (Path(__file__).resolve().parents[2] / "distros" / "ubuntu24.04"
@@ -22,22 +23,30 @@ class BashSourceTests(unittest.TestCase):
 
 
 class InstallRdmaCoreTests(unittest.TestCase):
+    _ENV = {"SKU": "NCv6", "DISTRIBUTION": "ubuntu24.04"}
+
     def _run(self, rc):
-        with mock.patch.object(m, "exec_program", return_value=rc) as run, \
-             mock.patch.object(m, "log_info"), \
-             mock.patch.object(m, "log_error") as error:
-            result = m.install_rdma_core({"SKU": "NCv6"})
+        with mock.patch.object(package_installer, "exec_program", return_value=rc) as run, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as error, \
+             mock.patch.object(m, "log_info"):
+            result = m.install_rdma_core(dict(self._ENV))
         return result, run, error
 
     def test_success(self):
         rc, run, error = self._run(0)
         self.assertEqual(rc, 0)
+        run.assert_called_once()
         self.assertEqual(run.call_args.args[0],
-                         ["apt-get", "install", "-y", "rdma-core", "libibverbs-dev",
-                          "ibverbs-utils", "librdmacm-dev", "pkg-config"])
+                         ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0",
+                          "rdma-core", "libibverbs-dev", "ibverbs-utils",
+                          "librdmacm-dev", "pkg-config"])
+        self.assertEqual(run.call_args.args[1], "install-rdma-core")
+        self.assertEqual(run.call_args.kwargs["env"], self._ENV)
         error.assert_not_called()
 
     def test_failure_returns_3(self):
+        # install_packages() logs the failure (manager, packages, exit code).
         rc, _, error = self._run(100)
         self.assertEqual(rc, 3)
         self.assertEqual(error.call_args.kwargs["exit_code"], 100)
