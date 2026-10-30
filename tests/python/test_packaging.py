@@ -22,6 +22,7 @@ import tarfile
 import unittest
 from unittest import mock
 
+from utils import component_config
 from utils import package_manager
 from utils import package_installer
 from utils.package_manager import PackageManager, detect_package_manager
@@ -269,13 +270,13 @@ class MpifileutilsConfigTests(unittest.TestCase):
         env = self._env({
             "mpifileutils": {"common": {"version": "0.12", "url": "u", "sha256": "s"}}
         })
-        cfg = install_mpifileutils.config_for("mpifileutils", env)
+        cfg = component_config.config_for("mpifileutils", env)
         self.assertEqual(cfg["version"], "0.12")
         self.assertEqual(cfg["url"], "u")
 
     def test_get_config_missing_component_returns_none(self):
         env = self._env({})
-        self.assertIsNone(install_mpifileutils.config_for("mpifileutils", env))
+        self.assertIsNone(component_config.config_for("mpifileutils", env))
 
 
 class MpifileutilsInstallTests(unittest.TestCase):
@@ -299,14 +300,15 @@ class MpifileutilsInstallTests(unittest.TestCase):
 
     def test_install_fails_when_no_version(self):
         env = {"COMPONENT_VERSIONS": json.dumps({})}
-        with mock.patch.object(install_mpifileutils, "log_error") as logged:
+        # require_config reports the missing version.
+        with mock.patch.object(component_config, "log_error") as logged:
             self.assertEqual(install_mpifileutils.install(env), 3)
         logged.assert_called_once()   # missing version is reported as an error
 
     def test_install_fails_when_deps_fail(self):
         env = self._env()
         with mock.patch.object(install_mpifileutils, "install_deps", return_value=3), \
-             mock.patch.object(install_mpifileutils, "download_and_verify") as dl, \
+             mock.patch.object(install_mpifileutils, "fetch_verified") as dl, \
              mock.patch("os.makedirs"):
             rc = install_mpifileutils.install(env)
         self.assertEqual(rc, 3)
