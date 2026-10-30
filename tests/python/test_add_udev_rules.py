@@ -5,8 +5,9 @@ install() does two kinds of thing, and the tests handle each differently:
   * It appends text to two files. The tests point the module's file-path
     constants at a temporary directory and check the real file contents, so
     nothing under /etc is touched.
-  * It runs udevadm twice. The tests replace exec_program with a mock, so
-    udevadm never runs; they check which commands would have run, in order.
+  * It runs udevadm twice. The tests replace utils.process.exec_program with
+    a mock, so udevadm never runs; they check which commands would have run,
+    in order.
 
 How the mocking works: `mock.patch.object(module, "name", value)` temporarily
 replaces `module.name`, only inside the `with` block.
@@ -23,6 +24,7 @@ import unittest
 from unittest import mock
 
 from components.python import add_udev_rules
+from utils import files, process
 from utils.build_config import BuildConfig, build_plan
 
 _RELOAD = ["udevadm", "control", "--reload-rules"]
@@ -64,18 +66,18 @@ class InstallTests(unittest.TestCase):
         self.rdma_file = os.path.join(self._tmp.name, "60-rdma-persistent-naming.rules")
         self.issm_file = os.path.join(self._tmp.name, "99-issm.rules")
 
-    def _install(self, *, rdma_file=None, exec_results=(0, 0)):
+    def _install(self, *, exec_results=(0, 0)):
         """Run install() with the files redirected and exec_program mocked.
 
         exec_results are the exit codes the fake udevadm returns, one per call.
-        Returns (rc, exec_program mock, log_error mock).
+        Returns (rc, exec_program mock, write_file's log_error mock).
         """
         with mock.patch.object(add_udev_rules, "_RDMA_NAMING_RULES_FILE",
-                               rdma_file or self.rdma_file), \
+                               self.rdma_file), \
              mock.patch.object(add_udev_rules, "_ISSM_RULES_FILE", self.issm_file), \
-             mock.patch.object(add_udev_rules, "exec_program",
+             mock.patch.object(process, "exec_program",
                                side_effect=list(exec_results)) as run, \
-             mock.patch.object(add_udev_rules, "log_error") as log_error:
+             mock.patch.object(files, "log_error") as log_error:
             rc = add_udev_rules.install({"DISTRIBUTION": "ubuntu24.04"})
         return rc, run, log_error
 
@@ -92,8 +94,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._read(self.issm_file), _ISSM_RULE)
         env = {"DISTRIBUTION": "ubuntu24.04"}
         self.assertEqual(run.call_args_list, [
-            mock.call(_RELOAD, "add-udev-rules", env=env),
-            mock.call(_TRIGGER, "add-udev-rules", env=env),
+            mock.call(_RELOAD, "add-udev-rules", cwd=None, env=env),
+            mock.call(_TRIGGER, "add-udev-rules", cwd=None, env=env),
         ])
         log_error.assert_not_called()
 
@@ -116,12 +118,18 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._read(self.rdma_file),
                          add_udev_rules._RDMA_NAMING_RULES * 2)
 
+    def test_missing_rules_directory_is_created(self):
+        # write_file creates missing parents (bash's `>>` would fail).
+        self.rdma_file = os.path.join(self._tmp.name, "rules.d", "60.rules")
+        rc, _, _ = self._install()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read(self.rdma_file), add_udev_rules._RDMA_NAMING_RULES)
+
     # ---- failure paths: each must return 3 and stop ------------------------
     def test_unwritable_first_file_returns_3_and_stops(self):
-        # A path inside a directory that doesn't exist: open() raises OSError,
-        # just as bash's `>>` fails when the directory is missing.
-        missing = os.path.join(self._tmp.name, "no-such-dir", "60.rules")
-        rc, run, log_error = self._install(rdma_file=missing)
+        os.mkdir(self.rdma_file)   # a directory where the file should be
+
+        rc, run, log_error = self._install()
 
         self.assertEqual(rc, 3)
         self.assertFalse(os.path.exists(self.issm_file))   # second append never ran
@@ -144,15 +152,15 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertEqual(run.call_args_list,
-                         [mock.call(_RELOAD, "add-udev-rules", env=mock.ANY)])
-        log_error.assert_called_once()
+                         [mock.call(_RELOAD, "add-udev-rules", cwd=None, env=mock.ANY)])
+        log_error.assert_not_called()      # exec_program logs the failed command
 
     def test_trigger_failure_returns_3(self):
         rc, run, log_error = self._install(exec_results=(0, 127))
 
         self.assertEqual(rc, 3)
         self.assertEqual(run.call_count, 2)
-        log_error.assert_called_once()
+        log_error.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
