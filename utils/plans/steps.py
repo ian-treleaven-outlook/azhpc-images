@@ -24,11 +24,13 @@ from components.python import (
     install_azsecpack_prereqs, install_azure_persistent_rdma_naming, install_aznfs,
     install_dcgm, install_doca, install_docker, install_health_checks, install_hpcdiag,
     install_intel_libs, install_libfabric, install_lustre_client, install_mofed,
-    install_monitoring_tools, install_mpifileutils, install_mpis, install_nccl, install_nvbandwidth_tool,
-    install_nvidiagpudriver, install_nvidiagriddriver, install_nvloom, install_nvshmem,
-    install_pmix, install_rccl, install_rocm, install_waagent, no_rdma_network,
-    remove_unused_packages, setup_sku_customizations, trivy_scan, write_kernel_os_version,
+    install_monitoring_tools, install_mpifileutils, install_mpis, install_nccl,
+    install_nvbandwidth_tool, install_nvidiagpudriver, install_nvidiagriddriver,
+    install_nvloom, install_nvshmem, install_pmix, install_rccl, install_rocm,
+    install_waagent, no_rdma_network, remove_unused_packages, setup_sku_customizations,
+    trivy_scan, write_kernel_os_version,
 )
+from components.python import azurelinux_network_config as azl_network_config
 from utils.logger import log_info
 from utils.plans.step import Step
 from utils.process import exec_program
@@ -231,3 +233,8 @@ def unused_packages(**kw):
 def mofed(**kw):
     """Azure Linux's InfiniBand stack (MOFED), in place of DOCA."""
     return Step("install-mofed", "install_mofed.sh", action=install_mofed.install, **kw)
+
+def azurelinux_network_config(**kw):
+    """./network-config.sh in distros/azurelinux3.0 (the RHEL family's differs)."""
+    return Step("network-config", "network-config.sh", base="distro",
+                action=azl_network_config.install, **kw)
