@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from utils import build_config
-from utils.plans import steps
+from utils.plans import PLANS, steps
 from utils.build_config import BuildConfig, ImageBuilder, Step, build_plan, resolve_config
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -189,6 +189,31 @@ class GatingTests(unittest.TestCase):
         self.assertEqual(warned.call_args.kwargs["requested_gpu"], "VR200")
         self.assertEqual(_plan_scripts(cfg), _plan_scripts(_cfg("NVidia", "GB200")))
 
+    def test_vr200_is_only_remapped_where_install_sh_does_it(self):
+        # Only distros/ubuntu24.04/install.sh exports SKU=GB200 for VR200;
+        # Azure Linux 3.0's keeps VR200 (so its GB200-only steps don't run).
+        args = Namespace(vendor="NVidia", gpu="VR200", os="Azure3", spec=None, fips=False)
+        with mock.patch.object(build_config, "log_warn") as warned:
+            cfg = resolve_config(args)
+        self.assertEqual(cfg.gpu, "VR200")
+        self.assertEqual(cfg.architecture, "aarch64")
+        warned.assert_not_called()
+
+    def test_sku_aliases_match_each_install_sh(self):
+        for os_name, plan in PLANS.items():
+            text = (_REPO_ROOT / build_config.DISTRO_DIRS[os_name] / "install.sh").read_text(
+                encoding="utf-8")
+            in_bash = dict(re.findall(
+                r'export SKU=\$\(\[\[ \$2 == "(\w+)" \]\] && echo "(\w+)"', text))
+            with self.subTest(os=os_name):
+                self.assertEqual(plan.sku_aliases, in_bash)
+
+    def test_rackscale_skus_are_the_ones_packer_treats_as_aarch64(self):
+        for sku in ("GB200", "GB300", "VR200"):
+            self.assertTrue(build_config.is_rackscale(sku), sku)
+        for sku in ("A100", "H100", "V100", "NCv6", "MI300X"):
+            self.assertFalse(build_config.is_rackscale(sku), sku)
+
     def test_other_gpus_are_not_remapped(self):
         args = Namespace(vendor="NVidia", gpu="H100", os="Ubuntu24", spec=None, fips=False)
         with mock.patch.object(build_config, "log_warn") as warned:
@@ -210,7 +235,7 @@ class GatingTests(unittest.TestCase):
                 args = Namespace(vendor=vendor, gpu=sku, os="Ubuntu24", spec=None, fips=False)
                 with mock.patch.object(build_config, "log_warn"):
                     cfg = resolve_config(args)
-                self.assertEqual(cfg.gpu, build_config.build_sku(sku))
+                self.assertEqual(cfg.gpu, build_config.build_sku(sku, "Ubuntu24"))
 
     def test_packer_python_cli_os_map_matches_the_cli(self):
         # packer/variables.pkr.hcl maps each distro folder with a Python plan to

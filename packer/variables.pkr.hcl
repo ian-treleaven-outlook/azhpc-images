@@ -735,7 +735,10 @@ locals {
   # azhpc.py --os for each distro folder whose install.sh the Python build plan
   # mirrors. Add a folder when its per-distro plan lands (ADO 991-997).
   python_cli_os_by_folder = {
-    "ubuntu24.04" = "Ubuntu24"
+    "ubuntu22.04"   = "Ubuntu22"
+    "ubuntu24.04"   = "Ubuntu24"
+    "ubuntu26.04"   = "Ubuntu26"
+    "azurelinux3.0" = "Azure3"
   }
   python_cli_os     = lookup(local.python_cli_os_by_folder, local.os_script_folder_name, "")
   python_cli_vendor = local.gpu_platform == "AMD" ? "AMD" : "NVidia"

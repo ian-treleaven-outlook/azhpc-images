@@ -145,11 +145,12 @@ def cmd_versions(args_list) -> int:
     versions = json.loads(spec.read_text(encoding="utf-8"))
 
     distribution = DISTRIBUTIONS[ns.os]
+    sku = build_sku(ns.gpu, ns.os)
     report = resolve_report(
         versions, distribution=distribution, architecture=ns.arch,
-        gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
+        gpu=GPU_ARGS[ns.vendor], sku=sku, node_type=ns.node_type,
     )
-    built_as = "" if build_sku(ns.gpu) == ns.gpu else f" (built as {build_sku(ns.gpu)})"
+    built_as = "" if sku == ns.gpu else f" (built as {sku})"
     print(f"# Resolved component versions for {ns.vendor}/{ns.gpu}{built_as} "
           f"on {ns.os} ({ns.arch}, {ns.node_type})")
     print(format_report(report))
@@ -186,11 +187,12 @@ def cmd_validate(args_list) -> int:
     versions = json.loads(spec.read_text(encoding="utf-8"))
 
     distribution = DISTRIBUTIONS[ns.os]
+    sku = build_sku(ns.gpu, ns.os)
     issues = check_cuda_consistency(
         versions, distribution=distribution, architecture=ns.arch,
-        gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
+        gpu=GPU_ARGS[ns.vendor], sku=sku, node_type=ns.node_type,
     )
-    built_as = "" if build_sku(ns.gpu) == ns.gpu else f" (built as {build_sku(ns.gpu)})"
+    built_as = "" if sku == ns.gpu else f" (built as {sku})"
     target = f"{ns.vendor}/{ns.gpu}{built_as} on {ns.os} ({ns.arch}, {ns.node_type})"
     if not issues:
         print(f"OK: no version-consistency issues for {target}")

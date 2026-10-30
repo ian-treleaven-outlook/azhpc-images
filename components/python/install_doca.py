@@ -60,8 +60,8 @@ Deliberate differences from bash
     Dpkg::Use-Pty=0` / `dnf install -y`); systemctl through utils.services.
   * Missing config fails up front: version always; url + sha256 for a public
     package; repo_file + sha256 for a private one.
-  * OFED: a failing `ofed_info` or a first line with fewer than four
-    '-'-separated fields fails the step (bash would record "" or "-").
+  * OFED: an unreadable `ofed_info` version fails the step (bash would
+    record "" or "-"; see utils/ofed.py).
   * RHEL family: dnf.conf is restored from the .bak even if the install
     fails (bash's `set -e` exits first and leaves the edited copy). The
     exclude= edit (edit_file) keeps every other byte, like sed -i.
@@ -98,6 +98,7 @@ from utils.download import fetch_verified, verify_checksum
 from utils.files import (copy_file, edit_file, make_dirs, move_file, remove_paths,
                          write_file)
 from utils.logger import log_error, log_info, log_warn
+from utils.ofed import record_ofed_version
 from utils.package_installer import install_packages, refresh_package_index
 from utils.process import command_exists, exec_program, run, run_all, run_capture
 from utils.services import systemctl
@@ -213,23 +214,6 @@ def parse_apt_cache_version(apt_cache_output: str) -> str | None:
             fields = line.split()
             return fields[1] if len(fields) >= 2 else None
     return None
-
-
-def parse_ofed_version(ofed_info_output: str) -> str | None:
-    """Extract the OFED version from `ofed_info` output.
-
-    Mirrors: ofed_info | sed -n '1,1p' | awk -F'-' 'OFS="-" {print $3,$4}' | tr -d ':'
-    i.e. take the first line, split on '-', join the 3rd and 4th fields with '-',
-    and drop any ':'. Returns None if the first line has too few fields.
-    """
-    lines = ofed_info_output.splitlines()
-    if not lines:
-        return None
-    fields = lines[0].split("-")
-    if len(fields) < 4:
-        return None
-    result = f"{fields[2]}-{fields[3]}".replace(":", "")
-    return result or None
 
 
 def strip_dnf_excludes(conf_text: str) -> str:
@@ -711,16 +695,7 @@ def _pin_baseos_conflicts(env: dict[str, str]) -> bool:
 # --------------------------------------------------------------------------- #
 def _record_versions(env: dict[str, str], doca_version: str) -> bool:
     """Record DOCA, then OFED as ofed_info reports it."""
-    if not record_version("DOCA", doca_version, _OP):
-        return False
-    rc, output = run_capture(["ofed_info"], _OP, env=env)
-    ofed = parse_ofed_version(output) if rc == 0 else None
-    if not ofed:
-        first = output.splitlines()[0] if output.splitlines() else ""
-        log_error(_OP, "could not read the OFED version from ofed_info",
-                  exit_code=rc, first_line=first)
-        return False
-    return record_version("OFED", ofed, _OP)
+    return record_version("DOCA", doca_version, _OP) and record_ofed_version(env, _OP)
 
 
 def _disable_ipoib_if_unused(env: dict[str, str]) -> bool:

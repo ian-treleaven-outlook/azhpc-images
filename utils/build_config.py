@@ -30,23 +30,23 @@ VALID_GPUS = {
 }
 DEDICATED_PATH_GPUS = {"GB200", "GB300", "NCv6", "V100"}
 
-# Placeholder SKUs that bash builds as another SKU. distros/ubuntu24.04/install.sh:
-#     export SKU=$([[ $2 == "VR200" ]] && echo "GB200" || echo "$2")
-# so a VR200 image is built exactly like a GB200 one (driver, NVLink tools,
-# aarch64, versions.json lookups...). We do the same.
-SKU_ALIASES = {"VR200": "GB200"}
 
-# SKUs with rackscale NVLink (after SKU_ALIASES), which expect NVLINK_RACKSCALE=true.
-RACKSCALE_GPUS = {"GB200", "GB300"}
+def is_rackscale(gpu: str) -> bool:
+    """Grace/Vera rackscale NVLink SKUs (GB200, GB300, VR200): aarch64, and
+    NVLINK_RACKSCALE=true. The same test Packer uses (startswith GB / VR)."""
+    return gpu.startswith(("GB", "VR"))
 
 
-def build_sku(gpu: str) -> str:
-    """The SKU bash actually builds for `gpu`, e.g. "VR200" -> "GB200".
+def build_sku(gpu: str, os_name: str | None = None) -> str:
+    """The SKU bash actually builds for `gpu` on `os_name`.
 
-    dict.get(key, default) returns `default` when the key isn't in the dict,
-    so any SKU without an alias is returned unchanged.
+    Some install.sh scripts build one SKU as another: Ubuntu 24.04's turns
+    VR200 into GB200 (`export SKU=$([[ $2 == "VR200" ]] && echo "GB200" ...)`).
+    Each distro plan lists its own (DistroPlan.sku_aliases); any other SKU,
+    or an OS without a plan, is returned unchanged.
     """
-    return SKU_ALIASES.get(gpu, gpu)
+    plan = PLANS.get(os_name) if os_name else None
+    return plan.sku_aliases.get(gpu, gpu) if plan else gpu
 
 # --os value -> its distros/ folder, and the distribution versions.json uses
 # for it (see TargetOS in utils/plans/__init__.py).
@@ -143,8 +143,8 @@ class BuildConfig:
 
     @property
     def architecture(self) -> str:
-        """Target CPU architecture, derived from the SKU (Grace SKUs are ARM)."""
-        return "aarch64" if self.gpu in {"GB200", "GB300"} else "x86_64"
+        """Target CPU architecture, derived from the SKU (Grace/Vera SKUs are ARM)."""
+        return "aarch64" if is_rackscale(self.gpu) else "x86_64"
 
 class ConfigError(Exception):
     def __init__(self, message: str, code: int):
@@ -191,15 +191,20 @@ def resolve_config(args) -> BuildConfig:
         except (json.JSONDecodeError, OSError):
             raise ConfigError(f"spec file is malformed JSON: {args.spec}", 2)
 
-    # Placeholder SKUs are built as another SKU, as in bash (see SKU_ALIASES).
-    # The requested name stays in every log line's "gpu" field (azhpc.py sets
-    # it before this runs), so telemetry still shows VR200 was asked for.
-    gpu = build_sku(args.gpu)
+    # Placeholder SKUs some install.sh scripts build as another SKU
+    # (DistroPlan.sku_aliases). The requested name stays in every log line's
+    # "gpu" field (azhpc.py sets it before this runs), so telemetry still shows
+    # VR200 was asked for.
+    gpu = build_sku(args.gpu, args.os)
     if gpu != args.gpu:
         log_warn("resolve-config",
                  f"GPU '{args.gpu}' is built as {gpu}: a placeholder mapping copied "
-                 "from distros/ubuntu24.04/install.sh",
+                 f"from {DISTRO_DIRS[args.os]}/install.sh",
                  requested_gpu=args.gpu, build_gpu=gpu)
+    # SKUs this distro's install.sh refuses, before it does anything.
+    error = plan.reject_sku(gpu)
+    if error:
+        raise ConfigError(error, 1)
 
     # build and return the immutable config object
     return BuildConfig(
@@ -367,7 +372,7 @@ class ImageBuilder:
         # (startswith "GB"/"VR") and the shared driver/tuning scripts read. Like
         # bash, we don't derive it ourselves; but a manual build without it
         # silently gets the non-rackscale driver path, so say so.
-        if cfg.gpu in RACKSCALE_GPUS and env.get("NVLINK_RACKSCALE", "").lower() != "true":
+        if is_rackscale(cfg.gpu) and env.get("NVLINK_RACKSCALE", "").lower() != "true":
             log_warn("resolve-config",
                      f"NVLINK_RACKSCALE is not 'true' for {cfg.gpu}: the driver step "
                      "will install fabric manager instead of IMEX/CDMM, as bash would "

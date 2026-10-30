@@ -1,6 +1,6 @@
 """disable_predictive_interface_renaming.py — Python port of
-distros/<distro>/disable_predictive_interface_renaming.sh (ubuntu22.04 and
-ubuntu24.04 carry the same script).
+distros/<distro>/disable_predictive_interface_renaming.sh (ubuntu22.04,
+ubuntu24.04 and ubuntu26.04 carry the same script).
 
 Adds the kernel parameter `net.ifnames=0` (classic eth0, eth1, ... interface
 names, which the HPC image and its tooling expect, instead of "predictable"

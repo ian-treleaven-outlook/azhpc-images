@@ -102,11 +102,15 @@ def refresh_package_index(env: dict[str, str], op: str) -> bool:
     return exec_program(command, op, env=env) == 0
 
 
-def remove_packages(packages, env: dict[str, str], op: str, *, purge: bool = False) -> bool:
-    """`apt-get remove|purge -y <packages>` / `dnf remove -y <packages>`.
+def remove_packages(packages, env: dict[str, str], op: str, *, purge: bool = False,
+                    options=()) -> bool:
+    """`apt-get remove|purge [options] -y <packages>` / `dnf remove [options] -y <packages>`.
 
     purge=True also deletes the packages' configuration files (apt-get purge;
-    dnf has no separate purge). All packages in one command, like install.
+    dnf has no separate purge). `options` are extra manager flags, such as
+    `["--auto-remove"]` (apt-get) to also remove dependencies nothing else
+    needs; the caller knows which family it is in. All packages in one
+    command, like install.
     """
     packages = [packages] if isinstance(packages, str) else list(packages)
     manager = _manager(env, op, "remove packages")
@@ -114,8 +118,9 @@ def remove_packages(packages, env: dict[str, str], op: str, *, purge: bool = Fal
         return False
     verb = ("purge" if purge else "remove") if manager == "apt-get" else "remove"
     log_info(op, f"Removing {len(packages)} package(s) with {manager}",
-             package_manager=manager, packages=" ".join(packages), purge=purge)
-    return exec_program([manager, verb, "-y", *packages], op, env=env) == 0
+             package_manager=manager, packages=" ".join(packages), purge=purge,
+             options=" ".join(options))
+    return exec_program([manager, verb, *options, "-y", *packages], op, env=env) == 0
 
 
 def update_packages(packages, env: dict[str, str], op: str) -> bool:

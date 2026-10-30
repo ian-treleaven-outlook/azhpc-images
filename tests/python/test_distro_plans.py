@@ -58,7 +58,11 @@ def _cfg(os_name, vendor, gpu):
 
 def _targets(os_name):
     plan = PLANS[os_name]
-    return [(vendor, gpu) for vendor in sorted(plan.vendors) for gpu in _SKUS[vendor]]
+    # Some install.sh scripts refuse SKUs before doing anything (Ubuntu 26.04:
+    # V100, GB200, VR200, NCv6); resolve_config fails those, so only the SKUs
+    # a distro builds are checked against its install.sh.
+    return [(vendor, gpu) for vendor in sorted(plan.vendors) for gpu in _SKUS[vendor]
+            if not plan.reject_sku(gpu)]
 
 
 def _planned(cfg):
@@ -113,9 +117,10 @@ class ResolveConfigTests(unittest.TestCase):
                              "AMD GPU support is not implemented yet for X.")
             self.assertEqual(self._resolve("Ubuntu24").vendor, "NVidia")
 
+    @unittest.skipUnless(PENDING, "every --os has a plan")
     def test_build_plan_refuses_an_os_without_a_plan(self):
         with self.assertRaises(ConfigError):
-            build_plan(_cfg("Azure3", "NVidia", "A100"))
+            build_plan(_cfg(next(iter(PENDING)), "NVidia", "A100"))
 
 
 class InstallShParityTests(unittest.TestCase):
