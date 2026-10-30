@@ -7,14 +7,33 @@ communication libraries). This step installs it on AMD GPU images (MI200 /
 MI300X / MI300HF) and sets up the machine so the GPUs work after boot:
 
   1. Install ROCm, with one branch per distro family:
-       * Ubuntu        download + verify the `amdgpu-install` .deb from
-                       versions.json, install it with apt, then run
-                       `amdgpu-install -y --usecase=graphics,rocm` and install
-                       rocm-bandwidth-test.
+       * Ubuntu 26.04  ROCm 10 from AMD's apt repos: download and dearmor the
+                       two AMD signing keys into /etc/apt/keyrings, write three
+                       apt source files (ROCm core, the amdgpu driver version
+                       from versions.json's "amdgpu" entry, and RVS), set up
+                       the amdgpu DKMS patch (below), install the amdgpu DKMS
+                       driver and check DKMS built it, then install the ROCm
+                       core SDK and RVS. The ROCm version recorded is the one
+                       the SDK reports in /opt/rocm/core/.info/version, and the
+                       AMDGPU and RVS package versions are recorded too.
+                       /opt/rocm/lib is added to the dynamic linker's path.
+       * other Ubuntu  download + verify the `amdgpu-install` .deb from
+                       versions.json, install it with apt, set up the amdgpu
+                       DKMS patch, then run `amdgpu-install -y
+                       --usecase=graphics` and apt-get install an explicit list
+                       of ROCm packages (the `rocm` metapackage minus MIVisionX
+                       and rocDecode, whose FFmpeg/Qt/... dependencies have
+                       CVEs that block publishing). Ubuntu 22.04 also gets
+                       libstdc++-12-dev. Then install rocm-bandwidth-test.
        * Azure Linux   install the AMD repo package, the GPU kernel drivers for
                        the running kernel and the amdgpu packages, append an
                        [amd_rocm] repo to /etc/yum.repos.d/amd_rocm.repo for
                        the ROCm version, then dnf-install the ROCm packages.
+     The amdgpu DKMS patch (Ubuntu only) backports a kernel API change in
+     pci_resize_resource() so the amdgpu module builds on newer kernels. It is
+     copied to /etc/dkms/amdgpu/patches/, and /etc/dkms/amdgpu.conf tells DKMS
+     to apply it only when the driver source doesn't already have AMD's own
+     fix (or this backport).
   2. Write a udev rules file that gives every user access to the GPUs
      (/dev/kfd and the DRM render nodes), and reload/trigger udev.
   3. Record the ROCM version in the component-versions file.
@@ -31,19 +50,57 @@ constants below):
 
     rocm_metadata=$(get_component_config "rocm")
     rocm_version=$(jq -r '.version' <<< $rocm_metadata)
-    rocm_url=$(jq -r '.url' <<< $rocm_metadata)
-    rocm_sha256=$(jq -r '.sha256' <<< $rocm_metadata)
-    DEBPACKAGE=$(basename ${rocm_url})
 
-    if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
+    configure_amdgpu_dkms_patches() {
+        mkdir -p /etc/dkms/amdgpu/patches
+        cp "${COMPONENT_DIR}/patches/amdgpu-pci-resize-resource-exclude-bars.patch" \\
+            /etc/dkms/amdgpu/patches/pci-resize-resource-exclude-bars.patch
+        cat > /etc/dkms/amdgpu.conf <<'EOF'
+        ...  (_AMDGPU_DKMS_CONF)
+        EOF
+    }
+
+    if [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
+        driver_metadata=$(get_component_config "amdgpu")
+        driver_version=$(jq -er '.version' <<< "$driver_metadata")
+        driver_url="https://repo.radeon.com/amdgpu/${driver_version}/ubuntu"
+        rocm_package="amdrocm-core-sdk${rocm_version}"
+        apt install -y ca-certificates wget gnupg dkms "linux-headers-$(uname -r)"
+        install -d -m 0755 /etc/apt/keyrings
+        wget -O /tmp/amdrocm-packages.key https://stable.repo.amd.com/rocm/gpg/packages.gpg
+        gpg --batch --yes --dearmor -o /etc/apt/keyrings/amdrocm.gpg /tmp/amdrocm-packages.key
+        wget -O /tmp/amdgpu-packages.key https://repo.radeon.com/rocm/rocm.gpg.key
+        gpg --batch --yes --dearmor -o /etc/apt/keyrings/amdgpu.gpg /tmp/amdgpu-packages.key
+        chmod 0644 /etc/apt/keyrings/amdrocm.gpg /etc/apt/keyrings/amdgpu.gpg
+        rm -f /tmp/amdrocm-packages.key /tmp/amdgpu-packages.key
+        cat > /etc/apt/sources.list.d/amdrocm-stable.sources <<EOF ... EOF
+        cat > /etc/apt/sources.list.d/amdgpu.list <<EOF ... ${driver_url} ... EOF
+        cat > /etc/apt/sources.list.d/rvs.list <<EOF ... EOF
+        apt update
+        configure_amdgpu_dkms_patches
+        apt install -y amdgpu-dkms amdgpu-dkms-firmware
+        check_dkms_status amdgpu
+        apt install -y "$rocm_package" amdrocm10-rvs
+        rocm_version=$(cat /opt/rocm/core/.info/version)
+        write_component_version "AMDGPU" "$(dpkg-query -W -f='${Version}' amdgpu-dkms)"
+        rvs_version=$(dpkg-query -W -f='${Version}' amdrocm10-rvs)
+        write_component_version "RVS" "$rvs_version"
+        echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf
+        ldconfig
+    elif [[ $DISTRIBUTION == *"ubuntu"* ]]; then
+        rocm_url=$(jq -r '.url' <<< $rocm_metadata)
+        rocm_sha256=$(jq -r '.sha256' <<< $rocm_metadata)
+        DEBPACKAGE=$(basename ${rocm_url})
         download_and_verify ${rocm_url} ${rocm_sha256}
         apt install -y ./${DEBPACKAGE}
-        if [[ $DISTRIBUTION == "ubuntu24.04" ]]; then
-            # TODO: go back to bundled userspace once we move back to ROCm 7.0
-            # ... (commented-out apt install of amdgpu-dkms/rocm) ...
-            amdgpu-install -y --usecase=graphics,rocm
-        else
-            amdgpu-install -y --usecase=graphics,rocm
+        configure_amdgpu_dkms_patches
+        # (commented-out if/else and TODOs: go back to the full `rocm` install
+        #  once ROCm 7.0 is used again)
+        amdgpu-install -y --usecase=graphics
+        apt-get install -y rocm-utils rocm-developer-tools rocm-openmp-sdk \\
+            rocm-opencl-sdk rocm-ml-sdk migraphx migraphx-dev rpp rpp-dev
+        if [[ $DISTRIBUTION == "ubuntu22.04" ]]; then
+            apt-get install -y libstdc++-12-dev
         fi
         apt install -y rocm-bandwidth-test
         rm -f ./${DEBPACKAGE}
@@ -110,17 +167,27 @@ Behaviour kept from bash
   * `sudo` is kept on `udevadm trigger`, exactly as bash runs it.
   * Appends stay appends (amd_rocm.repo, blacklist.conf), so a rerun adds the
     blocks again, as bash does; a warning is logged when the text is already
-    there. The udev rules, init script and service unit are overwritten.
-  * Ubuntu blacklists amdgpu, so nothing loads it at boot except the
-    rocmstartup service's script, once all the GPUs have appeared. A warning
-    says so in the log.
+    there. Every other file (DKMS patch and config, apt sources, keyrings,
+    rocm.conf, udev rules, init script, service unit) is overwritten.
+  * Ubuntu (26.04 included) blacklists amdgpu, so nothing loads it at boot
+    except the rocmstartup service's script, once all the GPUs have appeared.
+    A warning says so in the log.
   * `systemctl start rocmstartup` runs on the build VM too, as in bash. The
     script then polls the PCI bus for AMD GPUs for up to ~15 minutes, and a
-    build VM may have none; a warning is logged before starting it.
-  * Both Ubuntu versions run the same `amdgpu-install` command. Bash has an
-    if/else for ubuntu24.04 with identical branches plus a commented-out TODO
-    ("go back to bundled userspace once we move back to ROCm 7.0"); see the
-    comment in _install_ubuntu.
+    build VM may have none; a warning is logged before starting it. (Upstream
+    #653 briefly made Packer wait for rocmstartup after the reboot, then
+    reverted that in the same PR; install_rocm.sh's start + enable is
+    unchanged.)
+  * Ubuntu 26.04 records ROCM from /opt/rocm/core/.info/version (what the SDK
+    says it is, e.g. "10.0.0"), not versions.json's "10.0", as bash does. Both
+    are logged. Its RVS package name has a hard-coded "10" (amdrocm10-rvs),
+    as in bash, even though the SDK package name follows versions.json.
+  * The amdgpu DKMS patch and config are written on every Ubuntu, just before
+    the step that installs amdgpu-dkms (apt on 26.04, amdgpu-install on the
+    others), as in bash.
+  * Ubuntu 22.04 and 24.04 run the same amdgpu-install + explicit package
+    list. Bash keeps the old ubuntu24.04 if/else (and a "bundled userspace"
+    TODO for ROCm 7.0) commented out; see the comment in _install_ubuntu.
 
 Deliberate differences from bash
 --------------------------------
@@ -129,15 +196,24 @@ Deliberate differences from bash
     write the udev rules, install the boot service and record ROCM, so the
     image would claim a ROCm it doesn't have. (versions.json has ROCm entries
     for Rocky Linux, but the bash never installs them.)
-  * Missing config fails up front: a missing version on every distro, and a
-    missing url/sha256 on Ubuntu (bash would try to download "null"). Azure
-    Linux uses only the version, as in bash (its versions.json entry has no
-    url), so url/sha256 aren't required there.
+  * Missing config fails up front: a missing ROCm version on every distro
+    (bash would use "null", e.g. apt install amdrocm-core-sdknull); a missing
+    url/sha256 on Ubuntu other than 26.04 (bash would try to download
+    "null"); a missing "amdgpu" version on Ubuntu 26.04 (bash's `jq -e` stops
+    there too, before any change). Azure Linux and Ubuntu 26.04 use only the
+    ROCm version, as in bash, so url/sha256 aren't required there.
+  * On Ubuntu, a missing COMPONENT_DIR or DKMS patch file fails up front.
+    Bash's `cp` would fail too, but only after the repos/.deb were set up.
   * An empty `uname -r` fails instead of producing package/initramfs names
     with a hole in them.
-  * The .deb is downloaded into a scratch work directory (_WORK_DIR) instead
-    of the distro build directory bash runs in; the directory is emptied
-    before use and removed afterwards.
+  * Ubuntu 26.04: a missing or empty /opt/rocm/core/.info/version, or a
+    failing/empty `dpkg-query` for amdgpu-dkms or amdrocm10-rvs, fails the
+    step. Bash stops on a failing `cat` and RVS query (assignments under
+    `set -e`), but for AMDGPU the query runs inside a command argument, which
+    `set -e` doesn't check, and empty values would be recorded.
+  * The amdgpu-install .deb (Ubuntu 22.04/24.04) is downloaded into a scratch
+    work directory (_WORK_DIR) instead of the distro build directory bash
+    runs in; the directory is emptied before use and removed afterwards.
   * The init script is written straight to /etc/init.d/initamdgpu.sh instead
     of via /tmp/tempinit.sh + cp + rm; the resulting file is the same. Its
     mode then gets the execute bits added, as `chmod +x` does (0644 -> 0755
@@ -158,15 +234,18 @@ import shutil
 import stat
 
 from utils.component_config import config_for, write_component_version
+from utils.dkms import check_dkms_status
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.process import exec_program
+from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
 _OP = "install-rocm"
 
-# Bash's Azure Linux branch is an exact match on this value.
+# Bash's distro branches that are exact matches on these values.
 _AZURE_LINUX = "azurelinux3.0"
+_UBUNTU_2604 = "ubuntu26.04"
+_UBUNTU_2204 = "ubuntu22.04"
 
 # ---- Paths (module-level so tests can point them at a temporary directory) --
 # Scratch directory for the amdgpu-install .deb (bash uses its current dir).
@@ -178,6 +257,43 @@ _INIT_SCRIPT = "/etc/init.d/initamdgpu.sh"
 _SERVICE_FILE = "/etc/systemd/system/rocmstartup.service"
 _SERVICE_NAME = "rocmstartup"
 
+# The amdgpu DKMS patch: its source (relative to COMPONENT_DIR), where DKMS
+# looks for it, the name it gets there, and the DKMS config that selects it.
+_DKMS_PATCH_SOURCE = "patches/amdgpu-pci-resize-resource-exclude-bars.patch"
+_DKMS_PATCH_DIR = "/etc/dkms/amdgpu/patches"
+_DKMS_PATCH_NAME = "pci-resize-resource-exclude-bars.patch"
+_DKMS_CONF_FILE = "/etc/dkms/amdgpu.conf"
+
+# Ubuntu 26.04 apt setup. The keyring paths also appear, literally, in the apt
+# source texts below (as in bash), so tests that move these files don't change
+# what the source files say.
+_KEYRINGS_DIR = "/etc/apt/keyrings"
+_AMDROCM_KEY_URL = "https://stable.repo.amd.com/rocm/gpg/packages.gpg"
+_AMDGPU_KEY_URL = "https://repo.radeon.com/rocm/rocm.gpg.key"
+_AMDROCM_KEY_DOWNLOAD = "/tmp/amdrocm-packages.key"
+_AMDGPU_KEY_DOWNLOAD = "/tmp/amdgpu-packages.key"
+_AMDROCM_KEYRING = "/etc/apt/keyrings/amdrocm.gpg"
+_AMDGPU_KEYRING = "/etc/apt/keyrings/amdgpu.gpg"
+_AMDROCM_SOURCES_FILE = "/etc/apt/sources.list.d/amdrocm-stable.sources"
+_AMDGPU_LIST_FILE = "/etc/apt/sources.list.d/amdgpu.list"
+_RVS_LIST_FILE = "/etc/apt/sources.list.d/rvs.list"
+_ROCM_INFO_VERSION_FILE = "/opt/rocm/core/.info/version"
+_LD_SO_CONF_FILE = "/etc/ld.so.conf.d/rocm.conf"
+_ROCM_LIB_DIR = "/opt/rocm/lib"
+
+# Ubuntu 26.04 package names. Bash hard-codes the "10" in the RVS package even
+# though the SDK package name follows versions.json's ROCm version.
+_AMDGPU_DKMS_PACKAGE = "amdgpu-dkms"
+_RVS_PACKAGE = "amdrocm10-rvs"
+
+# Ubuntu 22.04 / 24.04: the `rocm` metapackage contents minus MIVisionX (and
+# rocDecode, which only MIVisionX pulls in). Bash's comment: those pull FFmpeg
+# (plus Qt, cJSON and mbedTLS on 24.04) packages with publishing-blocking CVEs
+# whose Ubuntu fixes need Pro/ESM. Same order as bash.
+_ROCM_PACKAGES = ["rocm-utils", "rocm-developer-tools", "rocm-openmp-sdk",
+                  "rocm-opencl-sdk", "rocm-ml-sdk", "migraphx", "migraphx-dev",
+                  "rpp", "rpp-dev"]
+
 # ---- File contents (exact bytes bash writes) --------------------------------
 # `cat <<'EOF'` has a QUOTED delimiter, so bash writes the text literally: no
 # $variable or $(command) expansion. Each heredoc ends with a newline after its
@@ -187,6 +303,43 @@ _UDEV_RULES = """\
 KERNEL=="kfd", MODE="0666"
 SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0666"
 """
+
+# /etc/dkms/amdgpu.conf (quoted heredoc, so written literally). DKMS reads this
+# file as shell when it builds amdgpu: it adds the patch to DKMS's PATCH list
+# unless the driver source already has AMD's native fix (..._ALIGN) or our
+# backport (..._EXCLUDE_BARS) in all three places.
+_AMDGPU_DKMS_CONF = """\
+_amdgpu_source="$source_tree/$module-$module_version"
+_amdgpu_pci_resize_fixed=false
+# AMD's native fix uses ALIGN; EXCLUDE_BARS identifies our backport.
+for _amdgpu_flag in HAVE_PCI_RESIZE_RESOURCE_ALIGN HAVE_PCI_RESIZE_RESOURCE_EXCLUDE_BARS; do
+    if grep -Fq "$_amdgpu_flag" "$_amdgpu_source/amd/dkms/configure" &&
+       grep -Fq "$_amdgpu_flag" "$_amdgpu_source/amd/dkms/config/config.h.in" &&
+       grep -Fq "$_amdgpu_flag" "$_amdgpu_source/amd/amdgpu/amdgpu_device.c"; then
+        _amdgpu_pci_resize_fixed=true
+        break
+    fi
+done
+if [[ "$_amdgpu_pci_resize_fixed" == false ]]; then
+    PATCH+=("pci-resize-resource-exclude-bars.patch")
+fi
+"""
+
+# Ubuntu 26.04 apt sources. The heredocs are unquoted (<<EOF), but only
+# amdgpu.list has a ${variable} in it (see amdgpu_list_text()).
+_AMDROCM_SOURCES = """\
+Types: deb
+URIs: https://stable.repo.amd.com/rocm/core/packages/ubuntu2604/
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/amdrocm.gpg
+"""
+_RVS_LIST = ("deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] "
+             "https://stable.repo.amd.com/rocm/extras/rvs/packages/ubuntu2604/ stable main\n")
+
+# `echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf`.
+_LD_SO_CONF = f"{_ROCM_LIB_DIR}\n"
 
 # PCI IDs used by the script: 1002:740c is MI200 (16 per node), 1002:74b5 is
 # MI300X and 1002:74bd is MI300HF (8 per node). The $(...) and $((...)) are
@@ -255,6 +408,23 @@ def amd_rocm_repo_text(version: str) -> str:
     )
 
 
+def amdgpu_repo_url(driver_version: str) -> str:
+    """bash: driver_url="https://repo.radeon.com/amdgpu/${driver_version}/ubuntu"."""
+    return f"https://repo.radeon.com/amdgpu/{driver_version}/ubuntu"
+
+
+def amdgpu_list_text(driver_url: str) -> str:
+    """/etc/apt/sources.list.d/amdgpu.list (unquoted heredoc: ${driver_url}
+    is expanded). "resolute" is Ubuntu 26.04's codename."""
+    return (f"deb [arch=amd64 signed-by=/etc/apt/keyrings/amdgpu.gpg] "
+            f"{driver_url} resolute main\n")
+
+
+def ubuntu2604_package(rocm_version: str) -> str:
+    """bash: rocm_package="amdrocm-core-sdk${rocm_version}", e.g. amdrocm-core-sdk10.0."""
+    return f"amdrocm-core-sdk{rocm_version}"
+
+
 def azure_linux_commands(kernel: str) -> tuple[list[list[str]], list[list[str]]]:
     """The Azure Linux dnf commands: (before the repo file, after it).
 
@@ -300,10 +470,15 @@ def _write(path: str, text: str, *, append: bool) -> None:
     "a" adds to the end. Both create a missing file. Raises OSError on failure;
     install() catches it.
     """
+    existed = os.path.exists(path)
     with open(path, "a" if append else "w", encoding="utf-8") as handle:
         handle.write(text)
+    if append:
+        action = "appended"
+    else:
+        action = "replaced" if existed else "created"
     log_info(_OP, f"{'Appended to' if append else 'Wrote'} {path}",
-             path=path, action="appended" if append else "replaced")
+             path=path, action=action)
     log_debug(_OP, f"Contents written to {path}:\n{text}")
 
 
@@ -321,11 +496,157 @@ def _has_line(path: str, line: str) -> bool:
         return False
 
 
+def _remove_if_present(path: str) -> None:
+    """bash's `rm -f <path>`: delete the file; a missing file is fine."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    log_info(_OP, f"Removed {path}", path=path, action="removed")
+
+
+def _dpkg_version(package: str, env: dict[str, str]) -> str | None:
+    """`dpkg-query -W -f='${Version}' <package>`: the installed version, or
+    None (after logging) when the query fails or prints nothing."""
+    # In bash the single quotes only stop ${Version} being expanded; dpkg-query
+    # receives -f=${Version} literally, which is what this argument is.
+    rc, output = run_capture(["dpkg-query", "-W", "-f=${Version}", package], _OP, env=env)
+    # "$(...)" strips trailing newlines; dpkg-query prints none with this format.
+    version = output.rstrip("\n") if rc == 0 else ""
+    if not version:
+        log_error(_OP, f"could not read the installed {package} version from dpkg-query",
+                  package=package, exit_code=rc)
+        return None
+    return version
+
+
 # --------------------------------------------------------------------------- #
-# Per-distro ROCm installs. Each returns True on success. They may raise
+# The amdgpu DKMS patch (every Ubuntu).
+# --------------------------------------------------------------------------- #
+def _configure_amdgpu_dkms_patches(component_dir: str) -> None:
+    """bash's configure_amdgpu_dkms_patches: patch file + /etc/dkms/amdgpu.conf.
+
+    Raises OSError if a file can't be copied or written; install() catches it.
+    """
+    source = os.path.join(component_dir, _DKMS_PATCH_SOURCE)
+    target = os.path.join(_DKMS_PATCH_DIR, _DKMS_PATCH_NAME)
+    os.makedirs(_DKMS_PATCH_DIR, exist_ok=True)       # mkdir -p
+    existed = os.path.exists(target)
+    # `cp` without -p: copies the bytes; a new file gets the default mode.
+    shutil.copyfile(source, target)
+    action = "replaced" if existed else "created"
+    log_info(_OP, f"Copied the amdgpu DKMS patch to {target} ({action})",
+             source=source, path=target, action=action, patch=_DKMS_PATCH_NAME)
+    _write(_DKMS_CONF_FILE, _AMDGPU_DKMS_CONF, append=False)
+    log_info(_OP, "amdgpu DKMS builds will apply the pci_resize_resource patch "
+                  "unless the driver source already has the fix",
+             path=_DKMS_CONF_FILE, patch=_DKMS_PATCH_NAME)
+
+
+# --------------------------------------------------------------------------- #
+# Per-distro ROCm installs. _install_ubuntu2604 returns the ROCm version to
+# record (None on failure); the others return True/False. They may raise
 # OSError from file operations; install() catches it.
 # --------------------------------------------------------------------------- #
-def _install_ubuntu(env: dict[str, str], config: dict) -> bool:
+def _install_ubuntu2604(env: dict[str, str], rocm_version: str, driver_version: str,
+                        kernel: str, component_dir: str) -> str | None:
+    """Ubuntu 26.04: ROCm 10 + amdgpu DKMS from AMD's apt repos.
+
+    Returns the ROCm version to record (read back from the installed SDK).
+    """
+    driver_url = amdgpu_repo_url(driver_version)
+    rocm_package = ubuntu2604_package(rocm_version)
+    log_info(_OP, "Ubuntu 26.04: installing ROCm from AMD's apt repos",
+             handler="ubuntu26.04", rocm_package=rocm_package,
+             amdgpu_version=driver_version, amdgpu_repo=driver_url,
+             rvs_package=_RVS_PACKAGE)
+
+    # ---- Signing keys -------------------------------------------------------
+    if not _run_all([
+        ["apt", "install", "-y", "ca-certificates", "wget", "gnupg", "dkms",
+         f"linux-headers-{kernel}"],
+        ["install", "-d", "-m", "0755", _KEYRINGS_DIR],
+        ["wget", "-O", _AMDROCM_KEY_DOWNLOAD, _AMDROCM_KEY_URL],
+        ["gpg", "--batch", "--yes", "--dearmor", "-o", _AMDROCM_KEYRING,
+         _AMDROCM_KEY_DOWNLOAD],
+        ["wget", "-O", _AMDGPU_KEY_DOWNLOAD, _AMDGPU_KEY_URL],
+        ["gpg", "--batch", "--yes", "--dearmor", "-o", _AMDGPU_KEYRING,
+         _AMDGPU_KEY_DOWNLOAD],
+        ["chmod", "0644", _AMDROCM_KEYRING, _AMDGPU_KEYRING],
+    ], env):
+        return None
+    log_info(_OP, "Installed the AMD apt signing keys",
+             keyrings=[_AMDROCM_KEYRING, _AMDGPU_KEYRING],
+             key_urls=[_AMDROCM_KEY_URL, _AMDGPU_KEY_URL])
+    _remove_if_present(_AMDROCM_KEY_DOWNLOAD)
+    _remove_if_present(_AMDGPU_KEY_DOWNLOAD)
+
+    # ---- apt sources (all `cat >`, so overwritten) --------------------------
+    _write(_AMDROCM_SOURCES_FILE, _AMDROCM_SOURCES, append=False)
+    _write(_AMDGPU_LIST_FILE, amdgpu_list_text(driver_url), append=False)
+    _write(_RVS_LIST_FILE, _RVS_LIST, append=False)
+    if not _run_all([["apt", "update"]], env):
+        return None
+
+    # ---- amdgpu driver (DKMS) -----------------------------------------------
+    _configure_amdgpu_dkms_patches(component_dir)
+    if not _run_all([["apt", "install", "-y", _AMDGPU_DKMS_PACKAGE,
+                      "amdgpu-dkms-firmware"]], env):
+        return None
+    # check_dkms_status logs the status lines and, on failure, the make.log tails.
+    if not check_dkms_status(["amdgpu"], _OP, env, kernel=kernel):
+        log_error(_OP, "ROCm install stopped: the amdgpu DKMS module is not "
+                       "installed for the running kernel", kernel=kernel)
+        return None
+
+    # ---- ROCm SDK + RVS -----------------------------------------------------
+    if not _run_all([["apt", "install", "-y", rocm_package, _RVS_PACKAGE]], env):
+        return None
+
+    # bash: rocm_version=$(cat /opt/rocm/core/.info/version). "$(...)" strips
+    # trailing newlines only.
+    try:
+        with open(_ROCM_INFO_VERSION_FILE, encoding="utf-8") as handle:
+            installed = handle.read().rstrip("\n")
+    except OSError as exc:
+        log_error(_OP, f"could not read the installed ROCm version: {exc}",
+                  path=_ROCM_INFO_VERSION_FILE)
+        return None
+    if not installed:
+        log_error(_OP, f"{_ROCM_INFO_VERSION_FILE} is empty; no ROCm version to record",
+                  path=_ROCM_INFO_VERSION_FILE)
+        return None
+    log_info(_OP, f"Installed ROCm SDK reports version {installed}; recording that "
+                  f"instead of versions.json's {rocm_version}, as bash does",
+             path=_ROCM_INFO_VERSION_FILE, installed_version=installed,
+             config_version=rocm_version)
+
+    amdgpu_version = _dpkg_version(_AMDGPU_DKMS_PACKAGE, env)
+    if amdgpu_version is None:
+        return None
+    write_component_version("AMDGPU", amdgpu_version)
+    log_info(_OP, f"Recorded AMDGPU={amdgpu_version}", component="AMDGPU",
+             version=amdgpu_version, package=_AMDGPU_DKMS_PACKAGE)
+    rvs_version = _dpkg_version(_RVS_PACKAGE, env)
+    if rvs_version is None:
+        return None
+    write_component_version("RVS", rvs_version)
+    log_info(_OP, f"Recorded RVS={rvs_version}", component="RVS",
+             version=rvs_version, package=_RVS_PACKAGE)
+
+    # The SDK ships no ld.so.conf entry, so libamdhip64 can't be found by
+    # anything linking ROCm (e.g. Open MPI's accelerator component) without it.
+    _write(_LD_SO_CONF_FILE, _LD_SO_CONF, append=False)
+    if not _run_all([["ldconfig"]], env):
+        return None
+    log_info(_OP, f"Added {_ROCM_LIB_DIR} to the dynamic linker path",
+             path=_LD_SO_CONF_FILE, lib_dir=_ROCM_LIB_DIR)
+    return installed
+
+
+def _install_ubuntu(env: dict[str, str], config: dict, distribution: str,
+                    component_dir: str) -> bool:
+    """Ubuntu other than 26.04: amdgpu-install .deb + explicit package list."""
     url, sha256 = config["url"], config["sha256"]
 
     # Start from an empty work directory so leftovers from an earlier failed
@@ -343,15 +664,30 @@ def _install_ubuntu(env: dict[str, str], config: dict) -> bool:
 
         # `./<file>` makes apt treat the argument as a local .deb file rather
         # than a package name; it's relative to the work directory (cwd).
+        if not _run_all([["apt", "install", "-y", f"./{deb.name}"]], env, cwd=_WORK_DIR):
+            return False
+
+        _configure_amdgpu_dkms_patches(component_dir)
+
+        # Bash keeps its old `if ubuntu24.04 ... else amdgpu-install -y
+        # --usecase=graphics,rocm` commented out, with TODOs to go back to the
+        # full `rocm` usecase (or the bundled amdgpu-dkms + rocm packages) once
+        # ROCm 7.0 is used again. Until then both 22.04 and 24.04 install the
+        # graphics usecase plus the explicit package list without MIVisionX.
+        log_info(_OP, "Installing ROCm without MIVisionX/rocDecode (their "
+                      "dependencies have CVEs that block publishing)",
+                 usecase="graphics", packages=_ROCM_PACKAGES)
         commands = [
-            ["apt", "install", "-y", f"./{deb.name}"],
-            # Bash has an ubuntu24.04 branch and an else branch that both run
-            # this exact command. The 24.04 branch carries a commented-out
-            # TODO to go back to the bundled userspace (apt install amdgpu-dkms
-            # rocm, recording RCCL from dpkg) once ROCm 7.0 is used again.
-            ["amdgpu-install", "-y", "--usecase=graphics,rocm"],
-            ["apt", "install", "-y", "rocm-bandwidth-test"],
+            ["amdgpu-install", "-y", "--usecase=graphics"],
+            ["apt-get", "install", "-y", *_ROCM_PACKAGES],
         ]
+        if distribution == _UBUNTU_2204:
+            # Bash: rocdecode-dev used to pull this in; ROCm's clang picks the
+            # newest GCC (12), so hipcc needs its C++ headers.
+            log_info(_OP, "Ubuntu 22.04: also installing libstdc++-12-dev for hipcc",
+                     package="libstdc++-12-dev")
+            commands.append(["apt-get", "install", "-y", "libstdc++-12-dev"])
+        commands.append(["apt", "install", "-y", "rocm-bandwidth-test"])
         if not _run_all(commands, env, cwd=_WORK_DIR):
             return False
 
@@ -453,11 +789,39 @@ def _install_boot_service(env: dict[str, str]) -> bool:
 # --------------------------------------------------------------------------- #
 # Orchestrator.
 # --------------------------------------------------------------------------- #
+def _check_config(env: dict[str, str], distribution: str, is_ubuntu: bool,
+                  config) -> tuple[str | None, str | None]:
+    """Check the inputs bash will need. Returns (amdgpu driver version, error).
+
+    The driver version is only resolved on Ubuntu 26.04; error is None when
+    everything needed is there.
+    """
+    # isinstance() guards against a missing (None) or oddly shaped config.
+    if not isinstance(config, dict) or not config.get("version"):
+        return None, "could not resolve rocm version from versions.json"
+    driver_version = None
+    if distribution == _UBUNTU_2604:
+        # bash: `jq -er '.version'` stops the script when it's missing.
+        driver = config_for("amdgpu", env)
+        if not isinstance(driver, dict) or not driver.get("version"):
+            return None, "could not resolve amdgpu driver version from versions.json"
+        driver_version = str(driver["version"])
+    elif is_ubuntu and not (config.get("url") and config.get("sha256")):
+        return None, "rocm url/sha256 missing from versions.json"
+    if is_ubuntu:
+        component_dir = env.get("COMPONENT_DIR", "")
+        patch = os.path.join(component_dir, _DKMS_PATCH_SOURCE)
+        if not component_dir or not os.path.isfile(patch):
+            return None, f"amdgpu DKMS patch not found at {patch!r} (COMPONENT_DIR unset?)"
+    return driver_version, None
+
+
 def install(env: dict[str, str]) -> int:
     """Install ROCm and its boot-time GPU setup. Returns 0 or 3.
 
     `env` is the build environment made by component_env() in build_config.py.
-    Uses DISTRIBUTION plus the values config_for() needs to find "rocm".
+    Uses DISTRIBUTION, COMPONENT_DIR (Ubuntu's DKMS patch) and the values
+    config_for() needs to find "rocm" (and "amdgpu" on Ubuntu 26.04).
     """
     # ---- 1. Checks before any change is made --------------------------------
     distribution = env.get("DISTRIBUTION", "")
@@ -469,16 +833,13 @@ def install(env: dict[str, str]) -> int:
         return 3
 
     config = config_for("rocm", env)
-    # isinstance() guards against a missing (None) or oddly shaped config.
-    if not isinstance(config, dict) or not config.get("version"):
-        log_error(_OP, "could not resolve rocm version from versions.json",
-                  distro=distribution)
-        return 3
-    if is_ubuntu and not (config.get("url") and config.get("sha256")):
-        log_error(_OP, "rocm url/sha256 missing from versions.json",
-                  distro=distribution, version=config["version"])
+    driver_version, problem = _check_config(env, distribution, is_ubuntu, config)
+    if problem:
+        log_error(_OP, problem, distro=distribution,
+                  version=config.get("version") if isinstance(config, dict) else None)
         return 3
     version = str(config["version"])
+    component_dir = env.get("COMPONENT_DIR", "")
 
     # platform.release() is Python's `uname -r`: the running kernel.
     kernel = platform.release()
@@ -486,18 +847,28 @@ def install(env: dict[str, str]) -> int:
         log_error(_OP, "could not determine the running kernel version (uname -r)")
         return 3
 
+    if distribution == _UBUNTU_2604:
+        source = f"apt ({amdgpu_repo_url(driver_version)} + stable.repo.amd.com)"
+    else:
+        source = config.get("url", "dnf (azurelinux-repos-amd + amd_rocm repo)")
     log_info(_OP, f"Installing ROCm {version} on {distribution}",
-             version=version, distro=distribution, kernel=kernel,
-             source=config.get("url", "dnf (azurelinux-repos-amd + amd_rocm repo)"))
+             version=version, distro=distribution, kernel=kernel, source=source,
+             amdgpu_version=driver_version)
     log_info(_OP, "ROCm is installed before PMIx/MPI, as in install.sh, so the "
                   "HPC-X step can rebuild UCX with ROCm support")
 
     try:
         # ---- 2. ROCm itself, per distro ------------------------------------
-        if is_ubuntu:
+        if distribution == _UBUNTU_2604:
+            installed = _install_ubuntu2604(env, version, driver_version, kernel,
+                                            component_dir)
+            ok = installed is not None
+            if ok:
+                version = installed     # bash: rocm_version=$(cat .../version)
+        elif is_ubuntu:
             log_info(_OP, "Ubuntu: installing ROCm with amdgpu-install",
-                     handler="ubuntu", usecase="graphics,rocm")
-            ok = _install_ubuntu(env, config)
+                     handler="ubuntu", usecase="graphics")
+            ok = _install_ubuntu(env, config, distribution, component_dir)
         else:
             log_info(_OP, "Azure Linux: installing ROCm from the AMD dnf repos",
                      handler="azurelinux")

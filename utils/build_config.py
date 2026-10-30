@@ -284,7 +284,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
         # install_mpis.sh can rebuild HPC-X's UCX with ROCm support.
         Step("install-rocm", "install_rocm.sh", action=install_rocm.install,
-             when=amd, resync="ADO 986"),
+             when=amd),
 
         # --- NVIDIA driver, before PMIx/MPI ---
         # As in install.sh: "Install CUDA before MPI so HPC-X can rebuild Open
@@ -324,7 +324,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # --- AMD branch (ROCm itself runs earlier, before PMIx/MPI) ---
         Step("install-rccl", "install_rccl.sh", action=install_rccl.install,
-             when=amd, resync="ADO 986"),
+             when=amd),
 
         # Lustre client, then mpifileutils which builds against it (upstream #557
         # moved lustre here so mpifileutils picks up Lustre support).
