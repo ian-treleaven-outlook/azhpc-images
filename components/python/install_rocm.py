@@ -158,7 +158,8 @@ install() returns 0 for success or 3 for failure. It logs problems and returns
 
 Behaviour kept from bash
 ------------------------
-  * Commands, arguments and order are the same. The first failing command
+  * Commands, arguments and order are the same (installs spelled the
+    install_packages() way, see below). The first failing command
     stops the step (bash's `set -e`), except for one quirk: in
     `udevadm control --reload-rules && sudo udevadm trigger`, `set -e` ignores
     a failure of the command before `&&`. If the reload fails, bash skips the
@@ -191,6 +192,9 @@ Behaviour kept from bash
 
 Deliberate differences from bash
 --------------------------------
+  * Package installs go through install_packages() (utils/package_installer.py),
+    which spells them `apt-get install -y -o Dpkg::Use-Pty=0` / `dnf install -y`
+    (bash: `apt install -y`, `apt-get install -y`, `dnf -y install`).
   * Unsupported distros fail (return 3) before changing anything. Bash's
     if/elif has no other branch: it would install no ROCm at all, yet still
     write the udev rules, install the boot service and record ROCM, so the
@@ -237,6 +241,7 @@ from utils.component_config import config_for, write_component_version
 from utils.dkms import check_dkms_status
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -285,6 +290,10 @@ _ROCM_LIB_DIR = "/opt/rocm/lib"
 # though the SDK package name follows versions.json's ROCm version.
 _AMDGPU_DKMS_PACKAGE = "amdgpu-dkms"
 _RVS_PACKAGE = "amdrocm10-rvs"
+# What the AMD keys/repos and the amdgpu DKMS build need (the kernel headers,
+# `linux-headers-$(uname -r)`, are added by ubuntu2604_prerequisites()).
+_UBUNTU2604_PREREQUISITES = ["ca-certificates", "wget", "gnupg", "dkms"]
+_UBUNTU2604_DRIVER_PACKAGES = [_AMDGPU_DKMS_PACKAGE, "amdgpu-dkms-firmware"]
 
 # Ubuntu 22.04 / 24.04: the `rocm` metapackage contents minus MIVisionX (and
 # rocDecode, which only MIVisionX pulls in). Bash's comment: those pull FFmpeg
@@ -293,6 +302,19 @@ _RVS_PACKAGE = "amdrocm10-rvs"
 _ROCM_PACKAGES = ["rocm-utils", "rocm-developer-tools", "rocm-openmp-sdk",
                   "rocm-opencl-sdk", "rocm-ml-sdk", "migraphx", "migraphx-dev",
                   "rpp", "rpp-dev"]
+_UBUNTU2204_EXTRA_PACKAGES = ["libstdc++-12-dev"]
+_BANDWIDTH_TEST_PACKAGES = ["rocm-bandwidth-test"]
+
+# Azure Linux: the dnf installs after the [amd_rocm] repo is added, one list
+# per bash command (rocm-validation-suite and rocm-bandwidth-test are listed
+# twice, as in bash). The ones before it need the kernel version; see
+# azure_linux_driver_packages().
+_AZURE_LINUX_ROCM_PACKAGES = [
+    ["rocm-dev", "rocm-validation-suite", "rocm-bandwidth-test"],
+    ["rocm-smi-lib", "rocm-core", "rocm-device-libs", "rocm-llvm",
+     "rocm-validation-suite"],
+    ["rocm-bandwidth-test"],
+]
 
 # ---- File contents (exact bytes bash writes) --------------------------------
 # `cat <<'EOF'` has a QUOTED delimiter, so bash writes the text literally: no
@@ -425,24 +447,20 @@ def ubuntu2604_package(rocm_version: str) -> str:
     return f"amdrocm-core-sdk{rocm_version}"
 
 
-def azure_linux_commands(kernel: str) -> tuple[list[list[str]], list[list[str]]]:
-    """The Azure Linux dnf commands: (before the repo file, after it).
+def ubuntu2604_prerequisites(kernel: str) -> list[str]:
+    """bash: apt install -y ca-certificates wget gnupg dkms "linux-headers-$(uname -r)"."""
+    return [*_UBUNTU2604_PREREQUISITES, f"linux-headers-{kernel}"]
 
-    `kernel` is the `uname -r` value used in the kernel-drivers-gpu package name.
+
+def azure_linux_driver_packages(kernel: str) -> list[list[str]]:
+    """The Azure Linux dnf installs before the repo file, one list per bash
+    command. `kernel` is the `uname -r` value in the kernel-drivers-gpu name.
     """
-    before = [
-        ["dnf", "install", "-y", "azurelinux-repos-amd"],
-        ["dnf", "-y", "install", f"kernel-drivers-gpu-{kernel}"],
-        ["dnf", "-y", "install", "amdgpu", "amdgpu-firmware", "amdgpu-headers"],
+    return [
+        ["azurelinux-repos-amd"],
+        [f"kernel-drivers-gpu-{kernel}"],
+        ["amdgpu", "amdgpu-firmware", "amdgpu-headers"],
     ]
-    after = [
-        ["dnf", "repolist", "--refresh"],
-        ["dnf", "install", "-y", "rocm-dev", "rocm-validation-suite", "rocm-bandwidth-test"],
-        ["dnf", "install", "-y", "rocm-smi-lib", "rocm-core", "rocm-device-libs",
-         "rocm-llvm", "rocm-validation-suite"],
-        ["dnf", "install", "-y", "rocm-bandwidth-test"],
-    ]
-    return before, after
 
 
 # --------------------------------------------------------------------------- #
@@ -459,6 +477,16 @@ def _run_all(commands, env: dict[str, str], cwd: str | None = None) -> bool:
         if rc != 0:
             log_error(_OP, f"ROCm install stopped: `{' '.join(command)}` failed",
                       exit_code=rc)
+            return False
+    return True
+
+
+def _install_each(package_lists, env: dict[str, str]) -> bool:
+    """One install_packages() call per list, in order, stopping at the first
+    failure (one list per bash install command). install_packages() logs the
+    manager, the packages and any failure."""
+    for packages in package_lists:
+        if not install_packages(packages, env, _OP):
             return False
     return True
 
@@ -562,9 +590,9 @@ def _install_ubuntu2604(env: dict[str, str], rocm_version: str, driver_version: 
              rvs_package=_RVS_PACKAGE)
 
     # ---- Signing keys -------------------------------------------------------
+    if not install_packages(ubuntu2604_prerequisites(kernel), env, _OP):
+        return None
     if not _run_all([
-        ["apt", "install", "-y", "ca-certificates", "wget", "gnupg", "dkms",
-         f"linux-headers-{kernel}"],
         ["install", "-d", "-m", "0755", _KEYRINGS_DIR],
         ["wget", "-O", _AMDROCM_KEY_DOWNLOAD, _AMDROCM_KEY_URL],
         ["gpg", "--batch", "--yes", "--dearmor", "-o", _AMDROCM_KEYRING,
@@ -590,8 +618,7 @@ def _install_ubuntu2604(env: dict[str, str], rocm_version: str, driver_version: 
 
     # ---- amdgpu driver (DKMS) -----------------------------------------------
     _configure_amdgpu_dkms_patches(component_dir)
-    if not _run_all([["apt", "install", "-y", _AMDGPU_DKMS_PACKAGE,
-                      "amdgpu-dkms-firmware"]], env):
+    if not install_packages(_UBUNTU2604_DRIVER_PACKAGES, env, _OP):
         return None
     # check_dkms_status logs the status lines and, on failure, the make.log tails.
     if not check_dkms_status(["amdgpu"], _OP, env, kernel=kernel):
@@ -600,7 +627,7 @@ def _install_ubuntu2604(env: dict[str, str], rocm_version: str, driver_version: 
         return None
 
     # ---- ROCm SDK + RVS -----------------------------------------------------
-    if not _run_all([["apt", "install", "-y", rocm_package, _RVS_PACKAGE]], env):
+    if not install_packages([rocm_package, _RVS_PACKAGE], env, _OP):
         return None
 
     # bash: rocm_version=$(cat /opt/rocm/core/.info/version). "$(...)" strips
@@ -664,7 +691,7 @@ def _install_ubuntu(env: dict[str, str], config: dict, distribution: str,
 
         # `./<file>` makes apt treat the argument as a local .deb file rather
         # than a package name; it's relative to the work directory (cwd).
-        if not _run_all([["apt", "install", "-y", f"./{deb.name}"]], env, cwd=_WORK_DIR):
+        if not install_packages([f"./{deb.name}"], env, _OP, cwd=_WORK_DIR):
             return False
 
         _configure_amdgpu_dkms_patches(component_dir)
@@ -677,18 +704,19 @@ def _install_ubuntu(env: dict[str, str], config: dict, distribution: str,
         log_info(_OP, "Installing ROCm without MIVisionX/rocDecode (their "
                       "dependencies have CVEs that block publishing)",
                  usecase="graphics", packages=_ROCM_PACKAGES)
-        commands = [
-            ["amdgpu-install", "-y", "--usecase=graphics"],
-            ["apt-get", "install", "-y", *_ROCM_PACKAGES],
-        ]
+        if not _run_all([["amdgpu-install", "-y", "--usecase=graphics"]], env,
+                        cwd=_WORK_DIR):
+            return False
+        if not install_packages(_ROCM_PACKAGES, env, _OP, cwd=_WORK_DIR):
+            return False
         if distribution == _UBUNTU_2204:
             # Bash: rocdecode-dev used to pull this in; ROCm's clang picks the
             # newest GCC (12), so hipcc needs its C++ headers.
             log_info(_OP, "Ubuntu 22.04: also installing libstdc++-12-dev for hipcc",
                      package="libstdc++-12-dev")
-            commands.append(["apt-get", "install", "-y", "libstdc++-12-dev"])
-        commands.append(["apt", "install", "-y", "rocm-bandwidth-test"])
-        if not _run_all(commands, env, cwd=_WORK_DIR):
+            if not install_packages(_UBUNTU2204_EXTRA_PACKAGES, env, _OP, cwd=_WORK_DIR):
+                return False
+        if not install_packages(_BANDWIDTH_TEST_PACKAGES, env, _OP, cwd=_WORK_DIR):
             return False
 
         # Bash's `rm -f ./<deb>`.
@@ -701,8 +729,7 @@ def _install_ubuntu(env: dict[str, str], config: dict, distribution: str,
 
 def _install_azurelinux(env: dict[str, str], config: dict, kernel: str) -> bool:
     version = config["version"]
-    before, after = azure_linux_commands(kernel)
-    if not _run_all(before, env):
+    if not _install_each(azure_linux_driver_packages(kernel), env):
         return False
 
     # Appended (bash `cat <<EOF >>`), so a rerun adds a second [amd_rocm] block.
@@ -713,7 +740,9 @@ def _install_azurelinux(env: dict[str, str], config: dict, kernel: str) -> bool:
     _write(_AMD_ROCM_REPO_FILE, amd_rocm_repo_text(version), append=True)
     log_info(_OP, "Added the AMD ROCm dnf repo", repo="amd_rocm", version=version)
 
-    return _run_all(after, env)
+    if not _run_all([["dnf", "repolist", "--refresh"]], env):
+        return False
+    return _install_each(_AZURE_LINUX_ROCM_PACKAGES, env)
 
 
 # --------------------------------------------------------------------------- #

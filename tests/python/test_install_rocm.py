@@ -1,10 +1,13 @@
 """Unit tests for components/python/install_rocm.py.
 
-  * Pure helpers (repo texts, dnf command lists) are tested directly, and the
-    file texts and key command lines are compared with the bash script itself
-    (components/install_rocm.sh), so an upstream change shows up here.
+  * Pure helpers (repo texts, package lists) are tested directly, and the
+    file texts, package lists and key command lines are compared with the bash
+    script itself (components/install_rocm.sh), so an upstream change shows up
+    here.
   * install() runs with every external effect mocked: config lookup, download,
-    exec_program (apt/dnf/wget/gpg/udevadm/systemctl...), run_capture
+    exec_program (wget/gpg/udevadm/systemctl... in install_rocm, and the
+    apt-get/dnf installs in utils.package_installer, recorded in one ordered
+    list), run_capture
     (dpkg-query), the DKMS check, the kernel version and the versions file.
     The files it writes go to a temporary directory, by pointing the module's
     path constants there with mock.patch.object. Nothing touches /etc, /opt,
@@ -24,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_rocm
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -44,6 +48,11 @@ _ROCM_PACKAGES = ["rocm-utils", "rocm-developer-tools", "rocm-openmp-sdk",
                   "rocm-opencl-sdk", "rocm-ml-sdk", "migraphx", "migraphx-dev",
                   "rpp", "rpp-dev"]
 
+# What install_packages() runs (bash's `apt install -y` / `apt-get install -y`
+# and `dnf -y install` / `dnf install -y`, normalised).
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
+
 _TAIL_UBUNTU = [
     ["udevadm", "control", "--reload-rules"],
     ["sudo", "udevadm", "trigger"],
@@ -53,26 +62,26 @@ _TAIL_UBUNTU = [
 ]
 
 _UBUNTU_COMMANDS = [
-    ["apt", "install", "-y", "./amdgpu-install_6.4.60404-1_all.deb"],
+    [*_APT, "./amdgpu-install_6.4.60404-1_all.deb"],
     ["amdgpu-install", "-y", "--usecase=graphics"],
-    ["apt-get", "install", "-y", *_ROCM_PACKAGES],
-    ["apt", "install", "-y", "rocm-bandwidth-test"],
+    [*_APT, *_ROCM_PACKAGES],
+    [*_APT, "rocm-bandwidth-test"],
 ] + _TAIL_UBUNTU
 
 # Ubuntu 22.04 also installs the GCC 12 C++ headers, before rocm-bandwidth-test.
 _UBUNTU2204_COMMANDS = (_UBUNTU_COMMANDS[:3]
-                        + [["apt-get", "install", "-y", "libstdc++-12-dev"]]
+                        + [[*_APT, "libstdc++-12-dev"]]
                         + _UBUNTU_COMMANDS[3:])
 
 _AZL_COMMANDS = [
-    ["dnf", "install", "-y", "azurelinux-repos-amd"],
-    ["dnf", "-y", "install", f"kernel-drivers-gpu-{_KERNEL}"],
-    ["dnf", "-y", "install", "amdgpu", "amdgpu-firmware", "amdgpu-headers"],
+    [*_DNF, "azurelinux-repos-amd"],
+    [*_DNF, f"kernel-drivers-gpu-{_KERNEL}"],
+    [*_DNF, "amdgpu", "amdgpu-firmware", "amdgpu-headers"],
     ["dnf", "repolist", "--refresh"],
-    ["dnf", "install", "-y", "rocm-dev", "rocm-validation-suite", "rocm-bandwidth-test"],
-    ["dnf", "install", "-y", "rocm-smi-lib", "rocm-core", "rocm-device-libs",
+    [*_DNF, "rocm-dev", "rocm-validation-suite", "rocm-bandwidth-test"],
+    [*_DNF, "rocm-smi-lib", "rocm-core", "rocm-device-libs",
      "rocm-llvm", "rocm-validation-suite"],
-    ["dnf", "install", "-y", "rocm-bandwidth-test"],
+    [*_DNF, "rocm-bandwidth-test"],
     ["udevadm", "control", "--reload-rules"],
     ["sudo", "udevadm", "trigger"],
     ["systemctl", "start", "rocmstartup"],
@@ -105,9 +114,13 @@ class PureHelperTests(unittest.TestCase):
             "baseurl=https://repo.radeon.com/rocm/azurelinux3/7.0.3/main/\n"
             "enabled=1\nrepo_gpgcheck=0\ngpgcheck=0\nsslverify=0\n"))
 
-    def test_azure_linux_commands_use_the_kernel(self):
-        before, after = install_rocm.azure_linux_commands(_KERNEL)
-        self.assertEqual(before + after, _AZL_COMMANDS[:7])
+    def test_package_lists_use_the_kernel(self):
+        self.assertEqual(install_rocm.azure_linux_driver_packages(_KERNEL), [
+            ["azurelinux-repos-amd"], [f"kernel-drivers-gpu-{_KERNEL}"],
+            ["amdgpu", "amdgpu-firmware", "amdgpu-headers"]])
+        self.assertEqual(install_rocm.ubuntu2604_prerequisites(_KERNEL),
+                         ["ca-certificates", "wget", "gnupg", "dkms",
+                          f"linux-headers-{_KERNEL}"])
 
     def test_service_unit_text(self):
         self.assertEqual(install_rocm._SERVICE_UNIT, _EXPECTED_UNIT)
@@ -177,6 +190,23 @@ class BashTextTests(unittest.TestCase):
         block = bash.split("apt-get install -y \\\n", 1)[1].split("\n    # else", 1)[0]
         self.assertEqual(block.replace("\\", " ").split(), install_rocm._ROCM_PACKAGES)
 
+    def test_azure_linux_package_lists_match_bash(self):
+        # One list per bash command, in bash's order.
+        bash = _BASH.read_text(encoding="utf-8")
+        lines = ["dnf install -y azurelinux-repos-amd",
+                 "dnf -y install kernel-drivers-gpu-$(uname -r)",
+                 "dnf -y install amdgpu amdgpu-firmware amdgpu-headers"]
+        lists = install_rocm.azure_linux_driver_packages("$(uname -r)")
+        lists += install_rocm._AZURE_LINUX_ROCM_PACKAGES
+        lines += ["dnf install -y " + " ".join(p)
+                  for p in install_rocm._AZURE_LINUX_ROCM_PACKAGES]
+        for line, packages in zip(lines, lists):
+            with self.subTest(line=line):
+                self.assertIn(f"    {line}\n", bash)
+                self.assertEqual(line.split(maxsplit=3)[3], " ".join(packages))
+        positions = [bash.index(f"    {line}\n") for line in lines]
+        self.assertEqual(positions, sorted(positions))
+
     def test_repo_patch_file_exists(self):
         self.assertTrue((_REPO / "components" / install_rocm._DKMS_PATCH_SOURCE).is_file())
 
@@ -222,7 +252,7 @@ class InstallTests(unittest.TestCase):
     def _u2604_commands(self):
         p = self.paths
         return [
-            ["apt", "install", "-y", "ca-certificates", "wget", "gnupg", "dkms",
+            [*_APT, "ca-certificates", "wget", "gnupg", "dkms",
              f"linux-headers-{_KERNEL}"],
             ["install", "-d", "-m", "0755", p["_KEYRINGS_DIR"]],
             ["wget", "-O", p["_AMDROCM_KEY_DOWNLOAD"],
@@ -234,8 +264,8 @@ class InstallTests(unittest.TestCase):
              p["_AMDGPU_KEY_DOWNLOAD"]],
             ["chmod", "0644", p["_AMDROCM_KEYRING"], p["_AMDGPU_KEYRING"]],
             ["apt", "update"],
-            ["apt", "install", "-y", "amdgpu-dkms", "amdgpu-dkms-firmware"],
-            ["apt", "install", "-y", "amdrocm-core-sdk10.0", "amdrocm10-rvs"],
+            [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"],
+            [*_APT, "amdrocm-core-sdk10.0", "amdrocm10-rvs"],
             ["ldconfig"],
         ] + _TAIL_UBUNTU
 
@@ -268,11 +298,15 @@ class InstallTests(unittest.TestCase):
 
         env = {"DISTRIBUTION": distro, "COMPONENT_DIR": str(self.component_dir)}
         env.update(env_extra or {})
+        # One mock for exec_program in both modules, so call_args_list is the
+        # ordered record of every command; install_packages() logs its own
+        # failures, so its log_error shares the module's mock too.
         with mock.patch.object(install_rocm, "config_for", side_effect=fake_config) as config, \
              mock.patch.object(install_rocm, "download_and_verify",
                                side_effect=self._download) as download, \
              mock.patch.object(install_rocm, "exec_program",
                                side_effect=fake_exec) as run, \
+             mock.patch.object(package_installer, "exec_program", new=run), \
              mock.patch.object(install_rocm, "run_capture",
                                side_effect=fake_capture) as capture, \
              mock.patch.object(install_rocm, "check_dkms_status",
@@ -282,7 +316,9 @@ class InstallTests(unittest.TestCase):
                                side_effect=write_error) as record, \
              mock.patch.object(install_rocm, "log_info") as info, \
              mock.patch.object(install_rocm, "log_warn") as warn, \
-             mock.patch.object(install_rocm, "log_error") as error:
+             mock.patch.object(install_rocm, "log_error") as error, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error", new=error):
             result = install_rocm.install(env)
         self.run_mock, self.download, self.record = run, download, record
         self.config, self.capture, self.dkms = config, capture, dkms
@@ -351,10 +387,11 @@ class InstallTests(unittest.TestCase):
         def fake_exec(command, op, *, cwd=None, env=None):
             if command[0] == "amdgpu-install":
                 seen["conf"] = os.path.exists(self.paths["_DKMS_CONF_FILE"])
-            elif command[0] == "apt" and command[3].startswith("./"):
+            elif command[0] == "apt-get" and command[-1].startswith("./"):
                 seen["conf_at_deb"] = os.path.exists(self.paths["_DKMS_CONF_FILE"])
             return 0
-        with mock.patch.object(install_rocm, "exec_program", side_effect=fake_exec):
+        with mock.patch.object(install_rocm, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec):
             env = {"DISTRIBUTION": "ubuntu24.04", "COMPONENT_DIR": str(self.component_dir)}
             with mock.patch.object(install_rocm, "config_for", return_value=_UBUNTU_CFG), \
                  mock.patch.object(install_rocm, "download_and_verify",
@@ -407,13 +444,14 @@ class InstallTests(unittest.TestCase):
         order = []
 
         def watch(command, op, *, cwd=None, env=None):
-            if command[:4] == ["apt", "install", "-y", "amdgpu-dkms"]:
+            if command == [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"]:
                 order.append(("dkms-install", os.path.exists(self.paths["_DKMS_CONF_FILE"])))
             if command == ["apt", "update"]:
                 order.append(("apt-update", os.path.exists(self.paths["_AMDGPU_LIST_FILE"]),
                               os.path.exists(self.paths["_DKMS_CONF_FILE"])))
             return 0
-        with mock.patch.object(install_rocm, "exec_program", side_effect=watch):
+        with mock.patch.object(install_rocm, "exec_program", side_effect=watch), \
+             mock.patch.object(package_installer, "exec_program", side_effect=watch):
             env = {"DISTRIBUTION": "ubuntu26.04", "COMPONENT_DIR": str(self.component_dir)}
             with mock.patch.object(install_rocm, "config_for",
                                    side_effect=lambda c, e: {"rocm": _U2604_CFG,
@@ -640,8 +678,7 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu2604_dkms_check_failure_returns_3(self):
         self.assertEqual(self._install("ubuntu26.04", _U2604_CFG, dkms_ok=False), 3)
         commands = self._commands()
-        self.assertEqual(commands[-1], ["apt", "install", "-y", "amdgpu-dkms",
-                                        "amdgpu-dkms-firmware"])
+        self.assertEqual(commands[-1], [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"])
         self.record.assert_not_called()
         self.assertIn("amdgpu DKMS module is not installed", self.error.call_args.args[1])
 
