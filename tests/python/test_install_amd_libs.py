@@ -197,8 +197,9 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(download_module, "log_error"), \
              mock.patch.object(component_config, "log_error"), \
              mock.patch.object(files, "log_info"), \
-             mock.patch.object(install_amd_libs, "write_component_version",
-                               side_effect=write_error) as record, \
+             mock.patch.object(component_config, "write_component_version",
+                               side_effect=write_error, return_value="/versions") as record, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_amd_libs, "log_info"), \
              mock.patch.object(install_amd_libs, "log_warn") as log_warn, \
              mock.patch.object(install_amd_libs, "log_error") as log_error:

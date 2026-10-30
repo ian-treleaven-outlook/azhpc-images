@@ -41,9 +41,9 @@ from __future__ import annotations
 import glob
 import os
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths, write_file
+from utils.files import extract_tarball, make_dirs, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
 from utils.process import run
 
@@ -93,6 +93,9 @@ def aocl_modulefile(prefix: str) -> str:
 def make_symlink(target: str, link_name: str, *, replace: bool) -> None:
     """`ln -sfn` (replace=True) or `ln -s` (replace=False); OSError where ln fails.
 
+    Stays local rather than utils.files.symlink(): the kept quirks need ln's
+    link-inside-an-existing-folder behaviour, and the rerun error its own text.
+
     As ln does: an existing folder at link_name gets the link *inside* it
     (with -n, a symlink to a folder is replaced instead); -f removes an
     existing file or symlink first; without -f an existing name is
@@ -106,15 +109,6 @@ def make_symlink(target: str, link_name: str, *, replace: bool) -> None:
 
 
 # ---- Steps ----------------------------------------------------------------------
-def _record_version(component: str, version: str) -> bool:
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}")
-        return False
-    return True
-
-
 def _download_and_extract(url: str, sha256: str, env: dict[str, str]) -> bool:
     """Download + verify `url` into _WORK_DIR and unpack it there."""
     tarball = fetch_verified(url, sha256, _OP, _WORK_DIR)
@@ -183,7 +177,7 @@ def _install_aocl(version: str, sha256: str, env: dict[str, str]) -> bool:
             and _copy_aocl_output(folder, version, env)
             and _link_mt_build()
             and _write_aocl_module(version, env["MODULE_FILES_DIRECTORY"])
-            and _record_version("AOCL", version))
+            and record_version("AOCL", version, _OP))
 
 
 def _install_aocc(version: str, sha256: str, env: dict[str, str]) -> bool:
@@ -192,15 +186,12 @@ def _install_aocc(version: str, sha256: str, env: dict[str, str]) -> bool:
             and run(["./install.sh"], _OP, cwd=folder, env=env)
             # Copies the folder itself: /opt/amd/aocc-compiler-<version>.
             and run(["cp", "-r", folder, _INSTALL_PREFIX], _OP, env=env)
-            and _record_version("AOCC", version))
+            and record_version("AOCC", version, _OP))
 
 
 def install(env: dict[str, str]) -> int:
     """Install AOCL then AOCC into /opt/amd. Returns 0 on success, 3 on failure."""
-    try:
-        os.makedirs(_INSTALL_PREFIX, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_INSTALL_PREFIX}: {exc}")
+    if not make_dirs(_INSTALL_PREFIX, op=_OP):
         return 3
     cfg = require_config("amd", env, _OP, "aocl.version", "aocl.sha256",
                          "aocc.version", "aocc.sha256")
