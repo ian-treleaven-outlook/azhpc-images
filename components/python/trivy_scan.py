@@ -1,117 +1,58 @@
 """trivy_scan.py — Python port of components/trivy_scan.sh.
 
-What this step does
--------------------
-Near the end of an image build we scan the finished root filesystem for known
-vulnerabilities with Trivy (an open-source scanner from Aqua Security) and keep
-two reports in the image, which the Packer build also copies out:
+Near the end of an image build, scans the finished root filesystem with Trivy
+(Aqua Security's vulnerability scanner) and keeps two reports in the image,
+which the Packer build also copies out:
 
-  * /opt/azurehpc/trivy-report-rootfs.json     Trivy's own JSON report
-                                                (fixable vulnerabilities only)
-  * /opt/azurehpc/trivy-cyclonedx-rootfs.json  a CycloneDX SBOM (software bill
-                                                of materials) of the same scan
+  * /opt/azurehpc/trivy-report-rootfs.json     Trivy JSON, fixable vulns only
+  * /opt/azurehpc/trivy-cyclonedx-rootfs.json  a CycloneDX SBOM of the same scan
 
-Steps, in bash order:
+Steps, in bash's order:
 
-  1. Ask the GitHub API for the latest Trivy release, e.g. "v0.58.1" -> "0.58.1".
+  1. Ask the GitHub API for the latest Trivy release ("v0.58.1" -> "0.58.1").
   2. mkdir -p /opt/azurehpc.
-  3. Download trivy_<version>_<Linux-64bit|Linux-ARM64>.tar.gz with wget,
-     unpack it into a trivy/ directory, delete the tarball, chmod a+x the binary.
-  4. Run the two scans. Each one is retried up to 10 times, under a 600-second
-     `timeout`, waiting 30 seconds between attempts (the vulnerability database
-     download from a container registry is sometimes flaky).
-  5. rm -rf the trivy/ directory.
+  3. wget trivy_<version>_<Linux-64bit|Linux-ARM64>.tar.gz, unpack it into
+     trivy/, delete the tarball, chmod a+x the binary.
+  4. Run the two scans, each under bash's retrycmd_if_failure 10 30 600: up to
+     10 attempts under a 600 s `timeout`, 30 s apart (the vulnerability
+     database download is sometimes flaky).
+  5. rm -rf trivy/.
 
-The original bash, for comparison (abridged; it runs with set -euxo pipefail):
+Only the Python build's "trivy-scan" Step runs this port: packer/build.pkr.hcl
+and every distros/*/install.sh still call trivy_scan.sh directly, so a fix made
+here must also be made in the .sh file until they are switched over.
 
-    TRIVY_VERSION=$(curl -sfL -H "Accept: application/vnd.github+json" \\
-        -H "X-GitHub-Api-Version: 2022-11-28" \\
-        https://api.github.com/repos/aquasecurity/trivy/releases/latest \\
-        | python3 -c "import sys,json;print(json.load(sys.stdin)['name'])")
-    TRIVY_VERSION=${TRIVY_VERSION:1} # remove the leading 'v'
-    if [[ "$ARCHITECTURE" == "aarch64" ]]; then TRIVY_ARCH="Linux-ARM64"
-    else TRIVY_ARCH="Linux-64bit"; fi
-    TRIVY_DB_REPOSITORIES="mcr.microsoft.com/mirror/ghcr/aquasecurity/trivy-db:2,..."
-    declare -a SKIP_DIRS=("/var/lib/waagent" "/snap" "/mnt" "$(pwd)/trivy")
+Kept bash quirks
+----------------
+  * ${TRIVY_VERSION:1} drops the first character of the release name, "v" or
+    not.
+  * `${SKIP_DIRS[@]/#/ --skip-dirs }` is unquoted, so each directory becomes
+    two words (`--skip-dirs /snap`). SKIP_FILES is never defined and (checked
+    with bash 5.3 under set -u) expands to no words: no --skip-files options.
+    skip_args() reproduces that list.
+  * Like bash, nothing is checksum-verified: the version is "latest", fetched
+    from GitHub releases with wget.
 
-    retrycmd_if_failure() {
-        retries=$1; wait_sleep=$2; timeout=$3; shift && shift && shift
-        for i in $(seq 1 $retries); do
-            timeout $timeout "${@}" && break || \\
-            if [ $i -eq $retries ]; then
-                echo Executed \\"$@\\" $i times; return 1
-            else
-                sleep $wait_sleep
-            fi
-        done
-        echo Executed \\"$@\\" $i times;
-    }
-
-    mkdir -p "${TRIVY_REPORT_DIRNAME}"
-    TARFILE="trivy_${TRIVY_VERSION}_${TRIVY_ARCH}.tar.gz"
-    wget "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARFILE}" -O "${TARFILE}"
-    mkdir -p trivy
-    tar -xvzf "${TARFILE}" -C trivy
-    rm "${TARFILE}"
-    chmod a+x trivy/trivy
-
-    retrycmd_if_failure 10 30 600 ./trivy/trivy --scanners vuln rootfs -f json \\
-        --db-repository ${TRIVY_DB_REPOSITORIES} ${SKIP_FILES[@]/#/ --skip-files } \\
-        ${SKIP_DIRS[@]/#/ --skip-dirs } --ignore-unfixed --list-all-pkgs=false \\
-        -o "${TRIVY_REPORT_ROOTFS_JSON_PATH}" /
-    retrycmd_if_failure 10 30 600 ./trivy/trivy --scanners vuln rootfs -f cyclonedx \\
-        --db-repository ${TRIVY_DB_REPOSITORIES} ${SKIP_FILES[@]/#/ --skip-files } \\
-        ${SKIP_DIRS[@]/#/ --skip-dirs } --ignore-unfixed \\
-        -o "${TRIVY_CYCLONEDX_ROOTFS_JSON_PATH}" /
-
-    rm -rf ./trivy
-
-How the skip options expand in bash
------------------------------------
-`${SKIP_DIRS[@]/#/ --skip-dirs }` prefixes every element with " --skip-dirs ";
-because it's unquoted, bash then splits each result into two words, giving
-`--skip-dirs /var/lib/waagent --skip-dirs /snap ...`. SKIP_FILES is never
-defined anywhere, and (checked with bash 5.3 under set -u) its expansion
-produces no words at all, so there are no --skip-files options. skip_args()
-below reproduces exactly that argument list.
-
-How it fits into the Python build
----------------------------------
-utils/plans/steps.py sets this module's install() as the `action=` of the
-"trivy-scan" Step. Deleting `action=` from that Step makes the build run the
-bash script again, which is why the .sh file is kept. (packer/build.pkr.hcl and
-the distros/*/install.sh scripts still call the bash script directly.)
-
-install() receives the build environment (a dict) and returns 0 for success or
-3 for failure. It logs problems and never lets an exception escape.
-
-Deliberate differences from bash
---------------------------------
-  * Bash runs in the distro build directory and unpacks trivy/ there; we use a
-    scratch work directory (_WORK_DIR) and run the scans with it as the current
-    directory, so `./trivy/trivy` and the skipped "<work dir>/trivy" still
-    refer to the unpacked copy. The work directory is removed even when a step
-    fails (bash's `set -e` would leave trivy/ behind).
-  * A release "name" that isn't a non-empty string (or leaves nothing once the
+Deliberate differences
+----------------------
+  * Bash unpacks trivy/ in the distro build directory; this uses a scratch
+    work directory (_WORK_DIR) as the scans' current directory, so
+    `./trivy/trivy` and the skipped "<work dir>/trivy" still refer to it. It
+    is removed even when a step fails (bash's `set -e` would leave trivy/).
+  * A release "name" that isn't a non-empty string (or is empty once the
     first character is dropped) fails, instead of downloading a nonsense URL.
-  * The tarball is unpacked with Python's tarfile module (filter="data") rather
-    than `tar -xvzf`; the Trivy release archive holds only regular files.
-  * Like bash, nothing is checksum-verified: the version is "latest" and the
-    tarball comes straight from GitHub releases with wget.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import tarfile
 import time
 
+from utils.files import extract_tarball, remove_paths
 from utils.logger import log_error, log_info
-from utils.process import exec_program, run_capture
+from utils.process import run, run_capture
 
-# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "trivy-scan"
 
 # The GitHub API call bash makes to find the newest Trivy release.
@@ -123,7 +64,7 @@ _LATEST_RELEASE_COMMAND = [
 ]
 _DOWNLOAD_URL = "https://github.com/aquasecurity/trivy/releases/download"
 
-# Module-level constants so the tests can point them at a temporary directory.
+# Module constants so the tests can point them at a temporary directory.
 _REPORT_DIR = "/opt/azurehpc"
 _WORK_DIR = "/tmp/azhpc-trivy"
 
@@ -132,8 +73,7 @@ _DB_REPOSITORIES = ("mcr.microsoft.com/mirror/ghcr/aquasecurity/trivy-db:2,"
                     "ghcr.io/aquasecurity/trivy-db:2,"
                     "public.ecr.aws/aquasecurity/trivy-db")
 
-# Directories excluded from the scan. The unpacked trivy/ directory is added
-# at run time, because its path depends on the work directory.
+# Excluded from the scan; the unpacked trivy/ is added at run time.
 _SKIP_DIRS = ["/var/lib/waagent", "/snap", "/mnt"]
 
 # retrycmd_if_failure 10 30 600: attempts, seconds between them, timeout each.
@@ -142,29 +82,20 @@ _RETRY_WAIT_SECONDS = 30
 _TIMEOUT_SECONDS = 600
 
 
-# --------------------------------------------------------------------------- #
-# Pure helpers: they only transform values, so tests call them directly.
-# --------------------------------------------------------------------------- #
+# ---- Pure helpers -------------------------------------------------------------
 def version_from_release(release_json: str) -> str | None:
-    """Return the Trivy version from the GitHub "latest release" JSON.
+    """The version in GitHub's "latest release" JSON: {"name": "v0.58.1"} -> "0.58.1".
 
-    Mirrors  python3 -c "...print(json.load(sys.stdin)['name'])"  followed by
-    ${TRIVY_VERSION:1}, which drops the first character (the leading "v"):
-
-        {"name": "v0.58.1", ...}  ->  "0.58.1"
-
-    Like bash, the first character is dropped whatever it is. Returns None if
-    the text isn't JSON, has no string "name", or leaves nothing behind.
+    bash: `print(json.load(sys.stdin)['name'])` then ${TRIVY_VERSION:1}. None
+    if the text isn't JSON, has no string "name", or leaves nothing behind.
     """
     try:
         release = json.loads(release_json)
     except json.JSONDecodeError:
         return None
-    # isinstance() checks the type: the JSON could be a list, or name could be null.
     name = release.get("name") if isinstance(release, dict) else None
     if not isinstance(name, str):
         return None
-    # name[1:] is a slice: everything from index 1 on, like bash's ${name:1}.
     return name[1:] or None
 
 
@@ -179,12 +110,7 @@ def tarball_name(version: str, architecture: str) -> str:
 
 
 def skip_args(skip_dirs: list[str]) -> list[str]:
-    """The words bash produces for the (empty) SKIP_FILES and the SKIP_DIRS.
-
-    e.g. ["/snap", "/mnt"] -> ["--skip-dirs", "/snap", "--skip-dirs", "/mnt"].
-    SKIP_FILES is undefined in bash and expands to nothing (see the module
-    docstring), so no --skip-files words are produced.
-    """
+    """bash's SKIP_FILES (nothing) and SKIP_DIRS words: ["--skip-dirs", d, ...]."""
     args = []
     for directory in skip_dirs:
         args += ["--skip-dirs", directory]
@@ -194,14 +120,12 @@ def skip_args(skip_dirs: list[str]) -> list[str]:
 def scan_commands(trivy_dir: str, report_dir: str) -> list[list[str]]:
     """The two trivy commands bash runs, in order (JSON report, then CycloneDX).
 
-    trivy_dir is the absolute path of the unpacked trivy/ directory; it is
-    skipped so Trivy doesn't scan itself. The binary is run as ./trivy/trivy,
-    so the commands must run with trivy_dir's parent as the current directory.
+    trivy_dir (the unpacked trivy/, absolute) is skipped so Trivy doesn't scan
+    itself. The binary is ./trivy/trivy, so run them from trivy_dir's parent.
     """
     common = ["--db-repository", _DB_REPOSITORIES,
               *skip_args([*_SKIP_DIRS, trivy_dir]),
               "--ignore-unfixed"]
-    # The * in [..., *common, ...] inserts common's items into the new list.
     return [
         ["./trivy/trivy", "--scanners", "vuln", "rootfs", "-f", "json", *common,
          "--list-all-pkgs=false",
@@ -211,23 +135,15 @@ def scan_commands(trivy_dir: str, report_dir: str) -> list[list[str]]:
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Helpers with side effects.
-# --------------------------------------------------------------------------- #
+# ---- Steps ----------------------------------------------------------------------
 def retry_command(command: list[str], env: dict[str, str], *, cwd: str,
                   retries: int = _RETRIES, wait_seconds: int = _RETRY_WAIT_SECONDS,
                   timeout_seconds: int = _TIMEOUT_SECONDS) -> bool:
-    """Port of bash's retrycmd_if_failure: run `timeout <secs> <command>` until
-    it succeeds, at most `retries` times, sleeping between failed attempts.
-
-    Returns True on success, False once every attempt has failed (bash returns
-    1 there, which stops the script because of set -e). There is no sleep after
-    the final failed attempt, as in bash.
-    """
+    """bash's retrycmd_if_failure: `timeout <secs> <command>` until it succeeds,
+    at most `retries` times, sleeping between failures (not after the last)."""
     timed = ["timeout", str(timeout_seconds), *command]
-    # range(1, retries + 1) counts 1, 2, ..., retries, like `seq 1 $retries`.
     for attempt in range(1, retries + 1):
-        if exec_program(timed, _OP, cwd=cwd, env=env) == 0:
+        if run(timed, _OP, cwd=cwd, env=env):
             log_info(_OP, f'Executed "{" ".join(command)}" {attempt} times')
             return True
         if attempt < retries:
@@ -236,82 +152,74 @@ def retry_command(command: list[str], env: dict[str, str], *, cwd: str,
     return False
 
 
-def _download_trivy(version: str, architecture: str, env: dict[str, str]) -> bool:
-    """wget the release tarball into the work dir, unpack it into trivy/,
-    delete the tarball and make the binary executable.
-
-    May raise OSError / tarfile.TarError; install() catches them.
-    """
-    tarfile_name = tarball_name(version, architecture)
-    tarball = os.path.join(_WORK_DIR, tarfile_name)
-    url = f"{_DOWNLOAD_URL}/v{version}/{tarfile_name}"
-    # Relative -O name with the work dir as cwd, exactly like bash's command.
-    if exec_program(["wget", url, "-O", tarfile_name], _OP, cwd=_WORK_DIR, env=env) != 0:
-        return False
-
-    trivy_dir = os.path.join(_WORK_DIR, "trivy")
-    os.makedirs(trivy_dir, exist_ok=True)
-    # tarfile.open() detects the gzip compression itself. filter="data" refuses
-    # unsafe entries (absolute paths, links leaving the directory); the Trivy
-    # archive contains only regular files, so it unpacks like `tar -xzf`.
-    with tarfile.open(tarball) as archive:
-        archive.extractall(trivy_dir, filter="data")
-    os.remove(tarball)
-
-    # chmod a+x: add the execute bit for user, group and others (0o111) to the
-    # current mode. 0o... is Python's octal notation, as used by chmod.
-    binary = os.path.join(trivy_dir, "trivy")
-    os.chmod(binary, os.stat(binary).st_mode | 0o111)
-    return True
-
-
-# --------------------------------------------------------------------------- #
-# Orchestrator.
-# --------------------------------------------------------------------------- #
-def install(env: dict[str, str]) -> int:
-    """Download the latest Trivy and write the two rootfs scan reports.
-
-    Returns 0 on success, 3 on failure.
-    """
-    # NOTE: this function only replaces trivy_scan.sh inside the Python build
-    # (the "trivy-scan" Step). packer/build.pkr.hcl runs
-    # `bash ../../components/trivy_scan.sh` itself after the build, and every
-    # distros/*/install.sh still calls $COMPONENT_DIR/trivy_scan.sh directly,
-    # so those scans use the bash script, not this port. A fix made here must
-    # also be made in the .sh file until they are switched over.
-    # ---- 1. Latest release version ----------------------------------------
+def _latest_version(env: dict[str, str]) -> str | None:
+    """Step 1: the latest Trivy release, from the GitHub API."""
     rc, output = run_capture(_LATEST_RELEASE_COMMAND, _OP, env=env)
     if rc != 0:
         log_error(_OP, "could not query the latest Trivy release from GitHub")
-        return 3
+        return None
     version = version_from_release(output)
     if version is None:
         log_error(_OP, f"unexpected GitHub release response: {output[:200]!r}")
-        return 3
-    log_info(_OP, f"Using Trivy {version}")
+        return None
+    log_info(_OP, f"Using Trivy {version}", version=version)
+    return version
 
-    architecture = env.get("ARCHITECTURE", "")
-    trivy_dir = os.path.join(_WORK_DIR, "trivy")
+
+# TODO(ADO 1001): toolkit candidate: make_dirs(*paths, op) -> bool (bash `mkdir -p`,
+# logging the path that failed).
+def _make_dirs(*paths: str) -> bool:
+    """bash `mkdir -p <paths>`."""
     try:
-        # ---- 2. Report directory (mkdir -p) --------------------------------
-        os.makedirs(_REPORT_DIR, exist_ok=True)
+        for path in paths:
+            os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        log_error(_OP, f"could not create {exc.filename}: {exc}", path=str(exc.filename))
+        return False
+    return True
 
-        # ---- 3. Download and unpack ----------------------------------------
-        os.makedirs(_WORK_DIR, exist_ok=True)
-        if not _download_trivy(version, architecture, env):
-            return 3
 
-        # ---- 4. The two scans, each with retries ---------------------------
-        for command in scan_commands(trivy_dir, _REPORT_DIR):
-            if not retry_command(command, env, cwd=_WORK_DIR):
-                return 3
-    except (OSError, tarfile.TarError) as exc:
-        log_error(_OP, f"file operation failed: {exc}")
+def _download_trivy(version: str, architecture: str, env: dict[str, str]) -> bool:
+    """Step 3: wget the tarball into the work dir, unpack it into trivy/, delete
+    it and make the binary executable (bash's commands, run from the work dir)."""
+    name = tarball_name(version, architecture)
+    if not run(["wget", f"{_DOWNLOAD_URL}/v{version}/{name}", "-O", name], _OP,
+               cwd=_WORK_DIR, env=env):
+        return False
+    trivy_dir = os.path.join(_WORK_DIR, "trivy")
+    if not (_make_dirs(trivy_dir)
+            and extract_tarball(name, _OP, dest="trivy", cwd=_WORK_DIR, env=env)):
+        return False
+    binary = os.path.join(trivy_dir, "trivy")
+    try:
+        os.remove(os.path.join(_WORK_DIR, name))                 # bash: rm (no -f)
+        os.chmod(binary, os.stat(binary).st_mode | 0o111)        # chmod a+x
+    except OSError as exc:
+        log_error(_OP, f"could not prepare the trivy binary: {exc}", path=binary)
+        return False
+    return True
+
+
+def _run_scans(env: dict[str, str]) -> bool:
+    """Step 4: the two scans, each with retries, from the work dir."""
+    for command in scan_commands(os.path.join(_WORK_DIR, "trivy"), _REPORT_DIR):
+        if not retry_command(command, env, cwd=_WORK_DIR):
+            return False
+    return True
+
+
+def install(env: dict[str, str]) -> int:
+    """Download the latest Trivy and write the two rootfs scan reports; 0 or 3."""
+    version = _latest_version(env)
+    if version is None:
         return 3
+    try:
+        ok = (_make_dirs(_REPORT_DIR, _WORK_DIR)
+              and _download_trivy(version, env.get("ARCHITECTURE", ""), env)
+              and _run_scans(env))
     finally:
-        # ---- 5. Cleanup: bash's `rm -rf ./trivy`, plus our work directory.
-        # A `finally` block runs whether the `try` returned, failed or raised.
-        shutil.rmtree(_WORK_DIR, ignore_errors=True)
-
-    log_info(_OP, f"Trivy reports written to {_REPORT_DIR}")
+        remove_paths(_WORK_DIR, op=_OP)      # bash's `rm -rf ./trivy`, and the work dir
+    if not ok:
+        return 3
+    log_info(_OP, f"Trivy reports written to {_REPORT_DIR}", path=_REPORT_DIR)
     return 0

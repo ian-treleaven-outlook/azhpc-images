@@ -2,11 +2,12 @@
 
   * Pure helpers (release JSON -> version, file names, the skip options and the
     exact scan command lines) are tested directly.
-  * retry_command() is tested with exec_program and time.sleep mocked, so the
-    attempt and sleep counts can be checked without waiting.
-  * install() is tested with run_capture (the GitHub API call) and exec_program
-    (wget, the scans) mocked. The fake wget writes a small real .tar.gz, so the
-    unpack/chmod/cleanup code genuinely runs, inside a temporary directory that
+  * retry_command() is tested with utils.process.exec_program and time.sleep
+    mocked, so the attempt and sleep counts can be checked without waiting.
+  * install() is tested with run_capture (the GitHub API call) and
+    utils.process.exec_program (wget, tar, the scans) mocked. The fake wget
+    writes a small real .tar.gz and the fake tar unpacks it, so the
+    chmod/cleanup code genuinely runs, inside a temporary directory that
     stands in for the work dir and /opt/azurehpc. Nothing touches the network.
 
 Run from the repo root:
@@ -26,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import trivy_scan
+from utils import files, process
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "trivy-scan"
@@ -114,7 +116,7 @@ class NameAndArgsTests(unittest.TestCase):
 class RetryCommandTests(unittest.TestCase):
     def _retry(self, results):
         env = {"A": "1"}
-        with mock.patch.object(trivy_scan, "exec_program", side_effect=results) as ex, \
+        with mock.patch.object(process, "exec_program", side_effect=results) as ex, \
              mock.patch.object(trivy_scan.time, "sleep") as sleep, \
              mock.patch.object(trivy_scan, "log_error"):
             ok = trivy_scan.retry_command(["./trivy/trivy", "x"], env, cwd="/w")
@@ -169,6 +171,9 @@ class InstallTests(unittest.TestCase):
                  wget_rc=0, tarball_writer=_fake_tarball):
         """Run install(env) with run_capture, exec_program and time.sleep mocked.
 
+        The fake `tar -xf <file> -C trivy` unpacks the tarball with tarfile
+        and exits 2 if it isn't one, like tar.
+
         scan_results: return codes for successive scan attempts (default all 0).
         Returns (rc, commands, exec_mock, capture_mock, sleep_mock, binary_modes);
         binary_modes holds the trivy binary's mode at each scan attempt.
@@ -183,11 +188,19 @@ class InstallTests(unittest.TestCase):
                 if wget_rc == 0:
                     tarball_writer(os.path.join(cwd, command[-1]))
                 return wget_rc
+            if command[0] == "tar":
+                try:
+                    with tarfile.open(os.path.join(cwd, command[2])) as archive:
+                        archive.extractall(os.path.join(cwd, command[4]), filter="data")
+                except tarfile.TarError:
+                    return 2
+                return 0
             binary_modes.append(os.stat(os.path.join(cwd, "trivy", "trivy")).st_mode)
             return next(scans, 0)
 
         with mock.patch.object(trivy_scan, "run_capture", return_value=release) as cap, \
-             mock.patch.object(trivy_scan, "exec_program", side_effect=fake_exec) as ex, \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec) as ex, \
+             mock.patch.object(files, "log_error"), \
              mock.patch.object(trivy_scan.time, "sleep") as sleep, \
              mock.patch.object(trivy_scan, "log_error"):
             rc = trivy_scan.install(env)
@@ -208,6 +221,7 @@ class InstallTests(unittest.TestCase):
             ["wget", "https://github.com/aquasecurity/trivy/releases/download/"
                      "v0.58.1/trivy_0.58.1_Linux-64bit.tar.gz",
              "-O", "trivy_0.58.1_Linux-64bit.tar.gz"],
+            ["tar", "-xf", "trivy_0.58.1_Linux-64bit.tar.gz", "-C", "trivy"],
             ["timeout", "600", *scans[0]],
             ["timeout", "600", *scans[1]],
         ])
@@ -233,7 +247,7 @@ class InstallTests(unittest.TestCase):
                                                      scan_results=[124, 1, 0, 0])
 
         self.assertEqual(rc, 0)
-        self.assertEqual(len(commands), 1 + 3 + 1)      # wget, 3 json, 1 cyclonedx
+        self.assertEqual(len(commands), 2 + 3 + 1)      # wget, tar, 3 json, 1 cyclonedx
         self.assertEqual(sleep.call_count, 2)
 
     def test_github_query_failure_returns_3_before_downloading(self):
@@ -263,16 +277,16 @@ class InstallTests(unittest.TestCase):
         rc, commands, *_ = self._install({}, tarball_writer=garbage)
 
         self.assertEqual(rc, 3)
-        self.assertEqual([c[0] for c in commands], ["wget"])
+        self.assertEqual([c[0] for c in commands], ["wget", "tar"])
         self.assertFalse(os.path.exists(self.work))
 
     def test_first_scan_exhausting_retries_returns_3_and_skips_the_second(self):
         rc, commands, _, _, sleep, _ = self._install({}, scan_results=[1] * 10)
 
         self.assertEqual(rc, 3)
-        self.assertEqual(len(commands), 1 + 10)
+        self.assertEqual(len(commands), 2 + 10)
         # Only the JSON scan was attempted.
-        self.assertTrue(all("json" in c for c in commands[1:]))
+        self.assertTrue(all("json" in c for c in commands[2:]))
         self.assertEqual(sleep.call_count, 9)
         self.assertFalse(os.path.exists(self.work))
 
@@ -280,7 +294,7 @@ class InstallTests(unittest.TestCase):
         rc, commands, *_ = self._install({}, scan_results=[0] + [1] * 10)
 
         self.assertEqual(rc, 3)
-        self.assertEqual(len(commands), 1 + 1 + 10)
+        self.assertEqual(len(commands), 2 + 1 + 10)
 
     def test_unwritable_report_dir_returns_3(self):
         # A regular file where a parent directory should be: makedirs raises.
