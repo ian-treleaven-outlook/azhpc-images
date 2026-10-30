@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry Azure persistent RDMA naming
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=azure_persistent_rdma_naming.service
+
+[Install]
+WantedBy=timers.target

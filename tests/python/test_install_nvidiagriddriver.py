@@ -38,8 +38,6 @@ _GRID_CFG = {"url": _GRID_URL, "sha256": "abc123", "version": _GRID_VERSION}
 _CUDA_CFG = {"driver": {"version": "13.2", "distribution": "ubuntu2404"},
              "samples": {"version": "13.2", "sha256": "def"}}
 _INSTALLER = f"NVIDIA-Linux-x86_64-{_GRID_VERSION}-grid-azure.run"
-_KEYRING_URL = ("https://developer.download.nvidia.com/compute/cuda/repos/"
-                "ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb")
 
 _NVCC_OUT = ("nvcc: NVIDIA (R) Cuda compiler driver\n"
              "Copyright (c) 2005-2025 NVIDIA Corporation\n"
@@ -71,9 +69,6 @@ def _env(distribution="ubuntu24.04", **extra):
 class NameTests(unittest.TestCase):
     def test_installer_name(self):
         self.assertEqual(grid.driver_installer_name("595.91.07"), _INSTALLER)
-
-    def test_keyring_url(self):
-        self.assertEqual(grid.cuda_keyring_url("ubuntu2404"), _KEYRING_URL)
 
     def test_toolkit_package_replaces_every_dot(self):
         self.assertEqual(grid.cuda_toolkit_package("13.2"), "cuda-toolkit-13-2")
@@ -127,6 +122,19 @@ class NvccVersionTests(unittest.TestCase):
         self.assertIsNone(grid.nvcc_release_version("nvcc: command not found\n"))
 
 
+class BashScriptTests(unittest.TestCase):
+    def test_cuda_repo_setup_moved_to_the_bootstrap(self):
+        # Upstream #643: the keyring/apt-get update lines left this script for
+        # install_cuda_repo_and_dkms.sh, which the bootstrap runs.
+        script = (_REPO / "components" / "install_nvidiagriddriver.sh").read_text()
+        self.assertIn("apt install -y cuda-toolkit-${CUDA_DRIVER_VERSION//./-}", script)
+        for gone in ("cuda-keyring", "dpkg -i", "apt-get update", "CUDA_DRIVER_DISTRIBUTION"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, script)
+        bootstrap = (_REPO / "distros" / "ubuntu24.04" / "install_utils.sh").read_text()
+        self.assertIn("$COMPONENT_DIR/install_cuda_repo_and_dkms.sh", bootstrap)
+
+
 class CudaProfileContentTests(unittest.TestCase):
     def test_matches_the_echo_lines_in_the_bash_script(self):
         # Each `echo '<text>' | tee [-a] /etc/profile.d/cuda.sh` writes <text>
@@ -150,10 +158,16 @@ class InstallTests(unittest.TestCase):
         self.template = os.path.join(root, "gridd.conf.template")
         self.conf = os.path.join(root, "gridd.conf")
         self.profile = os.path.join(root, "cuda.sh")
+        self.sources = os.path.join(root, "sources.list.d")
+        os.makedirs(self.sources)
+        # What the bootstrap's cuda-keyring install leaves behind.
+        self.cuda_source = os.path.join(self.sources, "cuda-ubuntu2404-x86_64.list")
+        open(self.cuda_source, "w").close()
         with open(self.template, "w", encoding="utf-8") as handle:
             handle.write(_TEMPLATE)
         for name, value in (("_WORK_DIR", self.work), ("_GRIDD_TEMPLATE", self.template),
-                            ("_GRIDD_CONF", self.conf), ("_CUDA_PROFILE", self.profile)):
+                            ("_GRIDD_CONF", self.conf), ("_CUDA_PROFILE", self.profile),
+                            ("_APT_SOURCES_DIR", self.sources)):
             patcher = mock.patch.object(grid, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -216,9 +230,6 @@ class InstallTests(unittest.TestCase):
         return [
             ["bash", _INSTALLER, "--silent", "--dkms", "--kernel-module-type=open"],
             ["cp", self.template, self.conf],
-            ["wget", _KEYRING_URL],
-            ["dpkg", "-i", "./cuda-keyring_1.1-1_all.deb"],
-            ["apt-get", "update"],
             ["apt", "install", "-y", "cuda-toolkit-13-2"],
             [_PERSISTENCE],
         ]
@@ -267,6 +278,11 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any(msg.startswith("Created ") and self.profile in msg
                             for msg in info))
         self.assertTrue(any("Recorded CUDA version 13.2.51" == msg for msg in info))
+        self.assertTrue(any(msg.startswith("NVIDIA CUDA apt source present")
+                            for msg in info))
+        source_log = [c for c in m["info"].call_args_list
+                      if c.args[1].startswith("NVIDIA CUDA apt source present")]
+        self.assertEqual(source_log[0].kwargs["cuda_apt_sources"], self.cuda_source)
         self.assertTrue(any("CUDA samples" in msg for msg in info))
         self.assertTrue(any("nvidia-persistenced" in msg for msg in info))
         self.assertEqual(info[-1], "NVIDIA GRID driver installed")
@@ -312,12 +328,20 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("glued" in msg for msg in self._messages(m["warn"])))
 
     # ---- warnings --------------------------------------------------------------
-    def test_non_ubuntu_warns_and_fails_at_dpkg_like_bash(self):
-        rc, m = self._install(_env("almalinux9.8"), fail_on="dpkg")
+    def test_non_ubuntu_warns_and_fails_at_apt_like_bash(self):
+        rc, m = self._install(_env("almalinux9.8"), fail_on="apt")
         self.assertEqual(rc, 3)
         self.assertTrue(any("assumes Ubuntu" in msg for msg in self._messages(m["warn"])))
-        self.assertEqual(self._commands(m)[-1], ["dpkg", "-i", "./cuda-keyring_1.1-1_all.deb"])
+        self.assertEqual(self._commands(m)[-1], ["apt", "install", "-y", "cuda-toolkit-13-2"])
         self.assertFalse(os.path.exists(self.work))
+
+    def test_missing_cuda_apt_source_warns_and_continues(self):
+        os.remove(self.cuda_source)
+        rc, m = self._install()
+        self.assertEqual(rc, 0)          # the (mocked) apt decides, as in bash
+        self.assertIn(["apt", "install", "-y", "cuda-toolkit-13-2"], self._commands(m))
+        self.assertTrue(any("no CUDA apt source" in msg and "install_cuda_repo_and_dkms.sh"
+                            in msg for msg in self._messages(m["warn"])))
 
     def test_installer_name_mismatch_warns(self):
         cfg = dict(_GRID_CFG, url="https://example.com/grid-driver.run")
@@ -348,6 +372,13 @@ class InstallTests(unittest.TestCase):
                             for msg in self._messages(m["warn"])))
 
     # ---- missing config ----------------------------------------------------------
+    def test_cuda_distribution_is_no_longer_needed(self):
+        # Only install_cuda_repo_and_dkms.sh reads driver.distribution now.
+        cuda = {"driver": {"version": "13.2"}}
+        rc, m = self._install(configs={"nvidia_grid": _GRID_CFG, "cuda": cuda})
+        self.assertEqual(rc, 0)
+        m["error"].assert_not_called()
+
     def test_missing_config_fails_before_anything_runs(self):
         cases = {
             "no grid": {"cuda": _CUDA_CFG},
@@ -356,8 +387,8 @@ class InstallTests(unittest.TestCase):
             "no grid sha256": {"nvidia_grid": {"url": _GRID_URL, "version": "1"},
                                "cuda": _CUDA_CFG},
             "no cuda": {"nvidia_grid": _GRID_CFG},
-            "no cuda distribution": {"nvidia_grid": _GRID_CFG,
-                                     "cuda": {"driver": {"version": "13.2"}}},
+            "no cuda version": {"nvidia_grid": _GRID_CFG,
+                                "cuda": {"driver": {"distribution": "ubuntu2404"}}},
         }
         for name, configs in cases.items():
             with self.subTest(name):

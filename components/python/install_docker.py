@@ -17,6 +17,10 @@ The packages differ per distro family:
                   On baremetal_3p nodes (TARGET_NODE_TYPE), instead install
                   moby-engine=<V> and moby-cli=<V>, pinned to the "moby"
                   version in versions.json, and no buildx.
+                  Ubuntu 26.04 (any node type) no longer has Microsoft's moby
+                  packages: one `apt-get install -y docker.io docker-buildx`
+                  (Canonical's Docker), and MOBY_ENGINE records the docker.io
+                  package version (`dpkg-query -W -f='${Version}' docker.io`).
   * Azure Linux   dnf install moby-engine, moby-cli, docker-buildx.
   * RHEL family   (AlmaLinux, Rocky, RHEL) dnf install moby-engine, moby-cli,
                   moby-buildx.
@@ -29,7 +33,9 @@ The original bash, for comparison (comments trimmed):
     fi
 
     if [[ $DISTRIBUTION == *"ubuntu"* ]]; then
-        if [[ "${TARGET_NODE_TYPE:-azure_vm_regular}" == "baremetal_3p" ]]; then
+        if [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
+            apt-get install -y docker.io docker-buildx
+        elif [[ "${TARGET_NODE_TYPE:-azure_vm_regular}" == "baremetal_3p" ]]; then
             moby_metadata=$(get_component_config "moby")
             MOBY_VERSION=$(jq -r '.version' <<< $moby_metadata)
             apt-get install -y moby-engine=${MOBY_VERSION}
@@ -72,7 +78,11 @@ The original bash, for comparison (comments trimmed):
     write_component_version "DOCKER" ${docker_version::-1}
 
     if [[ $DISTRIBUTION == ubuntu* ]]; then
-        moby_version=$(apt list --installed | grep moby-engine | awk -F' ' '{print $2}')
+        if [[ $DISTRIBUTION == "ubuntu26.04" ]]; then
+            moby_version=$(dpkg-query -W -f='${Version}' docker.io)
+        else
+            moby_version=$(apt list --installed | grep moby-engine | awk -F' ' '{print $2}')
+        fi
     elif [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
         moby_version=$(rpm -qa | grep moby | cut -d'-' -f3,4)
     else
@@ -106,7 +116,8 @@ Deliberate differences from bash
     stops with a "substring expression" error for an empty docker version).
   * A failing `docker --version`, `apt list`, `rpm -qa` or `dnf list` fails the
     step. Bash, without `set -o pipefail`, ignores the exit code of the first
-    command in a pipeline and parses whatever it printed.
+    command in a pipeline and parses whatever it printed. (Ubuntu 26.04's
+    `dpkg-query` is not in a pipeline, so it stops bash too.)
   * A missing "moby" version in versions.json on baremetal_3p fails up front.
     Bash would run `apt-get install -y moby-engine=null`, which fails anyway.
   * The "Waiting for containerd socket" lines are logged at DEBUG, and a socket
@@ -138,6 +149,10 @@ _OP = "install-docker"
 # The only distro handled by the Azure Linux branch (an exact match, as in bash).
 _AZURE_LINUX = "azurelinux3.0"
 
+# Ubuntu 26.04 installs Canonical's docker.io instead of moby (an exact match,
+# checked before the baremetal_3p test, as in bash).
+_UBUNTU_DOCKER_IO = "ubuntu26.04"
+
 # The node type whose Ubuntu moby packages are pinned to a versions.json version.
 _BAREMETAL_3P = "baremetal_3p"
 
@@ -155,6 +170,8 @@ _TOOLKIT_SCRIPT = "install_nvidia_container_toolkit.sh"
 # installed by its own command, as in bash (so one failure names one package).
 _UBUNTU_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
 _UBUNTU_PINNED_PACKAGES = ["moby-engine", "moby-cli"]          # baremetal_3p
+# Ubuntu 26.04: both packages in ONE apt-get command, as in bash.
+_UBUNTU_DOCKER_IO_COMMAND = ["apt-get", "install", "-y", "docker.io", "docker-buildx"]
 _AZURE_LINUX_PACKAGES = ["moby-engine", "moby-cli", "docker-buildx"]
 _RHEL_PACKAGES = ["moby-engine", "moby-cli", "moby-buildx"]
 
@@ -281,9 +298,14 @@ def rpm_moby_source_line(output: str) -> str | None:
 
 
 def moby_version_command(distribution: str) -> list[str]:
-    """The command whose output holds the installed moby-engine version."""
+    """The command whose output holds the installed moby-engine version
+    (docker.io's on Ubuntu 26.04)."""
     # startswith() mirrors bash's ubuntu* pattern (the install uses "contains").
     if distribution.startswith("ubuntu"):
+        if distribution == _UBUNTU_DOCKER_IO:
+            # Python passes '${Version}' to dpkg-query literally, as bash's
+            # single quotes do; dpkg-query fills it in.
+            return ["dpkg-query", "-W", "-f=${Version}", "docker.io"]
         return ["apt", "list", "--installed"]
     if distribution == _AZURE_LINUX:
         return ["rpm", "-qa"]
@@ -294,6 +316,10 @@ def parse_moby_version(distribution: str, output: str) -> str | None:
     """Parse the output of moby_version_command(distribution)."""
     if distribution == _AZURE_LINUX:
         return rpm_moby_version(output)
+    if distribution == _UBUNTU_DOCKER_IO:
+        # dpkg-query prints just the version (no newline); bash's unquoted
+        # ${moby_version} keeps its first word.
+        return first_word(output)
     # Ubuntu and the RHEL family use the same grep | awk '{print $2}' pipeline.
     return grep_awk_version(output, "moby-engine")
 
@@ -346,6 +372,12 @@ def _moby_commands(env: dict[str, str]) -> list[list[str]] | None:
     node_type = env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
 
     if "ubuntu" in distribution:
+        if distribution == _UBUNTU_DOCKER_IO:
+            log_info(_OP, "Ubuntu 26.04: installing Canonical's docker.io and "
+                          "docker-buildx (no Microsoft moby packages), on every "
+                          "node type", distro=distribution, node_type=node_type,
+                     packages="docker.io docker-buildx")
+            return [list(_UBUNTU_DOCKER_IO_COMMAND)]
         if node_type == _BAREMETAL_3P:
             cfg = config_for("moby", env)
             # isinstance() guards against a config that isn't a JSON object.
@@ -468,6 +500,9 @@ def install(env: dict[str, str]) -> int:
         log_error(_OP, f"could not determine the installed moby-engine version "
                        f"from `{' '.join(command)}`", distro=distribution, exit_code=rc)
         return 3
+    if distribution == _UBUNTU_DOCKER_IO:
+        log_info(_OP, "Ubuntu 26.04: MOBY_ENGINE records the docker.io package "
+                      "version, as bash does", package="docker.io", version=moby)
     if distribution == _AZURE_LINUX:
         # BASH QUIRK (kept for parity): `rpm -qa | grep moby` matches every
         # moby-* package, and the first one listed wins. If that isn't

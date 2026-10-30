@@ -7,22 +7,29 @@ talk between processes and nodes, and the environment-module files that let a
 user pick one with `module load mpi/<name>`:
 
   1. HPC-X       NVIDIA's MPI bundle (Open MPI + UCX + HCOLL + SHARP),
-                 unpacked into /opt and rebuilt against PMIx with the bundled
-                 hpcx_rebuild.sh. Which HPC-X build is used depends on the GPU
-                 vendor and network (see hpcx_variant()). Afterwards its SHARP
-                 and UCX libraries are registered with the dynamic linker
-                 (/etc/ld.so.conf.d) and its pkg-config files are symlinked
-                 into /usr/local/lib(64)/pkgconfig.
+                 unpacked into /opt. Which HPC-X build is used depends on the
+                 GPU vendor and network (see hpcx_variant()). Usually its Open
+                 MPI (and on AMD / Ubuntu 22.04 its UCX) is then rebuilt with
+                 the bundled hpcx_rebuild.sh (see "HPC-X rebuild" below).
+                 Afterwards its SHARP and UCX libraries are registered with the
+                 dynamic linker (/etc/ld.so.conf.d), its pkg-config files are
+                 symlinked into /usr/local/lib(64)/pkgconfig, and its
+                 modulefiles are written.
   2. MVAPICH     built from source into /opt/mvapich-<version> (skipped on
-                 GB200/GB300 with Ubuntu 24.04 or Azure Linux 3.0).
-  3. Open MPI    built from source into /opt/openmpi-<version>.
+                 GB200/GB300 with Ubuntu 24.04 or Azure Linux 3.0, and on
+                 Ubuntu 26.04).
+  3. Open MPI    built from source into /opt/openmpi-<version> (skipped on
+                 Ubuntu 26.04).
   4. Intel MPI   installed with Intel's offline installer (x86_64 only).
-  5. Modulefiles under $MODULE_FILES_DIRECTORY/mpi for each of the above, plus
-                 the short names (mpi/hpcx, mpi/openmpi, ...) as symlinks.
+
+Each MPI's modulefile under $MODULE_FILES_DIRECTORY/mpi, and its short name
+(mpi/hpcx, mpi/openmpi, ...) as a symlink, is written right after that MPI is
+installed. mpi/hpcx-pmix-<version> is a symlink to mpi/hpcx-<version>.
 
 Every installed version is recorded in the component-versions file (HPCX,
-MVAPICH, OMPI, IMPI). On RPM distros (AlmaLinux, Rocky, RHEL, Azure Linux 3.0)
-ucx*, openmpi and perftest are version-locked against later dnf updates.
+MVAPICH, OMPI, IMPI, and PMIX when Open MPI uses its internal PMIx). On RPM
+distros (AlmaLinux, Rocky, RHEL, Azure Linux 3.0) ucx*, openmpi and perftest
+are version-locked against later dnf updates.
 
 Two network flavours run through the whole script:
   * UCX SKUs (every SKU with InfiniBand): MPIs use UCX (+ HCOLL).
@@ -30,33 +37,83 @@ Two network flavours run through the whole script:
     (/opt/libfabric) with the tcp provider, and the modulefiles get extra
     settings that avoid hangs on MANA-only hardware.
 
+PMIx: internal or external
+--------------------------
+On Ubuntu 26.04, Azure Linux 3.0, AlmaLinux/Rocky/RHEL 10 (no external PMIx v5
+package to align to) and on baremetal_3p nodes (the external PMIx conflicts
+with the node's packages), Open MPI builds its own PMIx, hwloc and libevent
+("internal"), and the PMIx version it ships is read back with pkg-config and
+recorded as PMIX. Everywhere else Open MPI is built against the PMIx that
+install_pmix installed in /opt/pmix/<version without the last 2 chars>.
+
+HPC-X rebuild
+-------------
+  * UCX is rebuilt (hpcx_rebuild.sh --rebuild-ucx) on UCX SKUs that are AMD
+    (ROCm support) or Ubuntu 22.04. Before that, HPC-X's bundled UCX source
+    tarball is patched with components/patches/ucx-netlink-dump-done.patch if
+    it has the netlink route-dump hang (openucx/ucx#12070, hit on
+    linux-azure 5.15.0-1123+).
+  * HPC-X is rebuilt unless the SKU is an NVIDIA UCX SKU with internal PMIx and
+    no UCX rebuild; that one case uses the vendor Open MPI as shipped
+    (modulefiles/hpcx instead of modulefiles/hpcx-rebuild).
+  * The rebuild passes the vendor's own Open MPI configure options back
+    (--ompi-extra-config replaces them), --cuda on NVIDIA (the driver/CUDA
+    step runs before this one; CUDA_HOME=/usr/local/cuda when UCX is rebuilt)
+    and ROCm options on AMD (ROCm is installed before this step).
+  * After the rebuild: the rebuilt UCX must run (`ucx_info -v`), the rebuilt
+    ompi_info must load the rebuilt libmpi (`ldd`), and the generated
+    module/init entrypoints are fixed with sed to point at hpcx-rebuild.
+
 The original bash, for comparison (abridged; see components/install_mpis.sh):
 
     set CC=/usr/bin/gcc; set GCC=/usr/bin/gcc
     INSTALL_PREFIX=/opt
-    PMIX_PATH=${INSTALL_PREFIX}/pmix/${PMIX_VERSION:0:-2}
+    mkdir -p ${MODULE_FILES_DIRECTORY}/mpi
     hpcx_metadata = hpcx_amd (AMD) | hpcx_inbox (no_rdma) | hpcx
     download_and_verify ${HPCX_DOWNLOAD_URL} ${HPCX_SHA256}; tar -xvf ${TARBALL}
     mv ${HPCX_FOLDER} ${INSTALL_PREFIX}
     HPCX_DIR=${HPCX_PATH} ${HPCX_PATH}/utils/hpcx_fix_ladir.sh
     write_component_version "HPCX" $HPCX_VERSION
-    AMD + UCX: [[ -d /opt/rocm ]] || exit 1
-               HPCX_REBUILD_UCX_ARGS=(--rebuild-ucx --ucx-extra-config "--with-rocm=/opt/rocm")
-    ${HPCX_PATH}/utils/hpcx_rebuild.sh ...   (3 variants, see hpcx_rebuild_command())
-    cp -r ${HPCX_PATH}/ompi/tests ${HPCX_PATH}/hpcx-rebuild
-    UCX_PATH=${HPCX_PATH}/ucx/hpcx-rebuild   (only when UCX was rebuilt)
+    USE_INTERNAL_PMIX = ubuntu26.04|azurelinux3.0|almalinux10*|rocky10*|rhel10*|baremetal_3p
+        else PMIX_PATH=${INSTALL_PREFIX}/pmix/${PMIX_VERSION:0:-2}
+    OMPI_DEPS_ARGS = (--with-pmix=internal --with-hwloc=internal --with-libevent=internal)
+                     | ("--with-pmix=${PMIX_PATH}")
+    REBUILD_UCX = sku_uses_ucx && (AMD || ubuntu22.04)
+    REBUILD_HPCX = !(!REBUILD_UCX && USE_INTERNAL_PMIX && NVIDIA && sku_uses_ucx)
+    if REBUILD_HPCX:
+        REBUILD_UCX: patch_hpcx_ucx_source_netlink_dump; --rebuild-ucx;
+                     UCX_PATH=${HPCX_PATH}/ucx/hpcx-rebuild
+        AMD: [[ -d /opt/rocm ]] || exit 1; (REBUILD_UCX) --ucx-extra-config "--with-rocm=/opt/rocm"
+        NVIDIA: --cuda; (REBUILD_UCX) CUDA_HOME=/usr/local/cuda
+        --ompi-extra-config "--enable-mpi1-compatibility --without-xpmem --with-slurm
+            --enable-orterun-prefix-by-default ${OMPI_DEPS_ARGS[@]}
+            + (non-UCX) --without-ucx --with-ofi=${LIBFABRIC_PATH}
+            + (UCX) --with-platform=contrib/platform/mellanox/optimized [--with-rocm=/opt/rocm]"
+            (UCX adds --with-hcoll to the rebuild args)
+        env [CUDA_HOME=...] hpcx_rebuild.sh ... || { tail -n 40 of its logs; exit 1; }
+        REBUILD_UCX: LD_LIBRARY_PATH=${UCX_PATH}/lib ${UCX_PATH}/bin/ucx_info -v || exit 1
+        ldd hpcx-rebuild/bin/ompi_info: libmpi.so must be under hpcx-rebuild/lib/ || exit 1
+        sed -i --follow-symlinks -E ... modulefiles/hpcx-rebuild hpcx-rebuild.sh
+        cp -r ${HPCX_PATH}/ompi/tests ${HPCX_PATH}/hpcx-rebuild
+    USE_INTERNAL_PMIX: write_component_version "PMIX" $(PKG_CONFIG_PATH=<hpcx-rebuild|ompi5>/lib/pkgconfig
+                                                       pkg-config --modversion pmix)
     HPCX_DIR=${HPCX_PATH} ${HPCX_PATH}/utils/hpcx_fix_ladir.sh
     cat > /etc/ld.so.conf.d/hpcx-sharp.conf / hpcx-ucx.conf; ldconfig
     ln -sf <hcoll|sharp|ucx>/lib/pkgconfig/*.pc /usr/local/lib[64]/pkgconfig/
     RPM distros: dnf_pin_packages "ucx*"
-    MVAPICH (unless GB-family on ubuntu24.04/azurelinux3.0):
+    cat >> mpi/hpcx-${HPCX_VERSION} (module load <hpcx-rebuild|hpcx>)
+    ln -s hpcx-${V} hpcx-pmix-${V}; ln -s hpcx-${V} hpcx; ln -s hpcx-pmix-${V} hpcx-pmix
+    MVAPICH (unless GB-family on ubuntu24.04/azurelinux3.0, or ubuntu26.04):
         download, tar, ./configure [FFLAGS=...] --prefix=... <UCX|OFI args>,
-        make -j$(nproc), make install, write_component_version "MVAPICH"
-    Open MPI: download, tar, ./configure <UCX|OFI variant>, make, make install,
-        write_component_version "OMPI"; RPM distros: dnf_pin_packages openmpi perftest
+        make -j$(nproc), make install, write_component_version "MVAPICH",
+        cat >> mpi/mvapich-<v>; ln -s mvapich
+    Open MPI (unless ubuntu26.04): download, tar,
+        ./configure <UCX|OFI variant> <PMIX_FLAG>, make, make install,
+        write_component_version "OMPI", cat >> mpi/openmpi-<v>; ln -s openmpi
+    RPM distros: dnf_pin_packages openmpi perftest
     Intel MPI (not aarch64): download, bash <installer> -s -a -s --eula accept,
-        mv .../etc/modulefiles/mpi .../etc/modulefiles/impi, write_component_version "IMPI"
-    cat << EOF >> modulefiles; ln -s short names
+        mv .../etc/modulefiles/mpi .../etc/modulefiles/impi, write_component_version "IMPI",
+        cat >> mpi/impi_<v>; ln -s impi-2021; EL8: cat >> I_MPI_STARTUP_MODE
     rm -rf *.tbz *.tar.gz *offline.sh; rm -rf -- */
 
 How it fits into the Python build
@@ -74,17 +131,18 @@ as bash's `set -e`, without an `if ...: return` after every line.
 Behaviour kept from bash
 ------------------------
   * Commands, arguments and their order are bash's; external programs (tar,
-    mv, cp, hpcx scripts, configure, make, ldconfig, the Intel installer) are
-    still run, so they behave exactly as before. Each phase stops at the first
-    failing command.
+    mv, cp, sed, patch, ldd, pkg-config, ucx_info, hpcx scripts, configure,
+    make, ldconfig, the Intel installer) are still run, so they behave exactly
+    as before. Each phase stops at the first failing command.
   * Generated files are byte-for-byte what bash writes. The modulefiles were
-    checked against the real bash heredocs (tests/python/fixtures/install_mpis/,
-    rendered with bash for UCX, non-UCX, EL8 and GB200/aarch64 targets).
-    When the port was written, the real bash script and this module were
-    also run side by side against the same stubbed commands (tar, mv, cp,
-    make, ldconfig, hpcx scripts, configure, installer) for 11 targets plus
-    a rerun: the commands, arguments, recorded versions, pins and resulting
-    files/symlinks were identical.
+    checked against the real bash (tests/python/fixtures/install_mpis/,
+    rendered by running the real install_mpis.sh in bash with stubbed
+    commands for UCX, non-UCX, EL8 AMD, GB200/aarch64, Ubuntu 22.04
+    (patched/rebuilt UCX), Azure Linux 3.0 (vendor HPC-X, internal PMIx) and
+    Ubuntu 26.04 targets). That same run, with this module next to it, gave
+    identical commands, arguments, recorded versions, pins and resulting
+    files/symlinks for 14 targets (incl. RHEL 8/10, Rocky 9 NCv6,
+    baremetal_3p and a failing hpcx_rebuild.sh).
   * Modulefiles are APPENDED to (bash `cat >> file`) and the short-name
     symlinks are made with plain `ln -s` (no -f), so a rerun on the same image
     duplicates the modulefile content and then fails at the first symlink —
@@ -94,16 +152,17 @@ Behaviour kept from bash
   * Open MPI's UCX configure passes LD_LIBRARY_PATH=<caller's
     LD_LIBRARY_PATH>:<hcoll>/lib as a configure ARGUMENT (not an environment
     variable), with an empty caller value giving ":<hcoll>/lib", as in bash.
-  * The /opt/rocm check, the baremetal_3p "bundled PMIx" case and every
-    distro/SKU gate are kept.
+  * The /opt/rocm check, the baremetal_3p internal-PMIx case and every
+    distro/SKU gate (including ubuntu26.04 and EL10) are kept.
 
 Deliberate differences from bash
 --------------------------------
-  * All configs (pmix, the HPC-X variant, mvapich unless skipped, ompi, impi
-    on x86_64) are resolved and checked BEFORE anything is downloaded. A
-    missing version/url/sha256 fails the step (3). Bash resolves each one just
-    before using it and carries on with blank values, e.g. installing HPC-X
-    and only then building MVAPICH from an empty URL.
+  * All configs (pmix unless Open MPI uses its internal PMIx, the HPC-X
+    variant, mvapich and ompi unless skipped, impi on x86_64) are resolved and
+    checked BEFORE anything is downloaded. A missing version/url/sha256 fails
+    the step (3). Bash resolves each one just before using it and carries on
+    with blank values, e.g. installing HPC-X and only then building MVAPICH
+    from an empty URL.
   * A pmix or impi version shorter than 2 characters fails up front; bash's
     ${VERSION:0:-2} would abort mid-script ("substring expression < 0"), and an
     exactly-2-character one would give an empty path, which we also refuse.
@@ -118,6 +177,21 @@ Deliberate differences from bash
   * Open MPI's LD_LIBRARY_PATH configure argument is passed as ONE argument;
     bash's unquoted expansion would also split it at whitespace (a path list
     with spaces is not something these images use).
+  * hpcx_rebuild.sh gets CUDA_HOME through the environment we pass it, where
+    bash runs `env CUDA_HOME=/usr/local/cuda hpcx_rebuild.sh ...`; the log
+    line names the extra variable.
+  * The UCX patch is applied with `patch -d <src> -p1 -i <file>` instead of
+    `patch -d <src> -p1 < <file>` (exec_program has no stdin); same effect.
+  * UCX netlink patch: if the extracted UCX source has no
+    src/ucs/sys/netlink.c, bash's `grep -qF` fails, so bash prints "does not
+    have the netlink dump hang" and rebuilds UCX unpatched. We fail instead:
+    we can't tell whether the hang is there. The scratch directory the
+    tarball is unpacked into is removed even when patching fails (bash leaves
+    it behind on failure).
+  * hpcx_rebuild.sh failure: bash echoes `tail -n 40` of each of its UCX and
+    Open MPI logs; we log the same lines as error details.
+  * An internal-PMIx version that pkg-config prints as empty fails instead of
+    recording an empty PMIX version.
 
 Bash issues kept (warned at runtime with log_warn, and commented below)
 -----------------------------------------------------------------------
@@ -130,6 +204,9 @@ Bash issues kept (warned at runtime with log_warn, and commented below)
   * The modulefile appends and `ln -s` symlinks are not rerun-safe (see above).
     We warn when appending to a modulefile that already exists, and fail with
     an explanation when a symlink already exists, exactly where bash fails.
+  * Open MPI's PMIX_FLAG has a branch for azurelinux3.0 / baremetal_3p
+    (`--with-pmix`) that can't be reached any more: both now use the internal
+    PMIx, which is checked first. It is mirrored in ompi_pmix_flags().
 """
 
 # Lets type hints such as `str | None` work on older Python versions.
@@ -137,12 +214,15 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
+import tempfile
+from collections import deque
 from dataclasses import dataclass, field
 
 from utils.component_config import DEFAULT_NODE_TYPE, config_for, write_component_version
 from utils.download import download_and_verify
-from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.logger import log_debug, log_error, log_error_detail, log_info, log_warn
 from utils.package_pinning import dnf_pin_packages
 from utils.process import exec_program, run_capture
 from utils.sku import NETWORK_MODE_NO_RDMA, sku_network_mode, sku_uses_ucx
@@ -151,12 +231,18 @@ from utils.sku import NETWORK_MODE_NO_RDMA, sku_network_mode, sku_uses_ucx
 _OP = "install-mpis"
 
 _AZURE_LINUX = "azurelinux3.0"
+_UBUNTU_22 = "ubuntu22.04"
+_UBUNTU_26 = "ubuntu26.04"
 _GB_FAMILY = "gb-family"
 _BAREMETAL_3P = "baremetal_3p"
 # MVAPICH is skipped for gb-family SKUs on these two distros (exact matches).
 _MVAPICH_SKIP_DISTROS = ("ubuntu24.04", _AZURE_LINUX)
 # Intel MPI's EL8 race-condition workaround applies to these (plus rhel8*).
 _EL8_DISTROS = ("almalinux8.10", "rocky8.10")
+# Open MPI builds its own PMIx/hwloc/libevent on these distros (exact matches)
+# and on any distro starting with one of the prefixes (bash: almalinux10* ...).
+_INTERNAL_PMIX_DISTROS = (_UBUNTU_26, _AZURE_LINUX)
+_INTERNAL_PMIX_PREFIXES = ("almalinux10", "rocky10", "rhel10")
 
 # ---- Paths (module-level so tests can point them at a temporary directory) --
 _INSTALL_PREFIX = "/opt"                      # bash: INSTALL_PREFIX=/opt
@@ -165,10 +251,41 @@ _ROCM_DIR = "/opt/rocm"                       # only for the "is ROCm installed"
 _LD_SO_CONF_DIR = "/etc/ld.so.conf.d"
 _PKGCONFIG_DIRS = ("/usr/local/lib/pkgconfig",)
 _PKGCONFIG_DIRS_RPM = ("/usr/local/lib/pkgconfig", "/usr/local/lib64/pkgconfig")
+# Parent of the scratch directory the UCX source is patched in. None means
+# tempfile's default ($TMPDIR or /tmp), like bash's `mktemp -d`.
+_PATCH_TMP_PARENT: str | None = None
 
-# Used only inside generated text and configure arguments (literal in bash).
+# Used only inside generated text, configure arguments and the environment
+# (literal in bash).
 _LIBFABRIC_PATH = "/opt/libfabric"
-_ROCM_UCX_ARGS = ("--rebuild-ucx", "--ucx-extra-config", "--with-rocm=/opt/rocm")
+_ROCM_PATH = "/opt/rocm"
+_CUDA_HOME = "/usr/local/cuda"
+_INTERNAL_DEPS_ARGS = ("--with-pmix=internal", "--with-hwloc=internal",
+                       "--with-libevent=internal")
+# Supplying --ompi-extra-config replaces HPC-X's original Open MPI configure
+# options; these are the compatible vendor options bash restores.
+_OMPI_VENDOR_ARGS = ("--enable-mpi1-compatibility", "--without-xpmem", "--with-slurm",
+                     "--enable-orterun-prefix-by-default")
+_MELLANOX_PLATFORM = "--with-platform=contrib/platform/mellanox/optimized"
+
+# ---- UCX netlink route-dump patch (upstream #644) ---------------------------
+# Relative to COMPONENT_DIR.
+_UCX_NETLINK_PATCH = "patches/ucx-netlink-dump-done.patch"
+# The line only UCX versions with the hang have (bash greps for it with -F).
+_UCX_NETLINK_BUGGY_LINE = ("msg_done = ucs_netlink_is_msg_done("
+                           "(const struct nlmsghdr *)recv_msg);")
+_UCX_NETLINK_SOURCE = "src/ucs/sys/netlink.c"
+# How many lines of each hpcx_rebuild.sh log bash prints when the rebuild fails.
+_REBUILD_LOG_TAIL = 40
+
+# sed expressions bash uses to point hpcx_rebuild.sh's module/init files at
+# hpcx-rebuild instead of hpcx-rebuild$mpi_version (a directory it never
+# creates). Passed to sed exactly as bash does (bash single-quotes them).
+_REBUILD_ENTRYPOINT_SED = (
+    "-e", r"s|/hpcx-rebuild\$\{mpi_version\}|/hpcx-rebuild|g",
+    "-e", r"s|/hpcx-rebuild\$mpi_version|/hpcx-rebuild|g",
+    "-e", "s|/hpcx-rebuild[0-9]+|/hpcx-rebuild|g",
+)
 
 
 class _StepFailed(Exception):
@@ -218,14 +335,128 @@ def hpcx_variant(gpu: str, network_mode: str) -> tuple[str, str]:
     return "hpcx", "default HPC-X (InfiniBand network)"
 
 
-def uses_bundled_pmix(distribution: str, node_type: str) -> bool:
-    """bash: [[ $DISTRIBUTION == "azurelinux3.0" || ${TARGET_NODE_TYPE:-...} == "baremetal_3p" ]].
+def internal_pmix_reason(distribution: str, node_type: str) -> str | None:
+    """Why Open MPI builds its own PMIx here (bash's USE_INTERNAL_PMIX), or None.
 
-    These targets build against the PMIx bundled in HPC-X (`--with-pmix` with
-    no path): on baremetal nodes the standalone PMIx conflicts with the
-    Mellanox Open MPI package.
+    bash: [[ $D == "ubuntu26.04" ]] || [[ $D == "azurelinux3.0" ]] ||
+          [[ $D == almalinux10* ]] || [[ $D == rocky10* ]] || [[ $D == rhel10* ]]
+          elif [[ ${TARGET_NODE_TYPE:-azure_vm_regular} == "baremetal_3p" ]]
     """
-    return distribution == _AZURE_LINUX or (node_type or DEFAULT_NODE_TYPE) == _BAREMETAL_3P
+    if distribution == _AZURE_LINUX:
+        return "azurelinux3.0 lacks the PMIx package published by the CycleCloud team"
+    if distribution in _INTERNAL_PMIX_DISTROS or distribution.startswith(_INTERNAL_PMIX_PREFIXES):
+        return f"{distribution} has no external PMIx v5 to align to"
+    if (node_type or DEFAULT_NODE_TYPE) == _BAREMETAL_3P:
+        return "baremetal_3p nodes must avoid the external PMIx (package conflict)"
+    return None
+
+
+def uses_internal_pmix(distribution: str, node_type: str) -> bool:
+    """bash's USE_INTERNAL_PMIX (see internal_pmix_reason)."""
+    return internal_pmix_reason(distribution, node_type) is not None
+
+
+def ompi_deps_args(internal_pmix: bool, pmix_path: str | None) -> list[str]:
+    """bash's OMPI_DEPS_ARGS: Open MPI's PMIx/hwloc/libevent configure options.
+
+    Internal: Open MPI builds PMIx, hwloc and libevent from its own sources
+    into its prefix (pointing them at HPC-X's ompi5 tree would put the vendor
+    libmpi ahead of the rebuild in every RUNPATH).
+    """
+    if internal_pmix:
+        return list(_INTERNAL_DEPS_ARGS)
+    return [f"--with-pmix={pmix_path}"]
+
+
+def ompi_pmix_flags(internal_pmix: bool, distribution: str, node_type: str,
+                    pmix_path: str | None) -> list[str]:
+    """Open MPI's ${PMIX_FLAG}, split into words as bash's unquoted expansion does."""
+    if internal_pmix:
+        # PMIX_FLAG="${OMPI_DEPS_ARGS[*]}", expanded unquoted: three words.
+        return list(_INTERNAL_DEPS_ARGS)
+    # BASH ISSUE (kept): unreachable. azurelinux3.0 and baremetal_3p always
+    # use the internal PMIx, which is checked first.
+    if distribution == _AZURE_LINUX or (node_type or DEFAULT_NODE_TYPE) == _BAREMETAL_3P:
+        return ["--with-pmix"]
+    return [f"--with-pmix={pmix_path}"]
+
+
+def rebuild_ucx_reason(gpu: str, distribution: str, uses_ucx: bool) -> str | None:
+    """Why HPC-X's UCX is rebuilt (bash's REBUILD_UCX), or None.
+
+    bash: sku_uses_ucx && ( "$GPU" == "AMD" || "$DISTRIBUTION" == "ubuntu22.04" )
+    """
+    if not uses_ucx:
+        return None
+    if gpu == "AMD":
+        return "AMD GPU: rebuild UCX with ROCm support"
+    if distribution == _UBUNTU_22:
+        return ("ubuntu22.04: linux-azure 5.15.0-1123+ triggers the UCX netlink "
+                "route-dump hang, so rebuild UCX from the patched source")
+    return None
+
+
+def needs_hpcx_rebuild(*, rebuild_ucx: bool, internal_pmix: bool, gpu: str,
+                       uses_ucx: bool) -> bool:
+    """bash's REBUILD_HPCX: true unless nothing needs rebuilding.
+
+    Only an NVIDIA UCX SKU with internal PMIx and no UCX rebuild keeps the
+    vendor Open MPI. (A UCX rebuild is done by hpcx_rebuild.sh, so it always
+    means an HPC-X rebuild.)
+    """
+    return not (not rebuild_ucx and internal_pmix and gpu == "NVIDIA" and uses_ucx)
+
+
+def hpcx_rebuild_command(hpcx_path: str, *, gpu: str, uses_ucx: bool, rebuild_ucx: bool,
+                         deps_args: list[str]) -> tuple[list[str], dict[str, str]]:
+    """hpcx_rebuild.sh's command line and the extra environment it runs with.
+
+    Mirrors how bash builds HPCX_REBUILD_ARGS / HPCX_REBUILD_ENV, in the same
+    order. The Open MPI options are joined with spaces into one
+    --ompi-extra-config value, as bash's "${HPCX_REBUILD_OMPI_ARGS[*]}".
+    """
+    args: list[str] = []
+    extra_env: dict[str, str] = {}
+    if rebuild_ucx:
+        args.append("--rebuild-ucx")
+    if gpu == "AMD":
+        if rebuild_ucx:
+            args += ["--ucx-extra-config", f"--with-rocm={_ROCM_PATH}"]
+    elif gpu == "NVIDIA":
+        args.append("--cuda")
+        if rebuild_ucx:
+            # Without CUDA_HOME, hpcx_rebuild.sh passes a bare --with-cuda and
+            # UCX's configure misses /usr/local/cuda.
+            extra_env["CUDA_HOME"] = _CUDA_HOME
+
+    ompi_args = [*_OMPI_VENDOR_ARGS, *deps_args]
+    if not uses_ucx:
+        ompi_args += ["--without-ucx", f"--with-ofi={_LIBFABRIC_PATH}"]
+    else:
+        args.append("--with-hcoll")
+        ompi_args.append(_MELLANOX_PLATFORM)
+        if gpu == "AMD":
+            ompi_args.append(f"--with-rocm={_ROCM_PATH}")
+    args += ["--ompi-extra-config", " ".join(ompi_args)]
+    return [f"{hpcx_path}/utils/hpcx_rebuild.sh", *args], extra_env
+
+
+def ldd_libmpi(ldd_output: str) -> str:
+    """bash's  ldd <ompi_info> | awk '$1 ~ /^libmpi\\.so/ {print $3}'  inside $(...).
+
+    awk splits each line on runs of blanks (ignoring leading ones) and prints
+    the 3rd field ("" if there isn't one) of every line whose 1st field starts
+    with "libmpi.so"; $(...) then drops the trailing newlines. e.g.
+    "\\tlibmpi.so.40 => /opt/h/hpcx-rebuild/lib/libmpi.so.40 (0x...)" ->
+    "/opt/h/hpcx-rebuild/lib/libmpi.so.40", and "libmpi.so.40 => not found"
+    -> "not".
+    """
+    found = []
+    for line in ldd_output.split("\n"):
+        fields = re.split(r"[ \t]+", line.strip(" \t"))
+        if fields[0].startswith("libmpi.so"):
+            found.append(fields[2] if len(fields) > 2 else "")
+    return "\n".join(found).rstrip("\n")
 
 
 def is_rpm_distro(distribution: str) -> bool:
@@ -234,8 +465,14 @@ def is_rpm_distro(distribution: str) -> bool:
 
 
 def skips_mvapich(distribution: str, sku_family: str) -> bool:
-    """bash: ("$DISTRIBUTION" == ubuntu24.04 || == azurelinux3.0) && "$SKU_FAMILY" == gb-family."""
-    return distribution in _MVAPICH_SKIP_DISTROS and sku_family == _GB_FAMILY
+    """bash: ((D == ubuntu24.04 || D == azurelinux3.0) && SKU_FAMILY == gb-family) || D == ubuntu26.04."""
+    return ((distribution in _MVAPICH_SKIP_DISTROS and sku_family == _GB_FAMILY)
+            or distribution == _UBUNTU_26)
+
+
+def skips_ompi(distribution: str) -> bool:
+    """bash: [[ "$DISTRIBUTION" != "ubuntu26.04" ]] around the Open MPI build, negated."""
+    return distribution == _UBUNTU_26
 
 
 def is_el8(distribution: str) -> bool:
@@ -246,24 +483,6 @@ def is_el8(distribution: str) -> bool:
 def impi_fi_provider(network_mode: str) -> str:
     """Intel MPI's libfabric provider: "tcp" on no_rdma, else "mlx"."""
     return "tcp" if network_mode == NETWORK_MODE_NO_RDMA else "mlx"
-
-
-def hpcx_rebuild_command(hpcx_path: str, *, bundled_pmix: bool, uses_ucx: bool,
-                         ucx_args: tuple[str, ...], pmix_path: str) -> list[str]:
-    """The hpcx_rebuild.sh command line, one of bash's three variants.
-
-    ucx_args is HPCX_REBUILD_UCX_ARGS (empty unless AMD + UCX).
-    """
-    script = f"{hpcx_path}/utils/hpcx_rebuild.sh"
-    if bundled_pmix:
-        return [script, "--with-hcoll", *ucx_args, "--ompi-extra-config",
-                "--with-pmix --enable-orterun-prefix-by-default"]
-    if not uses_ucx:
-        return [script, "--ompi-extra-config",
-                f"--with-pmix={pmix_path} --enable-orterun-prefix-by-default "
-                f"--without-ucx --with-ofi={_LIBFABRIC_PATH}"]
-    return [script, "--with-hcoll", *ucx_args, "--ompi-extra-config",
-            f"--with-pmix={pmix_path} --enable-orterun-prefix-by-default"]
 
 
 def mvapich_configure_command(distribution: str, version: str, *, uses_ucx: bool,
@@ -290,7 +509,7 @@ def mvapich_configure_command(distribution: str, version: str, *, uses_ucx: bool
     return command, f"{_LIBFABRIC_PATH}/lib"
 
 
-def ompi_configure_command(version: str, *, uses_ucx: bool, pmix_flag: str,
+def ompi_configure_command(version: str, *, uses_ucx: bool, pmix_flags: list[str],
                            ucx_path: str, hcoll_path: str,
                            ld_library_path: str) -> tuple[list[str], str]:
     """Open MPI's ./configure command and the transport lib dir (see MVAPICH)."""
@@ -302,13 +521,12 @@ def ompi_configure_command(version: str, *, uses_ucx: bool, pmix_flag: str,
             # built from the caller's LD_LIBRARY_PATH, exactly as bash does.
             f"LD_LIBRARY_PATH={ld_library_path}:{hcoll_path}/lib",
             prefix, f"--with-ucx={ucx_path}", f"--with-hcoll={hcoll_path}",
-            pmix_flag, "--enable-mpirun-prefix-by-default",
-            "--with-platform=contrib/platform/mellanox/optimized",
+            *pmix_flags, "--enable-mpirun-prefix-by-default", _MELLANOX_PLATFORM,
         ], f"{ucx_path}/lib")
     # No UCX: drop --with-ucx, --with-hcoll (uses UCX) and the Mellanox platform file.
     return ([
         "./configure", prefix, "--without-ucx", f"--with-ofi={_LIBFABRIC_PATH}",
-        pmix_flag, "--enable-mpirun-prefix-by-default",
+        *pmix_flags, "--enable-mpirun-prefix-by-default",
     ], f"{_LIBFABRIC_PATH}/lib")
 
 
@@ -344,15 +562,20 @@ _IMPI_EL8_APPEND = (
     "setenv          I_MPI_STARTUP_MODE         pmi_shm\n")
 
 
-def hpcx_modulefile(version: str, hpcx_path: str, uses_ucx: bool) -> str:
-    """Text of mpi/hpcx-<version> and mpi/hpcx-pmix-<version> (bash writes the same)."""
+def hpcx_module(hpcx_path: str, rebuilt: bool) -> str:
+    """bash's HPCX_MODULE: the HPC-X module mpi/hpcx loads."""
+    return f"{hpcx_path}/modulefiles/{'hpcx-rebuild' if rebuilt else 'hpcx'}"
+
+
+def hpcx_modulefile(version: str, module: str, uses_ucx: bool) -> str:
+    """Text of mpi/hpcx-<version> (mpi/hpcx-pmix-<version> is a symlink to it)."""
     extras = "" if uses_ucx else _HPCX_NON_UCX_EXTRAS
     return ("#%Module 1.0\n"
             "#\n"
             f"#  HPCx {version}\n"
             "#\n"
             "conflict        mpi\n"
-            f"module load {hpcx_path}/modulefiles/hpcx-rebuild\n"
+            f"module load {module}\n"
             f"{extras}\n")
 
 
@@ -422,15 +645,26 @@ class _Inputs:
     network_mode: str
     uses_ucx: bool
     module_dir: str
+    component_dir: str
     hpcx_component: str
     hpcx_reason: str
     hpcx: dict
-    pmix_version: str
-    pmix_path: str
-    mvapich: dict | None            # None: skipped (GB-family)
-    ompi: dict
+    internal_pmix: bool
+    internal_pmix_reason: str | None
+    pmix_version: str | None        # None: internal PMIx (no pmix config needed)
+    pmix_path: str | None
+    rebuild_ucx: bool
+    rebuild_ucx_reason: str | None
+    rebuild_hpcx: bool
+    mvapich: dict | None            # None: skipped (GB-family, ubuntu26.04)
+    ompi: dict | None               # None: skipped (ubuntu26.04)
     impi: dict | None               # None: skipped (aarch64)
     impi_2021_version: str | None
+
+    @property
+    def mpi_dir(self) -> str:
+        """bash's MPI_MODULE_FILES_DIRECTORY."""
+        return f"{self.module_dir}/mpi"
 
 
 @dataclass
@@ -449,6 +683,7 @@ class _Report:
     files: list = field(default_factory=list)
     symlinks: list = field(default_factory=list)
     pinned: list = field(default_factory=list)
+    patched: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -576,6 +811,214 @@ def _nproc(env: dict[str, str]) -> int | None:
     return value
 
 
+def _tail_lines(path: str, count: int) -> list[str]:
+    """`tail -n <count> path` as a list of lines (without their newlines)."""
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return [line.rstrip("\n") for line in deque(handle, maxlen=count)]
+
+
+# --------------------------------------------------------------------------- #
+# HPC-X rebuild pieces, in bash's order.
+# --------------------------------------------------------------------------- #
+def _patch_ucx_source_netlink_dump(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx,
+                                   report: _Report) -> None:
+    """bash's patch_hpcx_ucx_source_netlink_dump.
+
+    Patch HPC-X's bundled UCX source tarball so `hpcx_rebuild.sh --rebuild-ucx`
+    builds a UCX that doesn't hang in ucs_netlink_send_request() on kernels
+    that append NLMSG_DONE to the last route-dump datagram (Ubuntu 5.15.0-198,
+    hence linux-azure 5.15.0-1123+; openucx/ucx#12070). Only UCX versions that
+    have the buggy line are patched; the tarball is repacked in place.
+    """
+    patch_file = os.path.join(inp.component_dir, _UCX_NETLINK_PATCH)
+    # bash: find "${HPCX_PATH}/sources" -maxdepth 1 -name 'ucx-*.tar.gz' | head -n1
+    # (sorted here so the choice is stable; HPC-X ships one UCX tarball).
+    tarballs = sorted(glob.glob(f"{hpcx.path}/sources/ucx-*.tar.gz"))
+    if not tarballs:
+        log_error(_OP, f"HPC-X UCX source tarball not found under {hpcx.path}/sources",
+                  path=f"{hpcx.path}/sources")
+        raise _StepFailed
+    if len(tarballs) > 1:
+        log_warn(_OP, f"{len(tarballs)} UCX source tarballs in HPC-X; patching the "
+                      f"first, {tarballs[0]}", tarballs=tarballs)
+    tarball = tarballs[0]
+    ucx_name = url_basename(tarball, ".tar.gz")
+
+    work_dir = tempfile.mkdtemp(dir=_PATCH_TMP_PARENT)
+    try:
+        _run(["tar", "-xzf", tarball, "-C", work_dir], "extracting the HPC-X UCX source",
+             env, _WORK_DIR)
+        ucx_src = f"{work_dir}/{ucx_name}"
+        source = f"{ucx_src}/{_UCX_NETLINK_SOURCE}"
+        try:
+            with open(source, encoding="utf-8", errors="replace") as handle:
+                buggy = _UCX_NETLINK_BUGGY_LINE in handle.read()
+        except OSError as exc:
+            # bash's grep -qF would fail and skip the patch, rebuilding UCX
+            # unpatched; we stop because we can't tell whether it hangs.
+            log_error(_OP, f"cannot read {_UCX_NETLINK_SOURCE} in {tarball} ({exc}); "
+                           "can't tell whether this UCX has the netlink route-dump "
+                           "hang (bash would rebuild it unpatched)",
+                      path=source, tarball=tarball)
+            raise _StepFailed from exc
+
+        if not buggy:
+            log_info(_OP, f"{ucx_name} does not have the netlink dump hang; skipping "
+                          "UCX patch", ucx=ucx_name, tarball=tarball, patched=False)
+            return
+        if not os.path.isfile(patch_file):
+            log_error(_OP, f"UCX patch {patch_file} not found (is COMPONENT_DIR set?)",
+                      path=patch_file)
+            raise _StepFailed
+        _run(["patch", "-d", ucx_src, "-p1", "-i", patch_file],
+             f"applying {_UCX_NETLINK_PATCH} to {ucx_name}", env, _WORK_DIR)
+        _run(["tar", "-czf", tarball, "-C", work_dir, ucx_name],
+             f"repacking the patched {ucx_name} source", env, _WORK_DIR)
+        report.patched.append(tarball)
+        log_info(_OP, f"Patched {ucx_name} for the netlink route-dump hang and "
+                      f"repacked {tarball} (replaced)", ucx=ucx_name, tarball=tarball,
+                 patch=patch_file, patched=True, action="replaced")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _log_rebuild_logs(hpcx_path: str) -> None:
+    """On a failed rebuild, show the tail of hpcx_rebuild.sh's logs.
+
+    hpcx_rebuild.sh only names its logs, which stay on the build VM.
+    """
+    patterns = (f"{hpcx_path}/sources/ucx-*/ucx-*.log",
+                f"{hpcx_path}/sources/openmpi-gitclone/ompi-*.log")
+    shown = 0
+    for pattern in patterns:
+        for log_file in sorted(glob.glob(pattern)):
+            if not os.path.isfile(log_file):        # bash: [[ -f ]] || continue
+                continue
+            try:
+                lines = _tail_lines(log_file, _REBUILD_LOG_TAIL)
+            except OSError as exc:
+                log_warn(_OP, f"could not read {log_file}: {exc}", path=log_file)
+                continue
+            log_error_detail(_OP, f"===== tail of {log_file}", "\n".join(lines) or "(empty)",
+                             path=log_file, lines=len(lines))
+            shown += 1
+    if not shown:
+        log_warn(_OP, "no hpcx_rebuild.sh UCX/Open MPI logs found to show",
+                 patterns=list(patterns))
+
+
+def _check_rebuilt_ucx(env: dict[str, str], hpcx: _Hpcx) -> None:
+    """bash: LD_LIBRARY_PATH=${UCX_PATH}/lib ${UCX_PATH}/bin/ucx_info -v > /dev/null.
+
+    hpcx_rebuild.sh reports, but doesn't fail on, UCX `make install` errors.
+    """
+    rc, output = run_capture([f"{hpcx.ucx}/bin/ucx_info", "-v"], _OP, cwd=_WORK_DIR,
+                             env={**env, "LD_LIBRARY_PATH": f"{hpcx.ucx}/lib"})
+    if rc != 0:
+        log_error(_OP, f"Rebuilt HPC-X UCX at {hpcx.ucx} is not usable.",
+                  ucx_path=hpcx.ucx, exit_code=rc)
+        raise _StepFailed
+    version = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    log_info(_OP, f"Rebuilt UCX at {hpcx.ucx} runs: {version}", ucx_path=hpcx.ucx,
+             ucx_info=version)
+
+
+def _check_rebuilt_libmpi(env: dict[str, str], hpcx: _Hpcx) -> None:
+    """The rebuilt ompi_info must load the rebuilt libmpi.
+
+    A libmpi resolved outside hpcx-rebuild means the vendor Open MPI shadows
+    the rebuild, which otherwise fails silently at runtime. bash ignores ldd's
+    exit code (no pipefail); only what awk prints decides.
+    """
+    ompi_info = f"{hpcx.path}/hpcx-rebuild/bin/ompi_info"
+    expected = f"{hpcx.path}/hpcx-rebuild/lib/"
+    rc, output = run_capture(["ldd", ompi_info], _OP, cwd=_WORK_DIR, env=env,
+                             failure_is_error=False)
+    libmpi = ldd_libmpi(output)
+    if not libmpi.startswith(expected):
+        log_error(_OP, f"Rebuilt HPC-X ompi_info loads {libmpi or '<unresolved>'} "
+                       "instead of the rebuilt libmpi.",
+                  ompi_info=ompi_info, libmpi=libmpi, expected_prefix=expected,
+                  ldd_exit_code=rc)
+        raise _StepFailed
+    log_info(_OP, f"Rebuilt ompi_info loads {libmpi}", ompi_info=ompi_info, libmpi=libmpi)
+
+
+def _fix_rebuild_entrypoints(env: dict[str, str], hpcx: _Hpcx, report: _Report) -> None:
+    """Point hpcx_rebuild.sh's module/init files at hpcx-rebuild.
+
+    hpcx_rebuild.sh installs into hpcx-rebuild but writes files that compose
+    the MPI prefix as hpcx-rebuild$mpi_version, a directory it never creates.
+    Only that suffix is dropped (mpi_version is still used for ompi5/tests).
+    """
+    for entrypoint in (f"{hpcx.path}/modulefiles/hpcx-rebuild", f"{hpcx.path}/hpcx-rebuild.sh"):
+        if not os.path.exists(entrypoint):      # bash: [[ -e ]] || continue
+            log_info(_OP, f"{entrypoint} does not exist; nothing to fix", path=entrypoint)
+            continue
+        _run(["sed", "-i", "--follow-symlinks", "-E", *_REBUILD_ENTRYPOINT_SED, entrypoint],
+             f"fixing the hpcx-rebuild prefix in {entrypoint}", env, _WORK_DIR)
+        report.files.append(entrypoint)
+        log_info(_OP, f"Fixed the hpcx-rebuild prefix in {entrypoint} (edited in place)",
+                 path=entrypoint, action="edited")
+
+
+def _rebuild_hpcx(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx, report: _Report) -> None:
+    """bash's `if [[ "$REBUILD_HPCX" == true ]]` block."""
+    if inp.rebuild_ucx:
+        _patch_ucx_source_netlink_dump(env, inp, hpcx, report)
+        hpcx.ucx = f"{hpcx.path}/ucx/hpcx-rebuild"
+        log_info(_OP, f"Rebuilding UCX: {inp.rebuild_ucx_reason}; using the rebuilt UCX "
+                      f"at {hpcx.ucx} from here on", ucx_path=hpcx.ucx)
+    if inp.gpu == "AMD" and not os.path.isdir(_ROCM_DIR):
+        log_error(_OP, "ROCm must be installed before rebuilding HPC-X UCX with "
+                       "ROCm support.", path=_ROCM_DIR)
+        raise _StepFailed
+
+    command, extra_env = hpcx_rebuild_command(
+        hpcx.path, gpu=inp.gpu, uses_ucx=inp.uses_ucx, rebuild_ucx=inp.rebuild_ucx,
+        deps_args=ompi_deps_args(inp.internal_pmix, inp.pmix_path))
+    log_info(_OP, "Rebuilding HPC-X Open MPI"
+                  f"{' and UCX' if inp.rebuild_ucx else ''} with hpcx_rebuild.sh",
+             phase="hpcx-rebuild", gpu=inp.gpu, uses_ucx=inp.uses_ucx,
+             rebuild_ucx=inp.rebuild_ucx, internal_pmix=inp.internal_pmix,
+             rebuild_args=" ".join(command[1:]),
+             rebuild_env=" ".join(f"{k}={v}" for k, v in extra_env.items()))
+    rc = exec_program(command, _OP, cwd=_WORK_DIR, env={**env, **extra_env})
+    if rc != 0:
+        _log_rebuild_logs(hpcx.path)
+        log_error(_OP, "hpcx_rebuild.sh failed; its UCX/Open MPI log tails are above",
+                  command=command[0], exit_code=rc)
+        raise _StepFailed
+
+    if inp.rebuild_ucx:
+        _check_rebuilt_ucx(env, hpcx)
+    _check_rebuilt_libmpi(env, hpcx)
+    _fix_rebuild_entrypoints(env, hpcx, report)
+    _run(["cp", "-r", f"{hpcx.path}/ompi/tests", f"{hpcx.path}/hpcx-rebuild"],
+         "copying the HPC-X ompi tests", env, _WORK_DIR)
+
+
+def _record_internal_pmix(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx,
+                          report: _Report) -> None:
+    """Record the PMIx Open MPI actually ships when it uses its internal copy.
+
+    The rebuild installs its own PMIx; otherwise the vendor ompi5 tree is used.
+    """
+    sub = "hpcx-rebuild" if inp.rebuild_hpcx else "ompi5"
+    pkg_config_path = f"{hpcx.path}/{sub}/lib/pkgconfig"
+    rc, output = run_capture(["pkg-config", "--modversion", "pmix"], _OP, cwd=_WORK_DIR,
+                             env={**env, "PKG_CONFIG_PATH": pkg_config_path})
+    version = output.rstrip("\n")       # bash's $(...) drops trailing newlines
+    if rc != 0 or not version.strip():
+        log_error(_OP, f"could not read the internal PMIx version with pkg-config from "
+                       f"{pkg_config_path}", pkg_config_path=pkg_config_path, exit_code=rc,
+                  output=version)
+        raise _StepFailed
+    log_info(_OP, f"Internal PMIx {version} (from {pkg_config_path})",
+             pkg_config_path=pkg_config_path, pmix_version=version)
+    _record("PMIX", version, report)
+
+
 # --------------------------------------------------------------------------- #
 # Phases, in bash's order.
 # --------------------------------------------------------------------------- #
@@ -604,35 +1047,17 @@ def _install_hpcx(env: dict[str, str], inp: _Inputs, report: _Report) -> _Hpcx:
                  sharp=f"{hpcx_path}/sharp", ucx=f"{hpcx_path}/ucx")
     _record("HPCX", version, report)
 
-    ucx_args: tuple[str, ...] = ()
-    if inp.gpu == "AMD" and inp.uses_ucx:
-        if not os.path.isdir(_ROCM_DIR):
-            log_error(_OP, "ROCm must be installed before rebuilding HPC-X UCX with "
-                           "ROCm support.", path=_ROCM_DIR)
-            raise _StepFailed
-        ucx_args = _ROCM_UCX_ARGS
-        log_info(_OP, "AMD GPU with UCX: rebuilding HPC-X's UCX with ROCm support",
-                 rebuild_ucx_args=" ".join(ucx_args))
-
-    bundled = uses_bundled_pmix(inp.distribution, inp.node_type)
-    if bundled:
-        why = (f"{inp.distribution}/{inp.node_type}: PMIx bundled in HPC-X "
-               "(standalone PMIx conflicts with the Mellanox Open MPI package on baremetal)")
-    elif not inp.uses_ucx:
-        why = f"non-UCX SKU: standalone PMIx {inp.pmix_path}, OFI/libfabric instead of UCX"
+    if inp.rebuild_hpcx:
+        _rebuild_hpcx(env, inp, hpcx, report)
     else:
-        why = f"UCX SKU: standalone PMIx {inp.pmix_path} with HCOLL"
-    rebuild = hpcx_rebuild_command(hpcx_path, bundled_pmix=bundled, uses_ucx=inp.uses_ucx,
-                                   ucx_args=ucx_args, pmix_path=inp.pmix_path)
-    log_info(_OP, f"Rebuilding HPC-X Open MPI: {why}", phase="hpcx-rebuild",
-             bundled_pmix=bundled, uses_ucx=inp.uses_ucx, rebuild_args=" ".join(rebuild[1:]))
-    _run(rebuild, "hpcx_rebuild.sh", env, _WORK_DIR)
-    _run(["cp", "-r", f"{hpcx_path}/ompi/tests", f"{hpcx_path}/hpcx-rebuild"],
-         "copying the HPC-X ompi tests", env, _WORK_DIR)
+        log_info(_OP, "Not rebuilding HPC-X: NVIDIA UCX SKU with internal PMIx and no UCX "
+                      "rebuild, so the vendor Open MPI is used as shipped",
+                 phase="hpcx-rebuild", rebuild_hpcx=False, internal_pmix=inp.internal_pmix,
+                 rebuild_ucx=inp.rebuild_ucx)
 
-    if ucx_args:
-        hpcx.ucx = f"{hpcx_path}/ucx/hpcx-rebuild"
-        log_info(_OP, f"Using the rebuilt UCX at {hpcx.ucx}", ucx_path=hpcx.ucx)
+    if inp.internal_pmix:
+        _record_internal_pmix(env, inp, hpcx, report)
+
     # hpcx_rebuild.sh installs fresh Open MPI (and, on AMD, UCX) metadata; fix it too.
     _run(fix_ladir, "hpcx_fix_ladir.sh (after rebuild)", fix_env, _WORK_DIR)
 
@@ -644,8 +1069,11 @@ def _install_hpcx(env: dict[str, str], inp: _Inputs, report: _Report) -> _Hpcx:
 
     if is_rpm_distro(inp.distribution):
         _pin(["ucx*"], env, report)          # exclude ucx from updates
+
+    _write_hpcx_modulefiles(inp, hpcx, report)
     log_info(_OP, f"HPC-X {version} installed at {hpcx_path}", phase="hpcx",
-             version=version, path=hpcx_path, ucx_path=hpcx.ucx)
+             version=version, path=hpcx_path, ucx_path=hpcx.ucx,
+             rebuilt=inp.rebuild_hpcx, module=hpcx_module(hpcx_path, inp.rebuild_hpcx))
     return hpcx
 
 
@@ -671,15 +1099,35 @@ def _link_pkgconfig(inp: _Inputs, hpcx: _Hpcx, report: _Report) -> None:
                  path=pkgconfig_dir, count=linked)
 
 
+def _write_hpcx_modulefiles(inp: _Inputs, hpcx: _Hpcx, report: _Report) -> None:
+    """mpi/hpcx-<v>, plus the hpcx-pmix-<v>, hpcx and hpcx-pmix symlinks."""
+    mpi_dir = inp.mpi_dir
+    version = inp.hpcx["version"]
+    module = hpcx_module(hpcx.path, inp.rebuild_hpcx)
+    log_info(_OP, f"mpi/hpcx loads {module}", module=module, rebuilt=inp.rebuild_hpcx,
+             uses_ucx=inp.uses_ucx)
+    if not inp.uses_ucx:
+        log_info(_OP, "Non-UCX SKU: adding PML cm / libfabric tcp settings and disabling "
+                      "UCC and hcoll in the HPC-X modulefile")
+    _append_file(f"{mpi_dir}/hpcx-{version}", hpcx_modulefile(version, module, inp.uses_ucx),
+                 report)
+    _ln_s(f"{mpi_dir}/hpcx-{version}", f"{mpi_dir}/hpcx-pmix-{version}", report)
+    _ln_s(f"{mpi_dir}/hpcx-{version}", f"{mpi_dir}/hpcx", report)
+    _ln_s(f"{mpi_dir}/hpcx-pmix-{version}", f"{mpi_dir}/hpcx-pmix", report)
+
+
 def _install_mvapich(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx, nproc: int,
-                     report: _Report) -> str | None:
-    """Build MVAPICH; returns its transport lib dir, or None when skipped."""
+                     report: _Report) -> None:
     if inp.mvapich is None:
-        log_info(_OP, f"Skipping MVAPICH: not supported on {inp.distribution} for "
-                      f"{inp.sku_family} SKUs (bash skips ubuntu24.04/azurelinux3.0 "
-                      "+ gb-family)", phase="mvapich", skipped=True,
+        if inp.distribution == _UBUNTU_26:
+            why = ("MVAPICH 4.1 does not build with ubuntu26.04's gcc 15 (bundled "
+                   "libfabric OPX/UCR providers, then the collectives source)")
+        else:
+            why = (f"not supported on {inp.distribution} for {inp.sku_family} SKUs "
+                   "(bash skips ubuntu24.04/azurelinux3.0 + gb-family)")
+        log_info(_OP, f"Skipping MVAPICH: {why}", phase="mvapich", skipped=True,
                  distro=inp.distribution, sku_family=inp.sku_family)
-        return None
+        return
     cfg = inp.mvapich
     version, url = cfg["version"], cfg["url"]
     folder = url_basename(url, ".tar.gz")
@@ -697,27 +1145,40 @@ def _install_mvapich(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx, nproc: int,
     _run(["make", f"-j{nproc}"], "MVAPICH make", env, source)
     _run(["make", "install"], "MVAPICH make install", env, source)
     _record("MVAPICH", version, report)
+
+    if not inp.uses_ucx:
+        log_info(_OP, "Non-UCX SKU: adding FI_PROVIDER=tcp and disabling CMA in the "
+                      "MVAPICH modulefile")
+    _write_mvapich_modulefile(inp, version, transport_lib, report)
     log_info(_OP, f"MVAPICH {version} installed to {_INSTALL_PREFIX}/mvapich-{version}",
              phase="mvapich", version=version)
-    return transport_lib
+
+
+def _write_mvapich_modulefile(inp: _Inputs, version: str, transport_lib: str,
+                              report: _Report) -> None:
+    mpi_dir = inp.mpi_dir
+    _append_file(f"{mpi_dir}/mvapich-{version}",
+                 mvapich_modulefile(version, transport_lib, inp.uses_ucx), report)
+    _ln_s(f"{mpi_dir}/mvapich-{version}", f"{mpi_dir}/mvapich", report)
 
 
 def _install_ompi(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx, nproc: int,
-                  report: _Report) -> str:
-    """Build Open MPI; returns its transport lib dir."""
+                  report: _Report) -> None:
+    if inp.ompi is None:
+        log_info(_OP, f"Skipping the standalone Open MPI on {inp.distribution} (HPC-X's "
+                      "Open MPI only)", phase="ompi", skipped=True, distro=inp.distribution)
+        return
     cfg = inp.ompi
     version, url = cfg["version"], cfg["url"]
     folder = url_basename(url, ".tar.gz")
-    if uses_bundled_pmix(inp.distribution, inp.node_type):
-        pmix_flag = "--with-pmix"
-    else:
-        pmix_flag = f"--with-pmix={inp.pmix_path}"
+    pmix_flags = ompi_pmix_flags(inp.internal_pmix, inp.distribution, inp.node_type,
+                                 inp.pmix_path)
     configure, transport_lib = ompi_configure_command(
-        version, uses_ucx=inp.uses_ucx, pmix_flag=pmix_flag, ucx_path=hpcx.ucx,
+        version, uses_ucx=inp.uses_ucx, pmix_flags=pmix_flags, ucx_path=hpcx.ucx,
         hcoll_path=hpcx.hcoll, ld_library_path=env.get("LD_LIBRARY_PATH", ""))
     log_info(_OP, f"Open MPI phase: building Open MPI {version} "
                   f"({'UCX + HCOLL' if inp.uses_ucx else 'OFI/libfabric'} transport)",
-             phase="ompi", version=version, url=url, pmix_flag=pmix_flag,
+             phase="ompi", version=version, url=url, pmix_flag=" ".join(pmix_flags),
              transport_lib=transport_lib)
 
     _download(url, cfg["sha256"], "Open MPI")
@@ -729,11 +1190,20 @@ def _install_ompi(env: dict[str, str], inp: _Inputs, hpcx: _Hpcx, nproc: int,
     _run(["make", "install"], "Open MPI make install", env, source)
     _record("OMPI", version, report)
 
-    if is_rpm_distro(inp.distribution):
-        _pin(["openmpi", "perftest"], env, report)   # exclude from updates
+    if not inp.uses_ucx:
+        log_info(_OP, "Non-UCX SKU: adding PML cm / libfabric tcp settings to the "
+                      "Open MPI modulefile")
+    _write_ompi_modulefile(inp, version, hpcx, transport_lib, report)
     log_info(_OP, f"Open MPI {version} installed to {_INSTALL_PREFIX}/openmpi-{version}",
              phase="ompi", version=version)
-    return transport_lib
+
+
+def _write_ompi_modulefile(inp: _Inputs, version: str, hpcx: _Hpcx, transport_lib: str,
+                           report: _Report) -> None:
+    mpi_dir = inp.mpi_dir
+    _append_file(f"{mpi_dir}/openmpi-{version}",
+                 openmpi_modulefile(version, hpcx.hcoll, transport_lib, inp.uses_ucx), report)
+    _ln_s(f"{mpi_dir}/openmpi-{version}", f"{mpi_dir}/openmpi", report)
 
 
 def _install_impi(env: dict[str, str], inp: _Inputs, report: _Report) -> None:
@@ -756,52 +1226,23 @@ def _install_impi(env: dict[str, str], inp: _Inputs, report: _Report) -> None:
     log_info(_OP, f"Renamed {modulefiles}/mpi to {modulefiles}/impi",
              path=f"{modulefiles}/impi")
     _record("IMPI", version, report)
+    _write_impi_modulefile(inp, report)
 
 
-def _write_modulefiles(inp: _Inputs, hpcx: _Hpcx, mvapich_lib: str | None,
-                       ompi_lib: str, report: _Report) -> None:
-    """Write the MPI modulefiles and symlinks, in bash's order."""
-    mpi_dir = f"{inp.module_dir}/mpi"
-    os.makedirs(mpi_dir, exist_ok=True)
-    log_info(_OP, f"Writing MPI modulefiles to {mpi_dir}", phase="modulefiles",
-             path=mpi_dir, uses_ucx=inp.uses_ucx)
-    if not inp.uses_ucx:
-        log_info(_OP, "Non-UCX SKU: adding libfabric tcp / PML cm settings to the "
-                      "HPC-X, MVAPICH and Open MPI modulefiles")
-
-    hpcx_version = inp.hpcx["version"]
-    hpcx_text = hpcx_modulefile(hpcx_version, hpcx.path, inp.uses_ucx)
-    # mpi/hpcx is the public HPC-X entrypoint; both files load the rebuilt HPC-X.
-    _append_file(f"{mpi_dir}/hpcx-{hpcx_version}", hpcx_text, report)
-    _append_file(f"{mpi_dir}/hpcx-pmix-{hpcx_version}", hpcx_text, report)
-
-    if inp.mvapich is not None:
-        mvapich_version = inp.mvapich["version"]
-        _append_file(f"{mpi_dir}/mvapich-{mvapich_version}",
-                     mvapich_modulefile(mvapich_version, mvapich_lib, inp.uses_ucx), report)
-        _ln_s(f"{mpi_dir}/mvapich-{mvapich_version}", f"{mpi_dir}/mvapich", report)
-
-    ompi_version = inp.ompi["version"]
-    _append_file(f"{mpi_dir}/openmpi-{ompi_version}",
-                 openmpi_modulefile(ompi_version, hpcx.hcoll, ompi_lib, inp.uses_ucx), report)
-
-    if inp.impi is not None:
-        impi_version = inp.impi_2021_version
-        provider = impi_fi_provider(inp.network_mode)
-        log_info(_OP, f"Intel MPI modulefile uses FI_PROVIDER={provider}",
-                 fi_provider=provider, network_mode=inp.network_mode)
-        impi_file = f"{mpi_dir}/impi_{impi_version}"
-        _append_file(impi_file, impi_modulefile(impi_version, provider), report)
-        _ln_s(impi_file, f"{mpi_dir}/impi-2021", report)
-        if is_el8(inp.distribution):
-            log_info(_OP, "EL8: adding I_MPI_STARTUP_MODE=pmi_shm to the Intel MPI "
-                          "modulefile (Intel MPI collectives race condition)",
-                     distro=inp.distribution)
-            _append_file(impi_file, _IMPI_EL8_APPEND, report, new_file=False)
-
-    _ln_s(f"{mpi_dir}/hpcx-{hpcx_version}", f"{mpi_dir}/hpcx", report)
-    _ln_s(f"{mpi_dir}/hpcx-pmix-{hpcx_version}", f"{mpi_dir}/hpcx-pmix", report)
-    _ln_s(f"{mpi_dir}/openmpi-{ompi_version}", f"{mpi_dir}/openmpi", report)
+def _write_impi_modulefile(inp: _Inputs, report: _Report) -> None:
+    mpi_dir = inp.mpi_dir
+    impi_version = inp.impi_2021_version
+    provider = impi_fi_provider(inp.network_mode)
+    log_info(_OP, f"Intel MPI modulefile uses FI_PROVIDER={provider}",
+             fi_provider=provider, network_mode=inp.network_mode)
+    impi_file = f"{mpi_dir}/impi_{impi_version}"
+    _append_file(impi_file, impi_modulefile(impi_version, provider), report)
+    _ln_s(impi_file, f"{mpi_dir}/impi-2021", report)
+    if is_el8(inp.distribution):
+        log_info(_OP, "EL8: adding I_MPI_STARTUP_MODE=pmi_shm to the Intel MPI "
+                      "modulefile (Intel MPI collectives race condition)",
+                 distro=inp.distribution)
+        _append_file(impi_file, _IMPI_EL8_APPEND, report, new_file=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -830,19 +1271,11 @@ def _resolve_inputs(env: dict[str, str]) -> _Inputs | None:
     sku_family = env.get("SKU_FAMILY", "")
     node_type = env.get("TARGET_NODE_TYPE") or DEFAULT_NODE_TYPE
     network_mode = sku_network_mode(sku, node_type)
+    uses_ucx = sku_uses_ucx(sku)
 
     module_dir = env.get("MODULE_FILES_DIRECTORY", "")
     if not module_dir:
         log_error(_OP, "MODULE_FILES_DIRECTORY is not set")
-        return None
-
-    pmix = config_for("pmix", env)
-    pmix_version = str(pmix.get("version") or "") if isinstance(pmix, dict) else ""
-    pmix_short = drop_last_two(pmix_version)
-    if pmix_short is None:
-        log_error(_OP, f"could not resolve a usable pmix version from versions.json "
-                       f"(got {pmix_version!r}; PMIX_PATH needs ${{PMIX_VERSION:0:-2}})",
-                  component="pmix", version=pmix_version)
         return None
 
     hpcx_component, hpcx_reason = hpcx_variant(gpu, network_mode)
@@ -850,15 +1283,36 @@ def _resolve_inputs(env: dict[str, str]) -> _Inputs | None:
     if hpcx is None:
         return None
 
+    pmix_reason = internal_pmix_reason(distribution, node_type)
+    internal_pmix = pmix_reason is not None
+    pmix_version, pmix_path = None, None
+    if not internal_pmix:
+        pmix = config_for("pmix", env)
+        pmix_version = str(pmix.get("version") or "") if isinstance(pmix, dict) else ""
+        pmix_short = drop_last_two(pmix_version)
+        if pmix_short is None:
+            log_error(_OP, f"could not resolve a usable pmix version from versions.json "
+                           f"(got {pmix_version!r}; PMIX_PATH needs ${{PMIX_VERSION:0:-2}})",
+                      component="pmix", version=pmix_version)
+            return None
+        pmix_path = f"{_INSTALL_PREFIX}/pmix/{pmix_short}"
+
+    ucx_reason = rebuild_ucx_reason(gpu, distribution, uses_ucx)
+    rebuild_ucx = ucx_reason is not None
+    rebuild_hpcx = needs_hpcx_rebuild(rebuild_ucx=rebuild_ucx, internal_pmix=internal_pmix,
+                                      gpu=gpu, uses_ucx=uses_ucx)
+
     mvapich = None
     if not skips_mvapich(distribution, sku_family):
         mvapich = _download_config("mvapich", env)
         if mvapich is None:
             return None
 
-    ompi = _download_config("ompi", env)
-    if ompi is None:
-        return None
+    ompi = None
+    if not skips_ompi(distribution):
+        ompi = _download_config("ompi", env)
+        if ompi is None:
+            return None
 
     impi, impi_2021_version = None, None
     if architecture != "aarch64":
@@ -874,9 +1328,12 @@ def _resolve_inputs(env: dict[str, str]) -> _Inputs | None:
     return _Inputs(
         distribution=distribution, architecture=architecture, gpu=gpu, sku=sku,
         sku_family=sku_family, node_type=node_type, network_mode=network_mode,
-        uses_ucx=sku_uses_ucx(sku), module_dir=module_dir,
+        uses_ucx=uses_ucx, module_dir=module_dir,
+        component_dir=env.get("COMPONENT_DIR", ""),
         hpcx_component=hpcx_component, hpcx_reason=hpcx_reason, hpcx=hpcx,
-        pmix_version=pmix_version, pmix_path=f"{_INSTALL_PREFIX}/pmix/{pmix_short}",
+        internal_pmix=internal_pmix, internal_pmix_reason=pmix_reason,
+        pmix_version=pmix_version, pmix_path=pmix_path,
+        rebuild_ucx=rebuild_ucx, rebuild_ucx_reason=ucx_reason, rebuild_hpcx=rebuild_hpcx,
         mvapich=mvapich, ompi=ompi, impi=impi, impi_2021_version=impi_2021_version)
 
 
@@ -895,15 +1352,26 @@ def install(env: dict[str, str]) -> int:
              sku_family=inp.sku_family, node_type=inp.node_type,
              network_mode=inp.network_mode, uses_ucx=inp.uses_ucx,
              hpcx_component=inp.hpcx_component, hpcx_version=inp.hpcx["version"],
-             pmix_version=inp.pmix_version, pmix_path=inp.pmix_path,
+             internal_pmix=inp.internal_pmix,
+             pmix_version=inp.pmix_version or "internal",
+             pmix_path=inp.pmix_path or "internal",
+             rebuild_ucx=inp.rebuild_ucx, rebuild_hpcx=inp.rebuild_hpcx,
              mvapich_version=inp.mvapich["version"] if inp.mvapich else "skipped",
-             ompi_version=inp.ompi["version"],
+             ompi_version=inp.ompi["version"] if inp.ompi else "skipped",
              impi_version=inp.impi["version"] if inp.impi else "skipped",
              module_dir=inp.module_dir)
     log_info(_OP, f"HPC-X variant {inp.hpcx_component}: {inp.hpcx_reason}",
              hpcx_component=inp.hpcx_component, gpu=inp.gpu, network_mode=inp.network_mode)
-    log_info(_OP, f"PMIx path for the MPI builds: {inp.pmix_path}",
-             pmix_path=inp.pmix_path, pmix_version=inp.pmix_version)
+    if inp.internal_pmix:
+        log_info(_OP, f"Open MPI uses its internal PMIx, hwloc and libevent: "
+                      f"{inp.internal_pmix_reason}", internal_pmix=True,
+                 distro=inp.distribution, node_type=inp.node_type)
+    else:
+        log_info(_OP, f"PMIx path for the MPI builds: {inp.pmix_path}",
+                 internal_pmix=False, pmix_path=inp.pmix_path, pmix_version=inp.pmix_version)
+    log_info(_OP, f"HPC-X rebuild: {'yes' if inp.rebuild_hpcx else 'no'}, UCX rebuild: "
+                  f"{inp.rebuild_ucx_reason or 'no'}", rebuild_hpcx=inp.rebuild_hpcx,
+             rebuild_ucx=inp.rebuild_ucx)
     # BASH ISSUE (kept): `set CC=/usr/bin/gcc` and `set GCC=/usr/bin/gcc` don't
     # set CC/GCC; bash's `set` replaces the positional parameters ($1). So the
     # builds use the environment's default compiler; we don't set CC either.
@@ -917,15 +1385,19 @@ def install(env: dict[str, str]) -> int:
 
     report = _Report()
     try:
+        # bash: mkdir -p ${MPI_MODULE_FILES_DIRECTORY}, before anything else.
+        os.makedirs(inp.mpi_dir, exist_ok=True)
+        log_info(_OP, f"MPI modulefiles go to {inp.mpi_dir}", path=inp.mpi_dir)
         # Start from an empty work directory (see the module docstring).
         shutil.rmtree(_WORK_DIR, ignore_errors=True)
         os.makedirs(_WORK_DIR, exist_ok=True)
 
         hpcx = _install_hpcx(env, inp, report)
-        mvapich_lib = _install_mvapich(env, inp, hpcx, nproc, report)
-        ompi_lib = _install_ompi(env, inp, hpcx, nproc, report)
+        _install_mvapich(env, inp, hpcx, nproc, report)
+        _install_ompi(env, inp, hpcx, nproc, report)
+        if is_rpm_distro(inp.distribution):
+            _pin(["openmpi", "perftest"], env, report)   # exclude from updates
         _install_impi(env, inp, report)
-        _write_modulefiles(inp, hpcx, mvapich_lib, ompi_lib, report)
     except _StepFailed:
         return 3
     except OSError as exc:
@@ -944,5 +1416,7 @@ def install(env: dict[str, str]) -> int:
                   f"work dir {_WORK_DIR}", work_dir=_WORK_DIR)
     log_info(_OP, "MPIs installed: " + ", ".join(f"{k}={v}" for k, v in report.recorded.items()),
              recorded=report.recorded, hpcx_path=hpcx.path, ucx_path=hpcx.ucx,
-             files=report.files, symlinks=len(report.symlinks), pinned=report.pinned)
+             rebuilt_hpcx=inp.rebuild_hpcx, internal_pmix=inp.internal_pmix,
+             files=report.files, symlinks=len(report.symlinks), pinned=report.pinned,
+             patched=report.patched)
     return 0

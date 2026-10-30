@@ -1,0 +1,4 @@
+hpcx -> hpcx-2.25.1
+hpcx-pmix -> hpcx-pmix-2.25.1
+hpcx-pmix-2.25.1 -> hpcx-2.25.1
+openmpi -> openmpi-5.0.10

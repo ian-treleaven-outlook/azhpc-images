@@ -1,5 +1,6 @@
 hpcx -> hpcx-2.18
 hpcx-pmix -> hpcx-pmix-2.18
+hpcx-pmix-2.18 -> hpcx-2.18
 impi-2021 -> impi_2021.16
 mvapich -> mvapich-4.1
 openmpi -> openmpi-5.0.10

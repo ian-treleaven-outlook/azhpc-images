@@ -8,7 +8,10 @@ for GB200 images only (Ubuntu 24.04 and Azure Linux 3.0, aarch64).
 
   1. Install the build dependencies (compiler toolchain, Boost
      program_options, cmake) with the distro's package manager.
-  2. Clone the nvloom source at the pinned tag (v<version> from versions.json).
+  2. Clone the nvloom source at the configured ref (versions.json "ref",
+     else "branch", else the tag v<version>), check out the pinned "commit",
+     and record where the source came from as NVLOOM_REPO_COMMIT and
+     NVLOOM_REPO_REF (write_repo_source_info; upstream #650, "build evidence").
   3. On Azure Linux, apply the repo's azurelinux_nvloom.patch. It stops
      nvloom linking Boost statically, which fails on Azure Linux.
   4. Load the HPC-X MPI module, then build with cmake + make for the
@@ -28,14 +31,21 @@ Linux one, but with apt packages and no patch):
     nvloom_metadata=$(get_component_config "nvloom")
     NVLOOM_VERSION=$(jq -r '.version' <<< $nvloom_metadata)
     NVLOOM_DOWNLOAD_URL=$(jq -r '.url' <<< $nvloom_metadata)
+    NVLOOM_COMMIT=$(jq -r '.commit' <<< $nvloom_metadata)
+    NVLOOM_REF=$(jq -r '.ref // .branch // empty' <<< $nvloom_metadata)
+    NVLOOM_REF=${NVLOOM_REF:-v${NVLOOM_VERSION}}
 
     if [[ $DISTRIBUTION == "azurelinux3.0" ]]; then
         dnf install -y build-essential
         dnf install -y boost-devel boost-program-options
         dnf install -y cmake
 
-        git clone $NVLOOM_DOWNLOAD_URL --branch v$NVLOOM_VERSION
+        git clone $NVLOOM_DOWNLOAD_URL --branch $NVLOOM_REF
         pushd nvloom
+        git checkout $NVLOOM_COMMIT
+        write_repo_source_info "NVLOOM" . \\
+            --commit "${NVLOOM_COMMIT}" \\
+            --ref "${NVLOOM_REF}"
         git apply /home/hpcuser/azhpc-images/distros/azurelinux3.0/azurelinux_nvloom.patch
         cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES="100" .
         make -j $(nproc)
@@ -45,7 +55,8 @@ Linux one, but with apt packages and no patch):
         apt install -y build-essential
         apt install -y libboost-program-options-dev
         apt install -y cmake
-        ... same clone / cmake / make / mv, without the patch ...
+        ... same clone / checkout / write_repo_source_info / cmake / make / mv,
+            without the patch ...
     fi
 
     module unload mpi/hpcx
@@ -76,8 +87,14 @@ Deliberate differences from bash
     with 3 if TOP_DIR is unset or the patch file is missing.
   * Unsupported distros: bash skips the build but still records NVLOOM, so the
     image would claim a tool it doesn't have. We fail with 3.
-  * Checks first: the config, distro and patch are checked before anything is
-    installed. Bash finds these problems later (e.g. `git clone --branch vnull`).
+  * Checks first: the config (version, url, commit), distro and patch are
+    checked before anything is installed. Bash finds these problems later
+    (e.g. `git clone --branch vnull`, or `git checkout null` after the
+    dependencies are installed and the source is cloned, when versions.json
+    has no "commit").
+  * The checkout and write_repo_source_info run in the source directory, as
+    in bash; the port passes its absolute path instead of ".". Both commit
+    and ref are always given, so write_repo_source_info doesn't ask git.
   * Work directory: bash clones into its current directory (the distro build
     dir). We clone into _WORK_DIR, delete any copy left by an earlier failed
     run first (in bash, that leftover would make `git clone` fail), and delete
@@ -98,6 +115,7 @@ import shutil
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_error, log_info
 from utils.process import exec_program
+from utils.repo_source import write_repo_source_info
 
 # The Step's `op` label in build_config.py. Every log line from this module uses it.
 _OP = "install-nvloom"
@@ -152,6 +170,25 @@ def dependency_commands(distribution: str) -> tuple[list[str], ...] | None:
     return None
 
 
+def configured_ref(config: dict, version: str) -> str:
+    """The git ref to clone, as bash resolves it:
+
+        NVLOOM_REF=$(jq -r '.ref // .branch // empty' <<< $nvloom_metadata)
+        NVLOOM_REF=${NVLOOM_REF:-v${NVLOOM_VERSION}}
+
+    jq's `//` skips a missing (null) or false value, but keeps "" (so an empty
+    "ref" hides "branch"); bash's `:-` then turns "" into v<version>. Checked
+    against real jq/bash in WSL.
+    """
+    ref = ""
+    for key in ("ref", "branch"):
+        value = config.get(key)
+        if value is not None and value is not False:
+            ref = str(value)
+            break
+    return ref or f"v{version}"
+
+
 def patch_path(top_dir: str) -> str:
     """Where the Azure Linux nvloom patch lives in this repo checkout.
 
@@ -193,8 +230,8 @@ def _run_all(commands, env: dict[str, str], cwd: str | None = None) -> bool:
     return True
 
 
-def _clone(url: str, version: str, env: dict[str, str]) -> str | None:
-    """Clone nvloom at tag v<version> into a fresh _WORK_DIR.
+def _clone(url: str, ref: str, env: dict[str, str]) -> str | None:
+    """Clone nvloom at `ref` into a fresh _WORK_DIR.
 
     Returns the source directory, or None on failure.
     """
@@ -207,8 +244,7 @@ def _clone(url: str, version: str, env: dict[str, str]) -> str | None:
         return None
 
     # Same arguments, in the same order, as bash's git clone.
-    if not _run_all([["git", "clone", url, "--branch", f"v{version}"]],
-                    env, cwd=_WORK_DIR):
+    if not _run_all([["git", "clone", url, "--branch", ref]], env, cwd=_WORK_DIR):
         return None
 
     source_dir = os.path.join(_WORK_DIR, _SOURCE_DIR_NAME)
@@ -227,10 +263,31 @@ def _install_binary(source_dir: str) -> bool:
     """
     built = os.path.join(source_dir, _BINARY)
     target = os.path.join(_DEST_DIR, _BINARY)
+    action = "replaced" if os.path.lexists(target) else "created"
     try:
         shutil.move(built, target)
     except OSError as exc:
-        log_error(_OP, f"could not move {built} to {target}: {exc}")
+        log_error(_OP, f"could not move {built} to {target}: {exc}",
+                  source=built, path=target)
+        return False
+    log_info(_OP, f"Installed {target}", path=target, action=action)
+    return True
+
+
+def _checkout_and_record(source_dir: str, commit: str, ref: str,
+                         env: dict[str, str]) -> bool:
+    """git checkout <commit>, then write_repo_source_info (bash's order)."""
+    if not _run_all([["git", "checkout", commit]], env, cwd=source_dir):
+        return False
+    try:
+        recorded = write_repo_source_info("NVLOOM", source_dir, _OP,
+                                          commit=commit, ref=ref, env=env)
+    except OSError as exc:
+        log_error(_OP, f"could not record the nvloom source (commit {commit}, "
+                       f"ref {ref}): {exc}", commit=commit, ref=ref)
+        return False
+    if not recorded:
+        log_error(_OP, "could not record the nvloom source", commit=commit, ref=ref)
         return False
     return True
 
@@ -247,17 +304,24 @@ def install(env: dict[str, str]) -> int:
     # ---- 1. Checks before any changes are made ----------------------------
     config = config_for("nvloom", env)
     # isinstance() guards against a missing (None) or oddly shaped config.
-    if not isinstance(config, dict) or not config.get("version") or not config.get("url"):
-        log_error(_OP, "could not resolve nvloom version and url from versions.json")
+    config = config if isinstance(config, dict) else {}
+    missing = [key for key in ("version", "url", "commit") if not config.get(key)]
+    if missing:
+        log_error(_OP, f"could not resolve nvloom {', '.join(missing)} from versions.json",
+                  missing=missing, distro=env.get("DISTRIBUTION", ""),
+                  node_type=env.get("TARGET_NODE_TYPE", ""))
         return 3
-    version = config["version"]
-    url = config["url"]
+    version = str(config["version"])
+    url = str(config["url"])
+    commit = str(config["commit"])
+    ref = configured_ref(config, version)
 
     distribution = env.get("DISTRIBUTION", "")
     deps = dependency_commands(distribution)
     if deps is None:
         # Bash would skip the build but still record NVLOOM.
-        log_error(_OP, f"nvloom build is not supported on {distribution!r}")
+        log_error(_OP, f"nvloom build is not supported on {distribution!r}",
+                  distro=distribution)
         return 3
 
     patch = None
@@ -271,7 +335,10 @@ def install(env: dict[str, str]) -> int:
             log_error(_OP, f"nvloom patch not found: {patch}")
             return 3
 
-    log_info(_OP, f"Installing nvloom {version} on {distribution}")
+    log_info(_OP, f"Installing nvloom {version} on {distribution}", version=version,
+             source=url, ref=ref, commit=commit, distro=distribution,
+             node_type=env.get("TARGET_NODE_TYPE", ""), dest=_DEST_DIR,
+             patch=patch or "(none)", work_dir=_WORK_DIR)
 
     # ---- 2. Destination directory (bash's `mkdir -p $dest_dir`) ----------
     try:
@@ -285,12 +352,18 @@ def install(env: dict[str, str]) -> int:
         return 3
 
     # ---- 4. Source, patch, build ------------------------------------------
-    source_dir = _clone(url, version, env)
+    source_dir = _clone(url, ref, env)
     if source_dir is None:
         return 3
 
-    if patch is not None and not _run_all([["git", "apply", patch]], env, cwd=source_dir):
+    if not _checkout_and_record(source_dir, commit, ref, env):
         return 3
+
+    if patch is not None:
+        if not _run_all([["git", "apply", patch]], env, cwd=source_dir):
+            return 3
+        log_info(_OP, f"Applied {os.path.basename(patch)} (Azure Linux: don't link "
+                      "Boost statically)", patch=patch)
 
     if not _run_all([["bash", "-c", build_script()]], env, cwd=source_dir):
         return 3
@@ -308,5 +381,8 @@ def install(env: dict[str, str]) -> int:
     except OSError as exc:
         log_error(_OP, f"could not record NVLOOM={version}: {exc}")
         return 3
-    log_info(_OP, f"nvloom {version} installed to {_DEST_DIR}")
+    log_info(_OP, f"Recorded NVLOOM version {version}", component="NVLOOM",
+             version=version)
+    log_info(_OP, f"nvloom {version} installed to {_DEST_DIR}", version=version,
+             commit=commit, ref=ref, dest=_DEST_DIR)
     return 0

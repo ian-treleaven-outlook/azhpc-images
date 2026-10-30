@@ -135,29 +135,13 @@ class InstallShParityTests(unittest.TestCase):
         self.assertEqual(_plan_scripts(_cfg("NVidia", "A100")), expected)
 
 
-# Since the upstream sync (ADO 983), some ports are behind their bash script and
-# run bash until a resync ticket updates them (Step.resync). This list is pinned
+# When upstream changes a ported script, the port is marked resync="ADO <id>"
+# and runs bash until the ticket updates it (Step.resync). This list is pinned
 # on purpose: re-enabling a port, or marking another one stale, should be a
-# deliberate change that also updates this test.
+# deliberate change that also updates this test. After the October 2026 sync,
+# ADO 984-988 resynced all 16 marked ports, so the list is empty.
 class ResyncTests(unittest.TestCase):
-    EXPECTED = {
-        "install-pmix": "ADO 984",
-        "install-mpis": "ADO 984",
-        "install-mpifileutils": "ADO 984",
-        "install-nv-driver": "ADO 985",
-        "install-nv-grid": "ADO 985",
-        "install-nvloom": "ADO 985",
-        "install-nvbandwidth": "ADO 985",
-        "install-rocm": "ADO 986",
-        "install-rccl": "ADO 986",
-        "install-doca": "ADO 987",
-        "install-nccl": "ADO 987",
-        "install-dcgm": "ADO 987",
-        "install-lustre": "ADO 988",
-        "hpc-tuning": "ADO 988",
-        "install-persistent-rdma-naming": "ADO 988",
-        "install-aznfs": "ADO 988",
-    }
+    EXPECTED: dict[str, str] = {}
 
     def _steps(self):
         return build_plan(_cfg("NVidia", "A100"))
@@ -174,9 +158,19 @@ class ResyncTests(unittest.TestCase):
                     self.assertIsNotNone(step.action)
                     self.assertTrue((_REPO_ROOT / "components" / step.script).is_file())
 
-    def test_new_upstream_step_runs_as_bash(self):
+    def test_every_step_runs_its_python_port(self):
+        # Every step in the Ubuntu 24.04 plan has a current Python port.
+        for cfg in (_cfg("NVidia", "A100"), _cfg("NVidia", "GB200"),
+                    _cfg("NVidia", "NCv6"), _cfg("AMD", "MI300")):
+            for step in build_plan(cfg):
+                with self.subTest(gpu=cfg.gpu, op=step.op):
+                    self.assertEqual(step.runner, "python")
+
+    def test_new_upstream_step_runs_its_python_port(self):
+        from components.python import install_azsecpack_prereqs
         steps = {s.op: s for s in self._steps()}
-        self.assertIsNone(steps["install-azsecpack-prereqs"].action)   # ADO 990
+        self.assertIs(steps["install-azsecpack-prereqs"].action,
+                      install_azsecpack_prereqs.install)   # ADO 990
 
 
 # Same plan, different targets: check the SKU/vendor/arch gates pull in the right

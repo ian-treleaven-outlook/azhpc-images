@@ -6,8 +6,8 @@ Two kinds of test:
     tests/python/fixtures/install_azure_persistent_rdma_naming/. Those fixtures
     were written by running the real bash heredocs (RDMA_CORE_VERSION=56.1) in
     bash, so they are byte for byte what the bash step writes.
-  * install() runs with the download, tar, build.sh, systemctl and the nested
-    monitor script faked by FakeCommands below. /tmp, /usr/sbin and
+  * install() runs with the download, tar, build.sh and systemctl faked by
+    FakeCommands below. /tmp, /usr/sbin and
     /etc/systemd/system are pointed at a temporary folder, so the tests never
     touch the real system or use the network.
 
@@ -63,13 +63,34 @@ class GeneratedTextTests(unittest.TestCase):
     def test_escaped_dollars_stay_literal(self):
         script = rdma.naming_script("59.0")
         # The bash source wrote these as \$...; they must reach the file as $.
-        self.assertIn("for old_device in $(ibdev2netdev -v", script)
+        self.assertIn("mapfile -t all_devices < <(ibdev2netdev -v | sort -n | "
+                      "awk '{print $2}')", script)
+        self.assertIn('for old_device in "${all_devices[@]}"; do', script)
+        self.assertIn("\t\tsuffix=${dev#$prefix}\n", script)
+        self.assertIn("ib_index=$(next_index mlx5_ib)", script)
         self.assertIn(r"\([a-zA-Z]*\)$/\1/p'", script)
         self.assertNotIn("${RDMA_CORE_VERSION}", script)
+
+    def test_naming_script_skips_devices_that_are_already_named(self):
+        # #614: the script can run again (the timer reruns it), so devices
+        # already called mlx5_ib<N>/mlx5_an<N> are left alone.
+        script = rdma.naming_script("59.0")
+        self.assertIn("\t\tmlx5_ib*|mlx5_an*) continue ;;\n", script)
+        self.assertIn('echo "Unknown device type for $old_device."\n', script)
 
     def test_service_unit_matches_bash_output(self):
         self.assertEqual(rdma._SERVICE_UNIT,
                          _fixture("azure_persistent_rdma_naming.service"))
+
+    def test_timer_unit_matches_bash_output(self):
+        self.assertEqual(rdma._TIMER_UNIT, _fixture("azure_persistent_rdma_naming.timer"))
+
+    def test_the_monitor_script_is_gone(self):
+        # Upstream deleted it (#614); the port no longer runs it.
+        components = Path(__file__).resolve().parents[2] / "components"
+        self.assertFalse((components /
+                          "install_azure_persistent_rdma_naming_monitor.sh").exists())
+        self.assertFalse(hasattr(rdma, "_MONITOR_SCRIPT"))
 
     def test_rdma_rename_path(self):
         self.assertEqual(rdma.rdma_rename_path("59.0"), "/usr/sbin/rdma_rename_59.0")
@@ -120,6 +141,7 @@ class InstallTests(unittest.TestCase):
         self.src = os.path.join(self.work, "rdma-core")
         self.naming = os.path.join(self.sbin, "azure_persistent_rdma_naming.sh")
         self.service = os.path.join(self.systemd, "azure_persistent_rdma_naming.service")
+        self.timer = os.path.join(self.systemd, "azure_persistent_rdma_naming.timer")
         self.components = os.path.join(root, "components")
         versions = {"rdma_core": {"common": {"version": _VERSION, "sha256": "sha"}}}
         self.env = {"COMPONENT_VERSIONS": json.dumps(versions),
@@ -142,6 +164,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(rdma, "_SBIN_DIR", self.sbin), \
              mock.patch.object(rdma, "_NAMING_SCRIPT", naming_path or self.naming), \
              mock.patch.object(rdma, "_SERVICE_FILE", self.service), \
+             mock.patch.object(rdma, "_TIMER_FILE", self.timer), \
              mock.patch.object(rdma, "exec_program", side_effect=fake.run), \
              mock.patch.object(rdma, "download_and_verify", download), \
              mock.patch.object(rdma, "log_info") as logs["info"], \
@@ -155,10 +178,11 @@ class InstallTests(unittest.TestCase):
             (["tar", "-xvf", _TARBALL, "--strip-components=1", "-C", "rdma-core"],
              self.work),
             (["bash", "build.sh"], self.src),
+            (["systemctl", "daemon-reload"], None),
             (["systemctl", "enable", "azure_persistent_rdma_naming.service"], None),
+            (["systemctl", "enable", "azure_persistent_rdma_naming.timer"], None),
             (["systemctl", "start", "azure_persistent_rdma_naming.service"], None),
-            ([os.path.join(self.components,
-                           "install_azure_persistent_rdma_naming_monitor.sh")], None),
+            (["systemctl", "start", "azure_persistent_rdma_naming.timer"], None),
         ]
 
     @staticmethod
@@ -183,16 +207,22 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(_mode(self.naming), 0o755)
         with open(self.service, encoding="utf-8", newline="") as handle:
             self.assertEqual(handle.read(), _fixture("azure_persistent_rdma_naming.service"))
+        with open(self.timer, encoding="utf-8", newline="") as handle:
+            self.assertEqual(handle.read(), _fixture("azure_persistent_rdma_naming.timer"))
         logs["error"].assert_not_called()
+        logs["warn"].assert_not_called()
 
     def test_existing_files_are_overwritten(self):
-        for path in (self.naming, self.service):
+        for path in (self.naming, self.service, self.timer):
             Path(path).write_text("old content that is longer than the new one\n" * 50)
-        rc, _, _ = self._install()
+        rc, _, logs = self._install()
 
         self.assertEqual(rc, 0)
         self.assertEqual(Path(self.naming).read_text(), rdma.naming_script(_VERSION))
         self.assertEqual(Path(self.service).read_text(), rdma._SERVICE_UNIT)
+        self.assertEqual(Path(self.timer).read_text(), rdma._TIMER_UNIT)
+        wrote = [c for c in logs["info"].call_args_list if c.args[1] == f"Wrote {self.timer}"]
+        self.assertEqual(wrote[0].kwargs["action"], "replaced")
 
     def test_existing_source_folder_is_reused_without_extracting(self):
         # bash: `mkdir rdma-core && tar ...` - a failing mkdir skips tar but
@@ -220,19 +250,25 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(wrote[0].kwargs["mode"], "0755")
         self.assertEqual(wrote[0].kwargs["action"], "created")
 
-        messages = self._messages(info)
-        self.assertIn("Enabled and started azure_persistent_rdma_naming.service", messages)
-        self.assertIn("Running the nested monitor installer", messages)
+        wrote = [c for c in info.call_args_list if c.args[1] == f"Wrote {self.timer}"]
+        self.assertEqual((wrote[0].kwargs["action"], wrote[0].kwargs["path"]),
+                         ("created", self.timer))
+
+        enabled = [c for c in info.call_args_list if c.args[1] ==
+                   "Enabled and started azure_persistent_rdma_naming.service and "
+                   "azure_persistent_rdma_naming.timer"]
+        self.assertEqual(enabled[0].kwargs, {"service": "azure_persistent_rdma_naming.service",
+                                             "timer": "azure_persistent_rdma_naming.timer"})
         summary = info.call_args_list[-1]
         self.assertEqual(summary.args[1], "Persistent RDMA naming installed")
         self.assertEqual(summary.kwargs["rdma_core_version"], _VERSION)
+        self.assertEqual(summary.kwargs["timer"], "azure_persistent_rdma_naming.timer")
 
     # ---- configuration -----------------------------------------------------
-    def test_missing_config_or_component_dir_returns_3_before_downloading(self):
+    def test_missing_config_returns_3_before_downloading(self):
         envs = [dict(self.env, COMPONENT_VERSIONS="{}"),
                 dict(self.env, COMPONENT_VERSIONS=json.dumps(
-                    {"rdma_core": {"common": {"version": _VERSION}}})),   # no sha256
-                {k: v for k, v in self.env.items() if k != "COMPONENT_DIR"}]
+                    {"rdma_core": {"common": {"version": _VERSION}}}))]   # no sha256
         for env in envs:
             with self.subTest(env=env):
                 rc, fake, logs = self._install(env=env)
@@ -240,6 +276,13 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(fake.downloads, [])
                 self.assertEqual(fake.commands, [])
                 logs["error"].assert_called_once()
+
+    def test_component_dir_is_not_needed(self):
+        # Only the removed monitor installer needed it.
+        env = {k: v for k, v in self.env.items() if k != "COMPONENT_DIR"}
+        rc, fake, _ = self._install(env=env)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.commands, self._expected_commands())
 
     # ---- failures: each returns 3 and stops --------------------------------
     def test_failed_download_returns_3(self):
@@ -278,6 +321,14 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertEqual(fake.commands, self._expected_commands()[:2])
         self.assertIn("could not copy", logs["error"].call_args.args[1])
+
+    def test_unwritable_timer_returns_3_before_systemctl(self):
+        os.makedirs(self.timer)                  # a folder can't be opened for writing
+        rc, fake, logs = self._install()
+
+        self.assertEqual(rc, 3)
+        self.assertEqual(fake.commands, self._expected_commands()[:2])
+        self.assertIn(f"could not write {self.timer}", logs["error"].call_args.args[1])
 
     def test_unwritable_naming_script_returns_3_before_systemctl(self):
         missing_dir = os.path.join(self._tmp.name, "no-such-dir", "naming.sh")
