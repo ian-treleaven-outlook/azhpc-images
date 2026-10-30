@@ -6,8 +6,9 @@ Two kinds of test:
     waagent.service text edits, the `waagent --version` parser) are tested
     directly with realistic inputs. Their grep/sed/awk equivalents were
     compared against real bash in WSL with the same inputs.
-  * install() is tested with utils.process.exec_program (under run(),
-    systemctl() and extract_tarball()), download_and_verify, run_capture,
+  * install() is tested with exec_program (utils.process, under run(),
+    systemctl() and extract_tarball(), and utils.package_installer, under
+    update_packages()), download_and_verify, run_capture,
     write_component_version, time.sleep and utils.logger._log replaced by
     fakes. The conf file, the service file and the work directory point into
     a temporary directory, so the real file edits run without touching /etc,
@@ -282,11 +283,12 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_waagent, "_WORK_DIR", str(self.work)), \
              mock.patch.object(install_waagent, "backup_timestamp", return_value=_TIMESTAMP), \
              mock.patch("utils.process.exec_program", fake), \
+             mock.patch("utils.package_installer.exec_program", fake), \
              mock.patch("utils.download.download_and_verify", download), \
              mock.patch.object(install_waagent, "run_capture",
                                return_value=capture) as run_capture, \
-             mock.patch.object(install_waagent, "write_component_version",
-                               side_effect=write_error) as record, \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=write_error, return_value="/versions") as record, \
              mock.patch.object(install_waagent.time, "sleep") as sleep, \
              mock.patch("utils.logger._log", logs):
             rc = install_waagent.install(env)
@@ -488,7 +490,7 @@ class InstallTests(unittest.TestCase):
         self.conf = self.root / "missing-dir" / "waagent.conf"
         rc, m = self._install(_env("ubuntu24.04"))
         self.assertEqual(rc, 3)
-        self.assertIn("Extensions.GoalStatePeriod", m["logs"].at("error")[-1].message)
+        self.assertIn(f"could not write {self.conf}", m["logs"].at("error")[-1].message)
         m["run_capture"].assert_not_called()
 
     def test_unwritable_versions_file_returns_3(self):
@@ -518,10 +520,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((ipoib["network_mode"], ipoib["uses_ipoib"]), ("standard_ib", True))
         conf = [r.fields for r in infos if r.fields.get("key") == "OS.EnableRDMA"]
         self.assertEqual(conf[0]["action"], "replaced")
-        self.assertIn(f"{self.service}.bak.{_TIMESTAMP}",
-                      [r.fields.get("backup") for r in infos])
-        self.assertIn({"component": "WAAGENT", "version": "2.15.0.1"},
-                      [r.fields for r in infos])
+        self.assertIn((str(self.service), f"{self.service}.bak.{_TIMESTAMP}"),
+                      [(r.fields.get("source"), r.fields.get("path")) for r in infos])
+        self.assertIn(("WAAGENT", "2.15.0.1"),
+                      [(r.fields.get("component"), r.fields.get("version")) for r in infos])
         summary = infos[-1]
         self.assertEqual(summary.message, "WALinuxAgent 2.15.0.1 installed and configured")
         self.assertEqual(summary.fields["waagent_extensions"], "2.15.1.3")

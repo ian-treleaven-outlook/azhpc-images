@@ -51,16 +51,16 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import time
 from datetime import datetime
 
-from utils.component_config import DEFAULT_NODE_TYPE, require_config, write_component_version
+from utils.component_config import DEFAULT_NODE_TYPE, record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths
+from utils.files import copy_file, edit_file, extract_tarball, remove_paths
 from utils.logger import log_debug, log_error, log_info, log_warn
-from utils.process import run, run_all, run_capture
+from utils.package_installer import update_packages
+from utils.process import run_all, run_capture
 from utils.services import systemctl
 from utils.sku import sku_network_mode, sku_uses_ipoib
 
@@ -236,74 +236,49 @@ def backup_timestamp() -> str:
 # --------------------------------------------------------------------------- #
 # File edits
 # --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: edit_file(path, edit, op, create=False) ->
-# bool — sed -i style read/modify/write that round-trips the bytes unchanged.
-def _edit_file(path: str, edit, *, create: bool = False) -> tuple[str | None, int]:
-    """Apply `edit(text) -> (new_text, count)` to `path` in place, like `sed -i`.
-
-    Returns (old text, count); old text is None if `create` let a missing file
-    read as empty (bash's `echo >>` creates it). Raises OSError. newline=""
-    and surrogateescape keep "\\r\\n" and non-UTF-8 bytes as they were, so
-    only what sed would change changes.
-    """
-    try:
-        with open(path, encoding="utf-8", errors="surrogateescape", newline="") as handle:
-            text = handle.read()
-    except FileNotFoundError:
-        if not create:
-            raise
-        text = None
-    new_text, count = edit(text or "")
-    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-        handle.write(new_text)
-    return text, count
-
-
 def _set_conf(key: str, value: str) -> bool:
-    """Set one waagent.conf key (bash's update_waagent_conf) and log what changed."""
-    try:
-        old, replaced = _edit_file(
-            _WAAGENT_CONF, lambda text: update_waagent_conf_text(text, key, value), create=True)
-    except OSError as exc:
-        log_error(_OP, f"could not set {key}={value} in {_WAAGENT_CONF}: {exc}",
-                  path=_WAAGENT_CONF, key=key, value=value)
-        return False
-    action = "replaced" if replaced else ("appended" if old is not None else "created")
-    if action == "appended" and old and not old.endswith("\n"):
-        log_warn(_OP, f"{_WAAGENT_CONF} did not end with a newline, so {key} was glued "
-                      "onto its last line, as bash's `echo >>` does",
-                 path=_WAAGENT_CONF, key=key, value=value)
-    log_info(_OP, f"Set {key}={value} in {_WAAGENT_CONF} ({action})",
-             path=_WAAGENT_CONF, key=key, value=value, action=action,
-             lines_replaced=replaced)
-    return True
+    """Set one waagent.conf key (bash's update_waagent_conf) and log what changed.
+
+    A missing file is created, as bash's `echo >>` does.
+    """
+    existed = os.path.exists(_WAAGENT_CONF)
+
+    def edit(text: str) -> str:
+        new_text, replaced = update_waagent_conf_text(text, key, value)
+        action = "replaced" if replaced else ("appended" if existed else "created")
+        if action == "appended" and text and not text.endswith("\n"):
+            log_warn(_OP, f"{_WAAGENT_CONF} did not end with a newline, so {key} was "
+                          "glued onto its last line, as bash's `echo >>` does",
+                     path=_WAAGENT_CONF, key=key, value=value)
+        log_info(_OP, f"Setting {key}={value} in {_WAAGENT_CONF} ({action})",
+                 path=_WAAGENT_CONF, key=key, value=value, action=action,
+                 lines_replaced=replaced)
+        return new_text
+    return edit_file(_WAAGENT_CONF, edit, _OP, create=True)
 
 
 def _apply_conf(settings) -> bool:
     return all(_set_conf(key, value) for key, value in settings)
 
 
-def _retarget_service_file() -> bool:
-    """Back up waagent.service and point its ExecStart at python3.12 (EL9)."""
-    backup = f"{_WAAGENT_SERVICE_FILE}.bak.{backup_timestamp()}"
-    try:
-        shutil.copy(_WAAGENT_SERVICE_FILE, backup)       # contents + mode, like `cp`
-        log_info(_OP, f"Backed up {_WAAGENT_SERVICE_FILE} to {backup}",
-                 path=_WAAGENT_SERVICE_FILE, backup=backup)
-        _, changed = _edit_file(_WAAGENT_SERVICE_FILE, retarget_exec_start)
-    except OSError as exc:
-        log_error(_OP, f"could not edit {_WAAGENT_SERVICE_FILE}: {exc}",
-                  path=_WAAGENT_SERVICE_FILE, backup=backup)
-        return False
+def _retarget_exec_start_text(text: str) -> str:
+    """The edit_file transform for waagent.service; warns when nothing matches."""
+    new_text, changed = retarget_exec_start(text)
     if changed:
-        log_info(_OP, f"Edited {_WAAGENT_SERVICE_FILE}: ExecStart now runs waagent "
-                      "with python3.12",
-                 path=_WAAGENT_SERVICE_FILE, action="edited", lines_changed=changed)
+        log_info(_OP, f"Editing {_WAAGENT_SERVICE_FILE}: ExecStart now runs waagent "
+                      "with python3.12", path=_WAAGENT_SERVICE_FILE, lines_changed=changed)
     else:
         log_warn(_OP, f"No '{_EXEC_START_OLD}' line in {_WAAGENT_SERVICE_FILE}; "
                       "ExecStart left unchanged (bash's sed does the same)",
                  path=_WAAGENT_SERVICE_FILE, lines_changed=0)
-    return True
+    return new_text
+
+
+def _retarget_service_file() -> bool:
+    """Back up waagent.service and point its ExecStart at python3.12 (EL9)."""
+    backup = f"{_WAAGENT_SERVICE_FILE}.bak.{backup_timestamp()}"
+    return (copy_file(_WAAGENT_SERVICE_FILE, backup, _OP)      # contents + mode, like `cp`
+            and edit_file(_WAAGENT_SERVICE_FILE, _retarget_exec_start_text, _OP))
 
 
 # --------------------------------------------------------------------------- #
@@ -313,8 +288,7 @@ def _update_from_distro_repo(env: dict[str, str], distro: Distro) -> bool:
     """Bash's azurelinux branch: dnf update, then the Azure Linux conf keys."""
     log_info(_OP, "Updating WALinuxAgent from the Azure Linux repository",
              distro=str(distro), method="dnf update", source="distro repository")
-    # TODO(ADO 1001): toolkit candidate: update_packages(packages, env, op) — `dnf update -y`.
-    if not run(["dnf", "update", "-y", "WALinuxAgent"], _OP, env=env):
+    if not update_packages(["WALinuxAgent"], env, _OP):
         return False
     entry = unused_azure_linux_entry(env, distro)
     if entry is not None:
@@ -406,16 +380,9 @@ def _record_versions(env: dict[str, str], branch: str) -> tuple[str, str] | None
         log_error(_OP, f"unexpected `{' '.join(command)}` output: {output.strip()!r}",
                   waagent=versions[0], waagent_extensions=versions[1])
         return None
-    for component, version in zip(("WAAGENT", "WAAGENT_EXTENSIONS"), versions):
-        # TODO(ADO 1001): toolkit candidate: record_version(component, version, op)
-        # -> bool — write_component_version that logs instead of raising.
-        try:
-            write_component_version(component, version)
-        except OSError as exc:
-            log_error(_OP, f"could not record {component}={version}: {exc}",
-                      component=component, version=version)
-            return None
-        log_info(_OP, f"Recorded {component}={version}", component=component, version=version)
+    if not all(record_version(component, version, _OP)
+               for component, version in zip(("WAAGENT", "WAAGENT_EXTENSIONS"), versions)):
+        return None
     return versions
 
 
