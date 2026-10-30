@@ -255,7 +255,8 @@ class InstallTests(unittest.TestCase):
 
         wrote = [(c.kwargs["path"], c.kwargs["action"])
                  for c in logs["files_info"].call_args_list]
-        self.assertEqual(wrote, [(self.naming, "created"), (self.service, "created"),
+        self.assertEqual(wrote, [(os.path.join(self.sbin, f"rdma_rename_{_VERSION}"), "created"),
+                                 (self.naming, "created"), (self.service, "created"),
                                  (self.timer, "created")])
 
         enabled = [c for c in info.call_args_list if c.args[1] ==
@@ -324,7 +325,7 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertEqual(fake.commands, self._expected_commands()[:2])
-        self.assertIn("could not copy", logs["error"].call_args.args[1])
+        self.assertIn("could not copy", logs["files_error"].call_args.args[1])
 
     def test_unwritable_timer_returns_3_before_systemctl(self):
         os.makedirs(self.timer)                  # a folder can't be opened for writing

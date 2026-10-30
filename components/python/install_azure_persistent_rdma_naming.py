@@ -43,7 +43,7 @@ Deliberate differences
     (bash would fetch "vnull.tar.gz").
   * The tarball is downloaded straight into /tmp (bash downloads into its
     current folder, then moves it there).
-  * `cp` is shutil.copy, which also copies the built file's mode: a new file
+  * `cp` is copy_file (shutil.copy), which also copies the built file's mode: a new file
     gets 0755 either way, but an existing rdma_rename_<version> gets the
     built mode too, where `cp` would have kept the old one.
 """
@@ -51,11 +51,10 @@ Deliberate differences
 from __future__ import annotations
 
 import os
-import shutil
 
 from utils.component_config import require_config
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths, write_file
+from utils.files import copy_file, extract_tarball, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
 from utils.process import run
 from utils.services import systemctl
@@ -207,20 +206,6 @@ def _unpack(src_dir: str, tarball: str, env: dict[str, str]) -> bool:
                            cwd=_WORK_DIR, env=env)
 
 
-# TODO(ADO 1001): toolkit candidate: copy_file(src, dest, op, *, mode=None) -> bool
-# (bash `cp`, logging the copy and its errors).
-def _copy(source: str, target: str) -> bool:
-    """bash `cp source target` (shutil.copy: content and mode bits)."""
-    try:
-        shutil.copy(source, target)
-    except OSError as exc:
-        log_error(_OP, f"could not copy {source} to {target}: {exc}",
-                  source=source, path=target)
-        return False
-    log_info(_OP, f"Installed {target}", source=source, path=target)
-    return True
-
-
 def _build_rdma_rename(version: str, sha256: str, env: dict[str, str]) -> bool:
     """Step 1: download and build rdma-core, install rdma_rename_<version>."""
     tarball = tarball_name(version)
@@ -229,8 +214,8 @@ def _build_rdma_rename(version: str, sha256: str, env: dict[str, str]) -> bool:
     src_dir = os.path.join(_WORK_DIR, _SRC_DIR_NAME)
     if not (_unpack(src_dir, tarball, env)
             and run(["bash", "build.sh"], _OP, cwd=src_dir, env=env)
-            and _copy(os.path.join(src_dir, "build", "bin", "rdma_rename"),
-                      rdma_rename_path(version))):
+            and copy_file(os.path.join(src_dir, "build", "bin", "rdma_rename"),
+                          rdma_rename_path(version), _OP)):
         return False
     remove_paths(src_dir, op=_OP)
     log_info(_OP, f"Removed build folder {src_dir}; {tarball} is left in "
