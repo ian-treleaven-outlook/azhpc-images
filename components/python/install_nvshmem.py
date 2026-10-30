@@ -59,11 +59,14 @@ meaningless version. Python stops with an error (return 3) instead:
   * `dnf list installed` / `apt list --installed` failing, or its output not
     containing the package. In bash only the last command of a pipeline decides
     the exit status, so `set -e` doesn't notice; the version is just empty.
+  * The Azure Linux install goes through install_packages() (the shared
+    package-manager abstraction); the dnf command it runs is bash's, unchanged.
 
 Known quirk kept for parity
 ---------------------------
 The Ubuntu `apt install` has no `-y`. See _install_ubuntu() for what that means;
-a warning is logged before it runs.
+a warning is logged before it runs. install_packages() always adds -y, so this
+one install is still a hand-built apt command.
 """
 
 # Lets type hints such as `str | None` work on Python versions older than 3.10.
@@ -73,6 +76,7 @@ from collections.abc import Callable
 
 from utils.component_config import config_for, write_component_version
 from utils.logger import log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py. Every log line from this module uses it.
@@ -187,15 +191,13 @@ def parse_apt_version(apt_output: str, cuda_major: str) -> str | None:
 # --------------------------------------------------------------------------- #
 def _install_azure_linux(cuda_major: str, env: dict[str, str]) -> str | None:
     """Azure Linux 3.0: dnf install from NVIDIA's RHEL 9 sbsa repo."""
-    command = [
-        "dnf", "install", "-y", "--nogpgcheck",
-        f"--repofrompath={_CUDA_REPO_ID},{_CUDA_REPO_URL}",
+    packages = [
         f"libnvshmem3-cuda-{cuda_major}",
         f"libnvshmem3-devel-cuda-{cuda_major}",
         f"libnvshmem3-static-cuda-{cuda_major}",
     ]
-    if exec_program(command, _OP, env=env) != 0:
-        log_error(_OP, "dnf could not install the NVSHMEM packages")
+    options = ["--nogpgcheck", f"--repofrompath={_CUDA_REPO_ID},{_CUDA_REPO_URL}"]
+    if not install_packages(packages, env, _OP, options=options):
         return None
 
     # run_capture() returns the exit code and stdout. stderr is logged but not
@@ -220,6 +222,8 @@ def _install_ubuntu(cuda_major: str, env: dict[str, str]) -> str | None:
     # "Abort." and fails; we then return 3. Bash stops the same way when its
     # stdin is at end-of-file. Adding -y would change behavior, so this is
     # flagged for review instead.
+    # TODO(ADO 991): install_packages() always adds -y, so this install stays
+    # a hand-built apt command until the quirk is decided.
     command = [
         "apt", "install",
         f"libnvshmem3-cuda-{cuda_major}",
