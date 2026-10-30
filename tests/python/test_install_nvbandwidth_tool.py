@@ -2,11 +2,12 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_commands, configured_ref, configured_commit,
+  * The pure helpers (dependency_packages, configured_ref, configured_commit,
     build_script) are tested directly. configured_ref/configured_commit were
     also compared with real jq/bash in WSL on the same configs.
-  * install() is tested with exec_program replaced by a fake that records each
-    command and imitates its effect on disk: `git clone` creates the source
+  * install() is tested with exec_program (the module's and
+    utils.package_installer's, which runs the dependency installs) replaced
+    by one fake that records each command and imitates its effect on disk: `git clone` creates the source
     directory and the `bash -c` build creates the nvbandwidth binary.
     write_repo_source_info is mocked and recorded in the same list, so the
     order is checked. The install paths (_DEST_DIR, _WORK_DIR) point into a
@@ -30,6 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvbandwidth_tool as m
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-nvbandwidth"
@@ -38,10 +40,16 @@ _COMMIT = "4a49bdae82d69e69330a88746cb12b449796ee8b"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_UBUNTU_DEPS = [["apt", "install", "-y", "libboost-program-options-dev"]]
-_DNF_BOOST = [["dnf", "-y", "install", "boost-devel"]]
-_AZL_ARM_DEPS = [["dnf", "install", "-y", "boost-devel", "boost-program-options"],
-                 ["dnf", "install", "-y", "cmake"]]
+# Package lists, one per bash install command.
+_UBUNTU_PACKAGES = [["libboost-program-options-dev"]]
+_DNF_BOOST_PACKAGES = [["boost-devel"]]
+_AZL_ARM_PACKAGES = [["boost-devel", "boost-program-options"], ["cmake"]]
+# The commands install_packages() runs for them.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
+_UBUNTU_DEPS = [[*_APT, *p] for p in _UBUNTU_PACKAGES]
+_DNF_BOOST = [[*_DNF, *p] for p in _DNF_BOOST_PACKAGES]
+_AZL_ARM_DEPS = [[*_DNF, *p] for p in _AZL_ARM_PACKAGES]
 
 
 class _FakeExec:
@@ -93,14 +101,14 @@ def _env(distribution="ubuntu24.04", arch="aarch64", *, config=None, node_type=N
 # Pure helpers.
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
-    def test_dependency_commands_follow_bash_branches(self):
-        deps = m.dependency_commands
-        self.assertEqual(list(deps("ubuntu24.04", "aarch64")), _UBUNTU_DEPS)
-        self.assertEqual(list(deps("ubuntu26.04", "x86_64")), _UBUNTU_DEPS)
-        self.assertEqual(list(deps("almalinux9.8", "x86_64")), _DNF_BOOST)
-        self.assertEqual(list(deps("almalinux8.10", "x86_64")), _DNF_BOOST)
-        self.assertEqual(list(deps("azurelinux3.0", "x86_64")), _DNF_BOOST)
-        self.assertEqual(list(deps("azurelinux3.0", "aarch64")), _AZL_ARM_DEPS)
+    def test_dependency_packages_follow_bash_branches(self):
+        deps = m.dependency_packages
+        self.assertEqual(list(deps("ubuntu24.04", "aarch64")), _UBUNTU_PACKAGES)
+        self.assertEqual(list(deps("ubuntu26.04", "x86_64")), _UBUNTU_PACKAGES)
+        self.assertEqual(list(deps("almalinux9.8", "x86_64")), _DNF_BOOST_PACKAGES)
+        self.assertEqual(list(deps("almalinux8.10", "x86_64")), _DNF_BOOST_PACKAGES)
+        self.assertEqual(list(deps("azurelinux3.0", "x86_64")), _DNF_BOOST_PACKAGES)
+        self.assertEqual(list(deps("azurelinux3.0", "aarch64")), _AZL_ARM_PACKAGES)
         for other in ("rocky9.8", "rhel9.8", "azurelinux3.1", ""):
             with self.subTest(distribution=other):
                 self.assertEqual(deps(other, "x86_64"), ())
@@ -192,6 +200,9 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(m, "_DEST_DIR", str(self.dest)), \
              mock.patch.object(m, "_WORK_DIR", str(self.work)), \
              mock.patch.object(m, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(m, "write_repo_source_info", side_effect=fake_source), \
              mock.patch.object(m, "write_component_version",
                                side_effect=write_error) as record, \
@@ -200,7 +211,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(m, "log_error") as log_error:
             rc = m.install(env)
         return rc, fake, {"record": record, "info": log_info, "warn": log_warn,
-                          "error": log_error}
+                          "error": log_error, "pkg_error": pkg_error}
 
     def _build_calls(self, *, ref="v0.9", commit=_COMMIT):
         calls = [(["git", "clone", "--branch", ref, _URL], str(self.work))]
@@ -316,7 +327,8 @@ class InstallTests(unittest.TestCase):
                 self.assertIsInstance(fake.calls[-1][0], list)
                 self.assertFalse((self.dest / "nvbandwidth").exists())
                 mocks["record"].assert_not_called()
-                mocks["error"].assert_called_once()
+                # install_packages() logs a failing dependency install itself.
+                mocks["pkg_error" if fail_at < 2 else "error"].assert_called_once()
 
     def test_repo_source_failure_returns_3(self):
         for result in (False, PermissionError("denied")):
