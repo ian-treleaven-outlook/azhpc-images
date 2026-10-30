@@ -360,9 +360,10 @@ class LibfabricInstallTests(unittest.TestCase):
 
         with mock.patch.object(install_libfabric, "fetch_verified",
                                return_value=self._TARBALL) as dl, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv, \
+             mock.patch("utils.component_config.write_component_version") as wcv, \
+             mock.patch("utils.component_config.log_info"), \
              mock.patch.object(install_libfabric, "remove_paths") as rm, \
-             mock.patch.object(install_libfabric.os, "cpu_count", return_value=8), \
+             mock.patch.object(install_libfabric, "cpu_count", return_value=8), \
              mock.patch("utils.process.exec_program", side_effect=record):
             rc = install_libfabric.install(self._env())
         return rc, commands, dl, wcv, rm
@@ -387,10 +388,22 @@ class LibfabricInstallTests(unittest.TestCase):
     def test_install_stops_on_download_failure(self):
         with mock.patch.object(install_libfabric, "fetch_verified", return_value=None), \
              mock.patch("utils.process.exec_program") as ex, \
-             mock.patch.object(install_libfabric, "write_component_version") as wcv:
+             mock.patch("utils.component_config.write_component_version") as wcv:
             self.assertEqual(install_libfabric.install(self._env()), 3)
         ex.assert_not_called()
         wcv.assert_not_called()
+
+    def test_install_fails_when_the_version_cannot_be_recorded(self):
+        with mock.patch.object(install_libfabric, "fetch_verified",
+                               return_value=self._TARBALL), \
+             mock.patch("utils.component_config.write_component_version",
+                        side_effect=PermissionError("denied")), \
+             mock.patch("utils.component_config.log_error") as logged, \
+             mock.patch.object(install_libfabric, "remove_paths") as rm, \
+             mock.patch("utils.process.exec_program", return_value=0):
+            self.assertEqual(install_libfabric.install(self._env()), 3)
+        self.assertIn("denied", logged.call_args.args[1])
+        rm.assert_not_called()
 
     def test_install_fails_when_no_version(self):
         with mock.patch("utils.component_config.log_error") as logged:

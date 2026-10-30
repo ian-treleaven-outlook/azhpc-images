@@ -13,18 +13,19 @@ Deliberate differences from the bash
   * `tar -xvf` becomes `tar -xf` (extract_tarball; -v only printed names).
   * A missing version, url or sha256 fails the step up front; bash's `jq -r`
     would carry on with "null".
+  * `make -j$(nproc)` takes its job count from cpu_count() (the same
+    CPU-affinity count nproc prints).
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.download import fetch_verified
 from utils.files import extract_tarball, remove_paths
 from utils.logger import log_info
-from utils.process import run_all
+from utils.process import cpu_count, run_all
 
 _OP = "install-libfabric"
 _WORK_DIR = "/tmp"
@@ -53,11 +54,12 @@ def install(env: dict[str, str]) -> int:
         return 3
     # bash: LIBFABRIC_FOLDER=$(basename $URL .tar.bz2)
     source_dir = Path(_WORK_DIR) / Path(tarball).name.removesuffix(".tar.bz2")
-    if not run_all(build_commands(source_dir, os.cpu_count() or 1), _OP,
+    if not run_all(build_commands(source_dir, cpu_count()), _OP,     # make -j$(nproc)
                    cwd=str(source_dir), env=env):
         return 3
 
-    write_component_version("LIBFABRIC", version)
+    if not record_version("LIBFABRIC", version, _OP):
+        return 3
     remove_paths(source_dir, tarball, op=_OP)
     log_info(_OP, f"libfabric {version} installed to {_INSTALL_PREFIX}", version=version)
     return 0
