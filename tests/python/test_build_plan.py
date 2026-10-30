@@ -141,9 +141,6 @@ class InstallShParityTests(unittest.TestCase):
 # deliberate change that also updates this test.
 class ResyncTests(unittest.TestCase):
     EXPECTED = {
-        "install-pmix": "ADO 984",
-        "install-mpis": "ADO 984",
-        "install-mpifileutils": "ADO 984",
         "install-nv-driver": "ADO 985",
         "install-nv-grid": "ADO 985",
         "install-nvloom": "ADO 985",

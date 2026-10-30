@@ -10,6 +10,9 @@ packages, and records the PMIx version in the component-versions file.
 
 There is one handler per distro family, like install_doca.py:
 
+  * Ubuntu 26.04  nothing: it uses the PMIx 5 stack bundled with HPC-X
+                  (install_mpis builds Open MPI with its internal PMIx and
+                  records that version). No version is recorded here.
   * Ubuntu        add the Microsoft Slurm apt repo + a pin file, make sure the
                   Microsoft package-signing key is installed, then
                   `apt install` and `apt-mark hold` pmix=<version>.
@@ -18,10 +21,16 @@ There is one handler per distro family, like install_doca.py:
                   versions.json.
   * RHEL family   (AlmaLinux, Rocky, RHEL) add the Microsoft Slurm yum repo,
                   make sure the Microsoft repo package is installed, enable
-                  CRB (9) or PowerTools (8), then `dnf install
-                  pmix-<version>.el<major>`.
+                  the repo with the -devel packages (RHEL: the RHUI CodeReady
+                  Builder repo; otherwise CRB on 9, PowerTools on 8), then
+                  `dnf install pmix-<version>.el<major>`.
 
 The original bash, for comparison (abridged):
+
+    if [[ "$DISTRIBUTION" == "ubuntu26.04" ]]; then
+        echo "Ubuntu 26.04 uses the PMIx 5 stack bundled with HPC-X."
+        exit 0
+    fi
 
     pmix_metadata=$(get_component_config "pmix")
     PMIX_VERSION=$(jq -r '.version' <<< $pmix_metadata)
@@ -40,7 +49,7 @@ The original bash, for comparison (abridged):
         cp ${COMPONENT_DIR}/slurm-repo/slurm-u.pin /etc/apt/preferences.d/slurm-repository-pin-990
         if [ ! -e /etc/apt/sources.list.d/microsoft-prod.list ]; then
             curl -sSL -O https://packages.microsoft.com/config/ubuntu/$UBUNTU_VERSION/packages-microsoft-prod.deb
-            dpkg -i packages-microsoft-prod.deb
+            apt install -y ./packages-microsoft-prod.deb
             rm packages-microsoft-prod.deb
         fi
         apt update
@@ -59,7 +68,9 @@ The original bash, for comparison (abridged):
             rpm -i packages-microsoft-prod.rpm
             rm packages-microsoft-prod.rpm
         fi
-        if [[ $OS_MAJOR_VERSION == "9" ]]; then dnf config-manager --set-enabled crb
+        if [[ $DISTRIBUTION == rhel* ]]; then
+            dnf config-manager --set-enabled codeready-builder-for-rhel-${OS_MAJOR_VERSION}-${ARCHITECTURE}-rhui-rpms
+        elif [[ $OS_MAJOR_VERSION == "9" ]]; then dnf config-manager --set-enabled crb
         elif [[ $OS_MAJOR_VERSION == "8" ]]; then dnf config-manager --set-enabled powertools
         fi
         dnf update -y
@@ -84,9 +95,10 @@ Deliberate differences from bash
     set_properties.sh / _detect_distribution), so "ubuntu24.04" gives "24.04"
     and "almalinux9.8" / "rocky8.10" give major "9" / "8". This keeps the
     handlers testable without a fake /etc/os-release.
-  * An Ubuntu version other than 22.04/24.04 fails (returns 3) before touching
-    the system. Bash prints a message and carries on, writing a broken repo line
-    (empty repo name and signed-by path) into slurm.list.
+  * An Ubuntu version other than 22.04/24.04 (26.04 returns before this)
+    fails (returns 3) before touching the system. Bash prints a message and
+    carries on, writing a broken repo line (empty repo name and signed-by
+    path) into slurm.list.
   * A missing pmix version in versions.json fails up front on every distro
     (bash would continue with an empty version). Azure Linux ignores that
     version, as in bash, but versions.json always has one for it.
@@ -114,6 +126,8 @@ _OP = "install-pmix"
 
 # The only distro handled by the Azure Linux branch (an exact match, as in bash).
 _AZURE_LINUX = "azurelinux3.0"
+# Uses HPC-X's bundled PMIx 5, so this step does nothing there (exact match).
+_UBUNTU_26 = "ubuntu26.04"
 
 # ---- Ubuntu paths ---------------------------------------------------------
 # Module-level constants so the tests can point them at a temporary directory.
@@ -135,8 +149,9 @@ _UBUNTU_REPOS = {
     "22.04": ("slurm-ubuntu-jammy", "/etc/apt/trusted.gpg.d/microsoft-prod.gpg"),
 }
 
-# RHEL major version -> the extra repo that provides the -devel packages.
-# Other majors enable nothing, exactly like bash's if/elif.
+# RHEL major version -> the extra repo that provides the -devel packages, on
+# AlmaLinux/Rocky. Other majors enable nothing, exactly like bash's if/elif.
+# RHEL itself uses rhel_codeready_repo() instead.
 _RHEL_EXTRA_REPOS = {"9": "crb", "8": "powertools"}
 
 # The sed expression bash uses to cut the version out of a `dnf list installed`
@@ -178,6 +193,20 @@ def apt_source_line(architecture_distro: str, repo: str, signed_by: str) -> str:
     """The exact line bash's `echo ... > slurm.list` writes (echo adds the newline)."""
     return (f"deb [arch={architecture_distro} signed-by={signed_by}] "
             f"https://packages.microsoft.com/repos/{repo}/ insiders main\n")
+
+
+def rhel_extra_repo(distribution: str, major: str, architecture: str) -> str | None:
+    """The repo bash enables for the -devel packages, or None.
+
+    bash: if [[ $DISTRIBUTION == rhel* ]]; then
+              codeready-builder-for-rhel-${OS_MAJOR_VERSION}-${ARCHITECTURE}-rhui-rpms
+          elif [[ $OS_MAJOR_VERSION == "9" ]]; then crb
+          elif [[ $OS_MAJOR_VERSION == "8" ]]; then powertools
+    e.g. ("rhel9.6", "9", "x86_64") -> "codeready-builder-for-rhel-9-x86_64-rhui-rpms".
+    """
+    if distribution.startswith("rhel"):
+        return f"codeready-builder-for-rhel-{major}-{architecture}-rhui-rpms"
+    return _RHEL_EXTRA_REPOS.get(major)
 
 
 def azure_linux_pmix_version(dnf_output: str, architecture: str) -> str | None:
@@ -241,26 +270,36 @@ def pmix_match_count(dnf_output: str, architecture: str) -> int:
 def _run_all(commands: list[list[str]], env: dict[str, str]) -> bool:
     """Run commands in order, stopping at the first failure (like `set -e`)."""
     for command in commands:
-        if exec_program(command, _OP, env=env) != 0:
+        rc = exec_program(command, _OP, env=env)
+        if rc != 0:
+            log_error(_OP, f"`{' '.join(command)}` failed; stopping, as bash's set -e would",
+                      command=command[0], exit_code=rc)
             return False
     return True
 
 
-def _install_ms_repo_package(url: str, installer: list[str],
+def _install_ms_repo_package(url: str, install_command: list[str],
                              env: dict[str, str]) -> bool:
     """Download a packages-microsoft-prod package, install it, delete it.
 
-    Mirrors bash's  curl -sSL -O <url>; dpkg -i <file> (or rpm -i <file>);
-    rm <file>  — run inside our scratch work directory. `installer` is the
-    command before the file name, e.g. ["dpkg", "-i"].
+    Mirrors bash's  curl -sSL -O <url>; <install_command>; rm <file>  — run
+    inside our scratch work directory. `install_command` is the full install
+    command, e.g. ["apt", "install", "-y", "./packages-microsoft-prod.deb"]
+    (apt needs the "./" to treat the argument as a local file, not a package
+    name) or ["rpm", "-i", "packages-microsoft-prod.rpm"].
     """
     # The file name curl -O saves to: the last part of the URL.
     filename = url.rsplit("/", 1)[-1]
+    log_info(_OP, f"Installing the Microsoft repo package {filename} (sets up the "
+                  "packages.microsoft.com signing key)", url=url,
+             installer=" ".join(install_command))
     os.makedirs(_WORK_DIR, exist_ok=True)
     try:
         if exec_program(["curl", "-sSL", "-O", url], _OP, cwd=_WORK_DIR, env=env) != 0:
+            log_error(_OP, f"could not download {url}", url=url)
             return False
-        if exec_program([*installer, filename], _OP, cwd=_WORK_DIR, env=env) != 0:
+        if exec_program(install_command, _OP, cwd=_WORK_DIR, env=env) != 0:
+            log_error(_OP, f"could not install {filename}", command=install_command[0])
             return False
         # Mirrors `rm <file>`, which would stop the bash script if it failed.
         os.remove(os.path.join(_WORK_DIR, filename))
@@ -278,25 +317,39 @@ def _install_ubuntu(env: dict[str, str], version: str) -> str | None:
     distribution = env.get("DISTRIBUTION", "")
     ubuntu = ubuntu_version(distribution)
     if ubuntu not in _UBUNTU_REPOS:
-        log_error(_OP, f"{distribution} not supported for pmix installation.")
+        log_error(_OP, f"{distribution} not supported for pmix installation.",
+                  distro=distribution, supported=sorted(_UBUNTU_REPOS))
         return None
     repo, signed_by = _UBUNTU_REPOS[ubuntu]
+    log_info(_OP, f"Ubuntu {ubuntu}: Microsoft Slurm repo {repo}", handler="ubuntu",
+             ubuntu_version=ubuntu, repo=repo, signed_by=signed_by)
 
     # open(..., "w") replaces the file's contents, like bash's `>`.
+    action = "replaced" if os.path.lexists(_SLURM_APT_LIST) else "created"
+    line = apt_source_line(env.get("ARCHITECTURE_DISTRO", ""), repo, signed_by)
     with open(_SLURM_APT_LIST, "w", encoding="utf-8") as handle:
-        handle.write(apt_source_line(env.get("ARCHITECTURE_DISTRO", ""), repo, signed_by))
+        handle.write(line)
+    log_info(_OP, f"Wrote {_SLURM_APT_LIST} ({action})", path=_SLURM_APT_LIST,
+             action=action, content=line.strip())
 
     # copyfile copies the contents only, like plain `cp` onto a file.
     pin = os.path.join(env.get("COMPONENT_DIR", ""), "slurm-repo", "slurm-u.pin")
+    action = "replaced" if os.path.lexists(_SLURM_APT_PIN) else "created"
     shutil.copyfile(pin, _SLURM_APT_PIN)
+    log_info(_OP, f"Copied {pin} to {_SLURM_APT_PIN} ({action})", path=_SLURM_APT_PIN,
+             source=pin, action=action)
 
     # The Microsoft repo package (pre-installed on CycleCloud images) sets up
     # the gpg key that signs the Slurm repo. Generic marketplace images may lack it.
     if not os.path.exists(_MS_PROD_APT_LIST):
         url = (f"https://packages.microsoft.com/config/ubuntu/{ubuntu}/"
                "packages-microsoft-prod.deb")
-        if not _install_ms_repo_package(url, ["dpkg", "-i"], env):
+        if not _install_ms_repo_package(
+                url, ["apt", "install", "-y", "./packages-microsoft-prod.deb"], env):
             return None
+    else:
+        log_info(_OP, f"{_MS_PROD_APT_LIST} exists; the Microsoft repo package is "
+                      "already installed", path=_MS_PROD_APT_LIST)
 
     packages = [f"pmix={version}", "libevent-dev", "libhwloc-dev"]
     if not _run_all([
@@ -311,6 +364,9 @@ def _install_ubuntu(env: dict[str, str], version: str) -> str | None:
 
 
 def _install_azurelinux(env: dict[str, str], version: str) -> str | None:
+    log_info(_OP, "Azure Linux: installing pmix from the distro repos; recording the "
+                  "installed version, not versions.json's", handler="azurelinux",
+             versions_json_version=version)
     if not _run_all([
         ["dnf", "-y", "install", "pmix", "pmix-devel", "pmix-tools"],
         ["dnf", "-y", "install", "hwloc-devel", "libevent-devel", "munge-devel"],
@@ -325,8 +381,10 @@ def _install_azurelinux(env: dict[str, str], version: str) -> str | None:
         return None
     installed = azure_linux_pmix_version(output, env.get("ARCHITECTURE", ""))
     if installed is None:
-        log_error(_OP, "could not find the installed pmix version in `dnf list installed`")
+        log_error(_OP, "could not find the installed pmix version in `dnf list installed`",
+                  arch=env.get("ARCHITECTURE", ""))
         return None
+    log_info(_OP, f"dnf installed pmix {installed}", installed_version=installed)
     # BASH QUIRK (kept): with several matching lines, bash records only the
     # first line's version. Warn so the log shows a choice was made.
     matches = pmix_match_count(output, env.get("ARCHITECTURE", ""))
@@ -343,22 +401,34 @@ def _install_rhel(env: dict[str, str], version: str) -> str | None:
     if major is None:
         log_error(_OP, f"could not determine the OS major version from {distribution!r}")
         return None
+    architecture = env.get("ARCHITECTURE", "")
+    extra_repo = rhel_extra_repo(distribution, major, architecture)
+    log_info(_OP, f"RHEL family: {distribution} (EL{major}), extra repo "
+                  f"{extra_repo or 'none'}", handler="rhel", distro=distribution,
+             os_major=major, extra_repo=extra_repo or "none", arch=architecture)
 
     # If there is no slurm-el<major>.repo (an unsupported major version), this
     # raises FileNotFoundError, just as bash's cp would stop the script.
     repo_file = os.path.join(env.get("COMPONENT_DIR", ""), "slurm-repo",
                              f"slurm-el{major}.repo")
+    action = "replaced" if os.path.lexists(_SLURM_YUM_REPO) else "created"
     shutil.copyfile(repo_file, _SLURM_YUM_REPO)
+    log_info(_OP, f"Copied {repo_file} to {_SLURM_YUM_REPO} ({action})",
+             path=_SLURM_YUM_REPO, source=repo_file, action=action)
 
     if not os.path.exists(_MS_PROD_YUM_REPO):
         url = (f"https://packages.microsoft.com/config/rhel/{major}/"
                "packages-microsoft-prod.rpm")
-        if not _install_ms_repo_package(url, ["rpm", "-i"], env):
+        if not _install_ms_repo_package(url, ["rpm", "-i", "packages-microsoft-prod.rpm"],
+                                        env):
             return None
+    else:
+        log_info(_OP, f"{_MS_PROD_YUM_REPO} exists; the Microsoft repo package is "
+                      "already installed", path=_MS_PROD_YUM_REPO)
 
     commands = []
-    if major in _RHEL_EXTRA_REPOS:
-        commands.append(["dnf", "config-manager", "--set-enabled", _RHEL_EXTRA_REPOS[major]])
+    if extra_repo:
+        commands.append(["dnf", "config-manager", "--set-enabled", extra_repo])
     commands += [
         ["dnf", "update", "-y"],
         ["dnf", "-y", "install", f"pmix-{version}.el{major}",
@@ -374,14 +444,21 @@ def _install_rhel(env: dict[str, str], version: str) -> str | None:
 # --------------------------------------------------------------------------- #
 def install(env: dict[str, str]) -> int:
     """Install PMIx for this distro and record its version. Returns 0 or 3."""
+    distribution = env.get("DISTRIBUTION", "")
+    # Checked first, as in bash: no config is needed for Ubuntu 26.04.
+    if distribution == _UBUNTU_26:
+        log_info(_OP, "Ubuntu 26.04 uses the PMIx 5 stack bundled with HPC-X.",
+                 distro=distribution, skipped=True)
+        return 0
+
     cfg = config_for("pmix", env)
     # isinstance() guards against a config that isn't a JSON object.
     if not isinstance(cfg, dict) or not cfg.get("version"):
-        log_error(_OP, "could not resolve pmix version from versions.json")
+        log_error(_OP, "could not resolve pmix version from versions.json",
+                  distro=distribution)
         return 3
     version = str(cfg["version"])
 
-    distribution = env.get("DISTRIBUTION", "")
     if "ubuntu" in distribution:
         handler = _install_ubuntu
     elif distribution == _AZURE_LINUX:
@@ -389,15 +466,17 @@ def install(env: dict[str, str]) -> int:
     else:  # RHEL family: AlmaLinux, Rocky Linux, RHEL, etc.
         handler = _install_rhel
 
-    log_info(_OP, f"Installing PMIx on {distribution}")
+    log_info(_OP, f"Installing PMIx on {distribution}", distro=distribution,
+             version=version, handler=handler.__name__.removeprefix("_install_"))
     try:
         recorded = handler(env, version)
         if recorded is None:
             return 3
         write_component_version("PMIX", recorded)
+        log_info(_OP, f"Recorded PMIX={recorded}", component="PMIX", version=recorded)
     except OSError as exc:
         # File copies/writes under /etc and the versions file under /opt.
-        log_error(_OP, f"file operation failed: {exc}")
+        log_error(_OP, f"file operation failed: {exc}", path=getattr(exc, "filename", None))
         return 3
 
     log_info(_OP, f"Installed PMIx {recorded}")

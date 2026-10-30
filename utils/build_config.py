@@ -301,10 +301,8 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
              when=lambda c: nvidia(c) and c.gpu == "NCv6", resync="ADO 985"),
 
         # PMIX + MPI libraries
-        Step("install-pmix", "install_pmix.sh", action=install_pmix.install,
-             resync="ADO 984"),
-        Step("install-mpis", "install_mpis.sh", action=install_mpis.install,
-             resync="ADO 984"),
+        Step("install-pmix", "install_pmix.sh", action=install_pmix.install),
+        Step("install-mpis", "install_mpis.sh", action=install_mpis.install),
 
         # --- GB200 NVLink tools (need the driver and HPC-X) ---
         Step("install-nvshmem", "install_nvshmem.sh",
@@ -333,7 +331,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         Step("install-lustre", "install_lustre_client.sh",
              action=install_lustre_client.install, resync="ADO 988"),
         Step("install-mpifileutils", "install_mpifileutils.sh",
-             action=install_mpifileutils.install, resync="ADO 984"),
+             action=install_mpifileutils.install),
 
         # --- x86_64 libraries ---
         Step("install-amd-libs", "install_amd_libs.sh",

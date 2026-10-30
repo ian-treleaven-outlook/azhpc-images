@@ -4,6 +4,17 @@ Ports the whole install flow to Python: resolve the version from versions.json,
 install build dependencies, download + verify the source, extract it, build it,
 and clean up. Only the build step itself (module load + cmake + make) stays in
 Bash, because `module load` needs everything to run in one shell (see install()).
+
+Lustre support follows the bash exactly (upstream #598): it is OFF unless the
+Lustre client headers are installed (the Lustre client step runs just before
+this one):
+
+    LUSTRE_CMAKE_FLAG="OFF"
+    if [[ -f /usr/include/lustre/lustre_user.h ]]; then
+        LUSTRE_CMAKE_FLAG="ON"
+    fi
+    ...
+    cmake ... -DENABLE_LUSTRE="${LUSTRE_CMAKE_FLAG}" ...
 """
 
 from __future__ import annotations
@@ -22,6 +33,8 @@ from utils.logger import log_info, log_error
 _INSTALL_PREFIX = "/opt/mpifileutils"
 _BUILD_DIR = "/tmp/mpifileutils-build"
 _SRC_DIR = "/tmp/mpifileutils-src"
+# Building with Lustre support needs this header from the Lustre client.
+_LUSTRE_USER_H = "/usr/include/lustre/lustre_user.h"
 
 # Build dependencies, keyed by package manager.
 _DEPS = {
@@ -31,6 +44,11 @@ _DEPS = {
     "yum":     ["bzip2-devel", "libattr-devel", "libarchive-devel"],
     "dnf":     ["bzip2-devel", "libattr-devel", "libarchive-devel"],
 }
+
+def lustre_cmake_flag(header: str) -> str:
+    """bash's LUSTRE_CMAKE_FLAG: "ON" if `header` is a file (`[[ -f ]]`), else "OFF"."""
+    return "ON" if os.path.isfile(header) else "OFF"
+
 
 def install_deps(env: dict[str, str]) -> int:
     """Install mpifileutils build dependencies via PackageInstaller.
@@ -61,7 +79,13 @@ def install(env: dict[str, str]) -> int:
     url = cfg.get("url", "")
     sha256 = cfg.get("sha256", "")
 
-    log_info("install-mpifileutils", f"Installing mpifileutils {version}")
+    lustre = lustre_cmake_flag(_LUSTRE_USER_H)
+    log_info("install-mpifileutils", f"Installing mpifileutils {version}",
+             version=version, url=url, lustre=lustre)
+    log_info("install-mpifileutils",
+             f"Lustre support {lustre}: {_LUSTRE_USER_H} "
+             f"{'found' if lustre == 'ON' else 'not found'}",
+             lustre=lustre, header=_LUSTRE_USER_H)
 
     # 1. build dependencies
     if install_deps(env) != 0:
@@ -90,7 +114,7 @@ def install(env: dict[str, str]) -> int:
         "module load mpi/hpcx\n"
         f'cmake "{source_dir}" '
         f'-DCMAKE_INSTALL_PREFIX="{_INSTALL_PREFIX}" '
-        "-DENABLE_XATTRS=ON -DENABLE_LIBARCHIVE=ON -DENABLE_LUSTRE=OFF "
+        f'-DENABLE_XATTRS=ON -DENABLE_LIBARCHIVE=ON -DENABLE_LUSTRE="{lustre}" '
         "-DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5\n"
         'make -j"$(nproc)"\n'
         "make install\n"
@@ -112,5 +136,6 @@ def install(env: dict[str, str]) -> int:
     write_component_version("MPIFILEUTILS", version)
 
     log_info("install-mpifileutils",
-             f"mpifileutils {version} installed to {_INSTALL_PREFIX}")
+             f"mpifileutils {version} installed to {_INSTALL_PREFIX}",
+             version=version, path=_INSTALL_PREFIX, lustre=lustre)
     return 0

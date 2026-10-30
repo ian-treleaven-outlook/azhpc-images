@@ -5,7 +5,7 @@ Two kinds of test:
   * The pure helpers (version parsing, the apt source line, and the
     `dnf list installed | grep | sed` port) are tested directly with real inputs.
   * install() is tested per distro with its external effects mocked:
-    exec_program / run_capture (apt, dnf, curl, dpkg, rpm) and
+    exec_program / run_capture (apt, dnf, curl, rpm) and
     write_component_version. The /etc paths and the scratch work directory are
     module-level constants, which the tests point at a temporary directory, so
     the real repo/pin files are genuinely copied but nothing under /etc is touched.
@@ -78,6 +78,19 @@ class VersionHelperTests(unittest.TestCase):
                                          "/usr/share/keyrings/microsoft-prod.gpg"),
             "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] "
             "https://packages.microsoft.com/repos/slurm-ubuntu-noble/ insiders main\n")
+
+    def test_rhel_extra_repo_matches_the_bash_if_elif(self):
+        self.assertEqual(install_pmix.rhel_extra_repo("rhel9.6", "9", "x86_64"),
+                         "codeready-builder-for-rhel-9-x86_64-rhui-rpms")
+        self.assertEqual(install_pmix.rhel_extra_repo("rhel8.10", "8", "aarch64"),
+                         "codeready-builder-for-rhel-8-aarch64-rhui-rpms")
+        # rhel* wins over the major-version branches, for any major.
+        self.assertEqual(install_pmix.rhel_extra_repo("rhel10.0", "10", "x86_64"),
+                         "codeready-builder-for-rhel-10-x86_64-rhui-rpms")
+        self.assertEqual(install_pmix.rhel_extra_repo("almalinux9.8", "9", "x86_64"), "crb")
+        self.assertEqual(install_pmix.rhel_extra_repo("rocky9.6", "9", "x86_64"), "crb")
+        self.assertEqual(install_pmix.rhel_extra_repo("rocky8.10", "8", "x86_64"), "powertools")
+        self.assertIsNone(install_pmix.rhel_extra_repo("almalinux10.0", "10", "x86_64"))
 
 
 class AzureLinuxPmixVersionTests(unittest.TestCase):
@@ -206,7 +219,7 @@ class UbuntuTests(_InstallTestBase):
         self.assertEqual(commands, [
             ["curl", "-sSL", "-O",
              "https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb"],
-            ["dpkg", "-i", "packages-microsoft-prod.deb"],
+            ["apt", "install", "-y", "./packages-microsoft-prod.deb"],
             *self._APT,
         ])
         # The downloads run in the work dir, with the build env.
@@ -245,12 +258,30 @@ class UbuntuTests(_InstallTestBase):
         self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
         record.assert_not_called()
 
-    def test_dpkg_failure_returns_3_and_stops(self):
-        rc, commands, _, _, record = self._install(_env("ubuntu24.04"), fail_on=["dpkg"])
+    def test_ms_package_install_failure_returns_3_and_stops(self):
+        # bash (#622): apt install -y ./packages-microsoft-prod.deb (was dpkg -i).
+        rc, commands, _, _, record = self._install(
+            _env("ubuntu24.04"), fail_on=["apt", "install", "-y", "./packages-microsoft-prod.deb"])
 
         self.assertEqual(rc, 3)
-        self.assertEqual([c[0] for c in commands], ["curl", "dpkg"])
+        self.assertEqual([c[0] for c in commands], ["curl", "apt"])
+        self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
         record.assert_not_called()
+
+    def test_ubuntu26_uses_hpcx_pmix_and_does_nothing(self):
+        # Returns before the config lookup, so no pmix version is needed.
+        with mock.patch.object(install_pmix, "log_info") as info:
+            rc, commands, _, cap, record = self._install(_env("ubuntu26.04", pmix=False))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(commands, [])
+        cap.assert_not_called()
+        record.assert_not_called()
+        self.assertFalse(os.path.exists(self.paths["_SLURM_APT_LIST"]))
+        info.assert_called_once()
+        self.assertEqual(info.call_args.args[1],
+                         "Ubuntu 26.04 uses the PMIx 5 stack bundled with HPC-X.")
+        self.assertTrue(info.call_args.kwargs["skipped"])
 
     def test_apt_install_failure_returns_3_and_skips_the_hold(self):
         self._touch("_MS_PROD_APT_LIST")
@@ -391,6 +422,31 @@ class RhelTests(_InstallTestBase):
         self.assertEqual(self._read("_SLURM_YUM_REPO"), self._repo_text("8"))
         self.assertEqual(commands, self._expected("8", "powertools"))
         record.assert_called_once_with("PMIX", _VERSION)
+
+    def test_rhel_enables_the_rhui_codeready_builder_repo(self):
+        # bash (#620): RHEL uses codeready-builder-for-rhel-<major>-<arch>-rhui-rpms
+        # instead of crb/powertools.
+        for distro, arch, major in (("rhel9.6", "x86_64", "9"), ("rhel8.10", "aarch64", "8")):
+            with self.subTest(distro=distro):
+                self._touch("_MS_PROD_YUM_REPO")
+                rc, commands, _, _, record = self._install(_env(distro, architecture=arch))
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(self._read("_SLURM_YUM_REPO"), self._repo_text(major))
+                self.assertEqual(commands, self._expected(
+                    major, f"codeready-builder-for-rhel-{major}-{arch}-rhui-rpms"))
+                record.assert_called_once_with("PMIX", _VERSION)
+
+    def test_rhel_without_ms_repo_installs_rpm_first(self):
+        rc, commands, _, _, _ = self._install(_env("rhel9.6"))
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(commands[:3], [
+            ["curl", "-sSL", "-O",
+             "https://packages.microsoft.com/config/rhel/9/packages-microsoft-prod.rpm"],
+            ["rpm", "-i", "packages-microsoft-prod.rpm"],
+            ["dnf", "config-manager", "--set-enabled",
+             "codeready-builder-for-rhel-9-x86_64-rhui-rpms"]])
 
     def test_other_major_enables_no_extra_repo(self):
         # Fake component dir with a slurm-el7.repo, so the copy succeeds.
