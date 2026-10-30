@@ -59,9 +59,11 @@ Deliberate differences from bash
     driver version (part of the package names; not on Azure Linux, which
     globs over it) and, on Ubuntu, ARCHITECTURE_DISTRO; when the SHARP
     plugin is built, rdmasharpplugins.commit and its ref (.ref, else .branch).
-  * A failing or non-numeric `nproc` fails the step; a tarball that doesn't
-    produce nccl-<version>/ fails clearly; on Ubuntu 26.04 an empty
-    dpkg-query result fails (bash would record NCCL as "").
+  * A tarball that doesn't produce nccl-<version>/ fails clearly; on Ubuntu
+    26.04 an empty dpkg-query result fails (bash would record NCCL as "").
+  * `nproc` is cpu_count() (the same CPU-affinity count, without a process);
+    the dpkg-query read is installed_package_version()'s
+    `dpkg-query -W -f ${Version} libnccl2` (bash: -f='${Version}').
   * The SHARP ref and commit are shell-quoted (identical for normal refs).
   * Azure Linux is any azurelinux* distro (bash: == "azurelinux3.0").
 
@@ -82,15 +84,16 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from utils.component_config import config_for, require_config, write_component_version
+from utils.component_config import config_for, record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths
+from utils.files import extract_tarball, fresh_dir, remove_paths
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import (install_packages, installed_package_version,
+                                     remove_packages)
 from utils.package_pinning import dnf_pin_packages
-from utils.process import run, run_all, run_capture, run_script
-from utils.repo_source import write_repo_source_info
+from utils.process import cpu_count, run, run_all, run_script
+from utils.repo_source import git_clone, write_repo_source_info
 from utils.sku import NETWORK_MODE_STANDARD_IB, sku_network_mode
 
 _OP = "install-nccl"
@@ -134,8 +137,6 @@ _DEPS = {
 
 _APT_NCCL_PACKAGES = ["libnccl2", "libnccl-dev"]
 _APT_NCCL_HOLDS = [["apt-mark", "hold", "libnccl2"], ["apt-mark", "hold", "libnccl-dev"]]
-# bash: dpkg-query -W -f='${Version}' libnccl2 (the quotes stop bash expanding it).
-_DPKG_QUERY_NCCL = ["dpkg-query", "-W", "-f=${Version}", "libnccl2"]
 
 _COMMIT_HASH_RE = re.compile(r"[0-9a-f]{7,40}")
 
@@ -167,15 +168,6 @@ def download_url(version: str) -> str:
 def make_jobs(nproc: int) -> int:
     """bash: MAKE_JOBS=$(( $(nproc) > 1 ? $(nproc) - 1 : 1 )) (never -j 0)."""
     return nproc - 1 if nproc > 1 else 1
-
-
-def parse_nproc(output: str) -> int | None:
-    """`nproc` output as a positive number, else None."""
-    try:
-        value = int(output.strip())
-    except ValueError:
-        return None
-    return value if value >= 1 else None
 
 
 def apt_nccl_version(dpkg_query_output: str) -> str:
@@ -395,13 +387,9 @@ def _log_start(inputs: _Inputs) -> None:
              work_dir=_WORK_DIR)
 
 
-def _make_jobs(env: dict[str, str]) -> int | None:
-    """bash's MAKE_JOBS, from `nproc`; None (logged) if nproc fails."""
-    rc, output = run_capture(["nproc"], _OP, env=env)
-    nproc = parse_nproc(output) if rc == 0 else None
-    if nproc is None:
-        log_error(_OP, f"could not count CPUs with nproc (output {output.strip()!r})")
-        return None
+def _make_jobs() -> int:
+    """bash's MAKE_JOBS, from `nproc` (cpu_count())."""
+    nproc = cpu_count()
     jobs = make_jobs(nproc)
     log_info(_OP, f"Using make -j {jobs} ({nproc} CPUs, one left free)",
              nproc=nproc, jobs=jobs)
@@ -425,7 +413,7 @@ def install_deps(env: dict[str, str]) -> int:
     return 0
 
 
-def _prepare_work_dir(version: str | None) -> None:
+def _prepare_work_dir(version: str | None) -> bool:
     leftovers = bash_leftovers(_BASH_TMP_DIR, version) if version else []
     if leftovers:
         log_warn(_OP, f"leftovers from an earlier bash install_nccl.sh run in "
@@ -434,8 +422,7 @@ def _prepare_work_dir(version: str | None) -> None:
     if os.path.lexists(_WORK_DIR):
         log_warn(_OP, f"removing leftovers of an interrupted run in {_WORK_DIR}",
                  path=_WORK_DIR)
-    remove_paths(_WORK_DIR, op=_OP)
-    os.makedirs(_WORK_DIR, exist_ok=True)
+    return fresh_dir(_WORK_DIR, _OP)
 
 
 def _install_apt_nccl(env: dict[str, str]) -> str | None:
@@ -448,14 +435,16 @@ def _install_apt_nccl(env: dict[str, str]) -> str | None:
         return None
     log_info(_OP, "Held libnccl2 and libnccl-dev with apt-mark",
              packages=_APT_NCCL_PACKAGES, held=True)
-    rc, output = run_capture(_DPKG_QUERY_NCCL, _OP, env=env)
-    version = apt_nccl_version(output) if rc == 0 else ""
+    installed = installed_package_version("libnccl2", env, _OP)
+    if installed is None:
+        return None
+    version = apt_nccl_version(installed)       # bash: | sed 's/+cuda.*//'
     if not version:
-        log_error(_OP, "could not read the installed libnccl2 version with dpkg-query",
-                  exit_code=rc, output=output.strip())
+        log_error(_OP, f"no NCCL version left in libnccl2's {installed!r}",
+                  dpkg_version=installed)
         return None
     log_info(_OP, f"Installed NCCL version is {version}", version=version,
-             version_source="dpkg-query", dpkg_version=output.strip())
+             version_source="dpkg-query", dpkg_version=installed)
     return version
 
 
@@ -573,10 +562,7 @@ def _build_sharp_plugin(env: dict[str, str], inputs: _Inputs) -> bool:
     action = "replaced" if conf_existed else "created"
     log_info(_OP, f"{action.capitalize()} {_LD_SO_CONF} ({_SHARP_PREFIX}/lib) and ran "
                   "ldconfig", path=_LD_SO_CONF, action=action)
-    write_component_version(_SHARP_COMPONENT, commit)
-    log_info(_OP, f"Recorded {_SHARP_COMPONENT}={commit}",
-             component=_SHARP_COMPONENT, version=commit)
-    return True
+    return record_version(_SHARP_COMPONENT, commit, _OP)
 
 
 def _sharp_plugin(env: dict[str, str], inputs: _Inputs) -> bool:
@@ -602,10 +588,9 @@ def _build_nccl_tests(env: dict[str, str], jobs: int) -> bool:
                       "fails if it is not empty", path=dest)
     log_info(_OP, f"Building nccl-tests with HPC-X MPI (make -j {jobs})",
              url=_NCCL_TESTS_GIT_URL, dest=dest, jobs=jobs, phase="nccl-tests")
-    if not run(["git", "clone", _NCCL_TESTS_GIT_URL], _OP, cwd=_WORK_DIR, env=env):
-        return False
-    if not write_repo_source_info(_NCCL_TESTS_COMPONENT,
-                                  os.path.join(_WORK_DIR, "nccl-tests"), _OP, env=env):
+    checkout = git_clone(_NCCL_TESTS_GIT_URL, _OP, cwd=_WORK_DIR, env=env)
+    if checkout is None or not write_repo_source_info(_NCCL_TESTS_COMPONENT, checkout,
+                                                      _OP, env=env):
         return False
     if not run_script(nccl_tests_lines(jobs), _OP, modules=_HPCX, cwd=_WORK_DIR, env=env):
         return False
@@ -615,8 +600,8 @@ def _build_nccl_tests(env: dict[str, str], jobs: int) -> bool:
 
 def _record_nccl(env: dict[str, str], distro: Distro, version: str) -> bool:
     """Record NCCL's version, then (Ubuntu 22.04) purge the build-time patchelf."""
-    write_component_version("NCCL", version)
-    log_info(_OP, f"Recorded NCCL={version}", component="NCCL", version=version)
+    if not record_version("NCCL", version, _OP):
+        return False
     if distro.name != _PURGE_PATCHELF_DISTRIBUTION:
         return True
     # patchelf is only needed at build time (the SHARP plugin's make install
@@ -624,8 +609,7 @@ def _record_nccl(env: dict[str, str], distro: Distro, version: str) -> bool:
     # CVE (USN-6036-1) whose fix needs Ubuntu Pro.
     log_info(_OP, f"{distro}: purging patchelf (build-time only; USN-6036-1 is "
                   "unfixed without Ubuntu Pro)", package="patchelf")
-    # TODO(ADO 1001): toolkit candidate: remove_packages(packages, env, op, purge=True)
-    return run(["apt-get", "purge", "-y", "patchelf"], _OP, env=env)
+    return remove_packages(["patchelf"], env, _OP, purge=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -637,13 +621,14 @@ def install(env: dict[str, str]) -> int:
     if inputs is None:
         return 3
     _log_start(inputs)
-    jobs = _make_jobs(env)
-    if jobs is None or install_deps(env) != 0:
+    jobs = _make_jobs()
+    if install_deps(env) != 0:
         return 3
 
     source_dir = os.path.join(_WORK_DIR, f"nccl-{inputs.version}")
     try:
-        _prepare_work_dir(inputs.version)
+        if not _prepare_work_dir(inputs.version):
+            return 3
         version = _install_nccl(env, inputs, source_dir, jobs)
         if version is None:
             return 3
@@ -652,7 +637,7 @@ def install(env: dict[str, str]) -> int:
         if not _record_nccl(env, inputs.distro, version):
             return 3
     except OSError as exc:
-        # Creating the work dir, or writing the versions file.
+        # write_repo_source_info raises if the versions file can't be written.
         log_error(_OP, f"file operation failed: {exc}",
                   path=getattr(exc, "filename", None))
         return 3
