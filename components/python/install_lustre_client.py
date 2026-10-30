@@ -89,12 +89,12 @@ import os
 import platform
 import re
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.dkms import check_dkms_status
 from utils.files import write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import install_packages, refresh_package_index
 from utils.process import run
 
 _OP = "install-lustre"
@@ -429,7 +429,7 @@ def _install_ubuntu(env: dict[str, str], version: str, kernel: str) -> str | Non
     # The userspace package goes before the DKMS config: it owns
     # /etc/sysconfig/dkms-lustre, and a pre-created conffile makes
     # noninteractive dpkg stop at a prompt.
-    installed = (run(["apt-get", "update"], _OP, env=env)
+    installed = (refresh_package_index(env, _OP)
                  and install_packages([f"lustre-client-{version}"], env, _OP)
                  and _configure_ubuntu_dkms(ubuntu_version, version)
                  and install_packages([f"amlfs-lustre-client-dkms-{version}"], env, _OP)
@@ -465,19 +465,6 @@ def _install_rhel(env: dict[str, str], version: str, kernel: str) -> str | None:
 _INSTALLERS = {"ubuntu": _install_ubuntu}
 
 
-def _record_version(version: str) -> bool:
-    """write_component_version("LUSTRE", ...), logging a file error."""
-    try:
-        write_component_version("LUSTRE", version)
-    except OSError as exc:
-        log_error(_OP, f"could not record LUSTRE={version}: {exc}",
-                  component="LUSTRE", version=version)
-        return False
-    log_info(_OP, f"Recorded LUSTRE version {version}", component="LUSTRE",
-             version=version)
-    return True
-
-
 def install(env: dict[str, str]) -> int:
     """Install the AMLFS Lustre client and record its version. Returns 0 or 3."""
     distro = Distro.from_env(env)
@@ -501,7 +488,7 @@ def install(env: dict[str, str]) -> int:
 
     installer = _INSTALLERS.get(distro.family, _install_rhel)
     recorded = installer(env, version, kernel)
-    if recorded is None or not _record_version(recorded):
+    if recorded is None or not record_version("LUSTRE", recorded, _OP):
         return 3
     log_info(_OP, "Lustre client installed", version=recorded, distro=distro.name,
              kernel=kernel)

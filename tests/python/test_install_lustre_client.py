@@ -246,8 +246,9 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(files, "log_error", log_error), \
              mock.patch.object(lustre, "check_dkms_status",
                                return_value=dkms_ok) as check, \
-             mock.patch.object(lustre, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(component_config, "log_info") as config_info, \
              mock.patch.object(lustre, "log_info") as log_info, \
              mock.patch.object(lustre, "log_warn") as log_warn, \
              mock.patch.object(lustre, "log_error", log_error):
@@ -257,7 +258,8 @@ class InstallTests(unittest.TestCase):
             self.assertIs(call.kwargs["env"], env)
         return rc, {"config_for": config_for, "exec": exec_program, "check": check,
                     "record": record, "info": log_info, "warn": log_warn,
-                    "error": log_error, "files_info": files_info}
+                    "error": log_error, "files_info": files_info,
+                    "config_info": config_info}
 
     @staticmethod
     def _commands(m):
@@ -323,8 +325,10 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._info_fields(m, "Ubuntu 24.04 (noble)")["codename"], "noble")
         apt_source = self.p("etc/apt/sources.list.d/amlfs.list")
         self.assertEqual(self._written(m, apt_source), "created")
-        self.assertEqual(self._info_fields(m, f"Recorded LUSTRE version {_NOBLE_V}"),
-                         {"component": "LUSTRE", "version": _NOBLE_V})
+        recorded = m["config_info"].call_args
+        self.assertEqual(recorded.args[1], f"Recorded LUSTRE {_NOBLE_V}")
+        self.assertEqual((recorded.kwargs["component"], recorded.kwargs["version"]),
+                         ("LUSTRE", _NOBLE_V))
         self.assertEqual(self._info_fields(m, "Lustre client installed"),
                          {"version": _NOBLE_V, "distro": "ubuntu24.04", "kernel": _KERNEL})
 
