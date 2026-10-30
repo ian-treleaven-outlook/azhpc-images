@@ -5,7 +5,7 @@
     script itself (components/install_rocm.sh), so an upstream change shows up
     here.
   * install() runs with every external effect mocked: config lookup, download,
-    exec_program (wget/gpg/udevadm/systemctl... in install_rocm, and the
+    exec_program (wget/gpg/udevadm/systemctl... through utils.process, and the
     apt-get/dnf installs in utils.package_installer, recorded in one ordered
     list), run_capture
     (dpkg-query), the DKMS check, the kernel version and the versions file.
@@ -27,8 +27,9 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_rocm
-from utils import package_installer
+from utils import component_config, download, files, package_installer, process
 from utils.build_config import BuildConfig, build_plan
+from utils.download import ChecksumError
 
 _REPO = Path(__file__).resolve().parents[2]
 _BASH = _REPO / "components" / "install_rocm.sh"
@@ -270,7 +271,9 @@ class InstallTests(unittest.TestCase):
         ] + _TAIL_UBUNTU
 
     def _download(self, url, sha256, dest_dir="."):
-        # Like the real helper: the file lands in dest_dir under the URL's name.
+        # Like the real helper: dest_dir is created and the file lands in it
+        # under the URL's name.
+        Path(dest_dir).mkdir(parents=True, exist_ok=True)
         path = Path(dest_dir) / Path(url).name
         path.write_bytes(b"deb")
         self.downloaded = path
@@ -278,9 +281,15 @@ class InstallTests(unittest.TestCase):
 
     def _install(self, distro, cfg, *, fail_on=None, rc=1, kernel=_KERNEL,
                  write_error=None, amdgpu_cfg=_AMDGPU_CFG, dkms_ok=True,
-                 dpkg=None, env_extra=None):
-        """Run install() with mocks; fail_on = a command (list) that returns rc."""
+                 dpkg=None, env_extra=None, watch=None):
+        """Run install() with mocks; fail_on = a command (list) that returns rc.
+
+        watch(command) is called before each command runs, to look at the
+        files at that point.
+        """
         def fake_exec(command, op, *, cwd=None, env=None):
+            if watch:
+                watch(command)
             if command == fail_on:
                 return rc
             if command[:2] == ["wget", "-O"]:
@@ -298,14 +307,16 @@ class InstallTests(unittest.TestCase):
 
         env = {"DISTRIBUTION": distro, "COMPONENT_DIR": str(self.component_dir)}
         env.update(env_extra or {})
-        # One mock for exec_program in both modules, so call_args_list is the
-        # ordered record of every command; install_packages() logs its own
-        # failures, so its log_error shares the module's mock too.
-        with mock.patch.object(install_rocm, "config_for", side_effect=fake_config) as config, \
-             mock.patch.object(install_rocm, "download_and_verify",
-                               side_effect=self._download) as download, \
-             mock.patch.object(install_rocm, "exec_program",
-                               side_effect=fake_exec) as run, \
+        # One mock for exec_program where commands run (utils.process for
+        # run/run_all/systemctl, utils.package_installer for installs), so
+        # call_args_list is the ordered record of every command. The toolkit
+        # helpers log their own results, so their log calls share the
+        # module's mocks too.
+        with mock.patch.object(component_config, "config_for",
+                               side_effect=fake_config) as config, \
+             mock.patch.object(download, "download_and_verify",
+                               side_effect=self._download) as fetch, \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec) as run, \
              mock.patch.object(package_installer, "exec_program", new=run), \
              mock.patch.object(install_rocm, "run_capture",
                                side_effect=fake_capture) as capture, \
@@ -318,9 +329,13 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_rocm, "log_warn") as warn, \
              mock.patch.object(install_rocm, "log_error") as error, \
              mock.patch.object(package_installer, "log_info"), \
-             mock.patch.object(package_installer, "log_error", new=error):
+             mock.patch.object(package_installer, "log_error", new=error), \
+             mock.patch.object(files, "log_info", new=info), \
+             mock.patch.object(files, "log_error", new=error), \
+             mock.patch.object(download, "log_error", new=error), \
+             mock.patch.object(component_config, "log_error", new=error):
             result = install_rocm.install(env)
-        self.run_mock, self.download, self.record = run, download, record
+        self.run_mock, self.download, self.record = run, fetch, record
         self.config, self.capture, self.dkms = config, capture, dkms
         self.info, self.warn, self.error = info, warn, error
         return result
@@ -343,6 +358,9 @@ class InstallTests(unittest.TestCase):
 
     def _patch_target(self):
         return Path(self.paths["_DKMS_PATCH_DIR"], "pci-resize-resource-exclude-bars.patch")
+
+    def _patch_source(self):
+        return os.path.join(str(self.component_dir), install_rocm._DKMS_PATCH_SOURCE)
 
     # ---- success paths ------------------------------------------------------
     def test_ubuntu_success(self):
@@ -378,27 +396,18 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu2204_adds_libstdcxx_12(self):
         self.assertEqual(self._install("ubuntu22.04", _UBUNTU_CFG), 0)
         self.assertEqual(self._commands(), _UBUNTU2204_COMMANDS)
-        self.assertIn("Ubuntu 22.04: also installing libstdc++-12-dev for hipcc",
+        self.assertIn("ubuntu22.04: also installing libstdc++-12-dev for hipcc",
                       self._info_messages())
 
     def test_ubuntu_dkms_patch_is_set_up_before_amdgpu_install(self):
         seen = {}
 
-        def fake_exec(command, op, *, cwd=None, env=None):
+        def watch(command):
             if command[0] == "amdgpu-install":
                 seen["conf"] = os.path.exists(self.paths["_DKMS_CONF_FILE"])
             elif command[0] == "apt-get" and command[-1].startswith("./"):
                 seen["conf_at_deb"] = os.path.exists(self.paths["_DKMS_CONF_FILE"])
-            return 0
-        with mock.patch.object(install_rocm, "exec_program", side_effect=fake_exec), \
-             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec):
-            env = {"DISTRIBUTION": "ubuntu24.04", "COMPONENT_DIR": str(self.component_dir)}
-            with mock.patch.object(install_rocm, "config_for", return_value=_UBUNTU_CFG), \
-                 mock.patch.object(install_rocm, "download_and_verify",
-                                   side_effect=self._download), \
-                 mock.patch.object(install_rocm, "write_component_version"), \
-                 mock.patch.object(install_rocm.platform, "release", return_value=_KERNEL):
-                self.assertEqual(install_rocm.install(env), 0)
+        self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG, watch=watch), 0)
         self.assertEqual(seen, {"conf_at_deb": False, "conf": True})
 
     def test_real_patch_file_is_copied_byte_for_byte(self):
@@ -443,24 +452,13 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu2604_dkms_patch_before_amdgpu_dkms_install(self):
         order = []
 
-        def watch(command, op, *, cwd=None, env=None):
+        def watch(command):
             if command == [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"]:
                 order.append(("dkms-install", os.path.exists(self.paths["_DKMS_CONF_FILE"])))
             if command == ["apt", "update"]:
                 order.append(("apt-update", os.path.exists(self.paths["_AMDGPU_LIST_FILE"]),
                               os.path.exists(self.paths["_DKMS_CONF_FILE"])))
-            return 0
-        with mock.patch.object(install_rocm, "exec_program", side_effect=watch), \
-             mock.patch.object(package_installer, "exec_program", side_effect=watch):
-            env = {"DISTRIBUTION": "ubuntu26.04", "COMPONENT_DIR": str(self.component_dir)}
-            with mock.patch.object(install_rocm, "config_for",
-                                   side_effect=lambda c, e: {"rocm": _U2604_CFG,
-                                                             "amdgpu": _AMDGPU_CFG}[c]), \
-                 mock.patch.object(install_rocm, "run_capture", return_value=(0, "1")), \
-                 mock.patch.object(install_rocm, "check_dkms_status", return_value=True), \
-                 mock.patch.object(install_rocm, "write_component_version"), \
-                 mock.patch.object(install_rocm.platform, "release", return_value=_KERNEL):
-                self.assertEqual(install_rocm.install(env), 0)
+        self.assertEqual(self._install("ubuntu26.04", _U2604_CFG, watch=watch), 0)
         # Sources written before apt update; DKMS config after it, before amdgpu-dkms.
         self.assertEqual(order, [("apt-update", True, False), ("dkms-install", True)])
 
@@ -480,9 +478,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn(f"Recorded AMDGPU={_AMDGPU_DPKG}", by_message)
         self.assertIn(f"Recorded RVS={_RVS_DPKG}", by_message)
         self.assertIn("Recorded ROCM=10.0.0", by_message)
-        self.assertEqual(by_message[f"Wrote {self.paths['_AMDGPU_LIST_FILE']}"]["action"],
-                         "created")
-        self.assertIn(f"Copied the amdgpu DKMS patch to {self._patch_target()} (created)",
+        self.assertEqual(by_message[f"Wrote {self.paths['_AMDGPU_LIST_FILE']} (created)"]
+                         ["action"], "created")
+        self.assertIn(f"Copied {self._patch_source()} to {self._patch_target()} (created)",
                       by_message)
         self.assertEqual(self._info_messages()[-1], "ROCm 10.0.0 installed and configured")
 
@@ -492,9 +490,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._read("_LD_SO_CONF_FILE"), "/opt/rocm/lib\n")
         self.assertEqual(self._read("_DKMS_CONF_FILE"), install_rocm._AMDGPU_DKMS_CONF)
         by_message = self._info_by_message()
-        self.assertEqual(by_message[f"Wrote {self.paths['_RVS_LIST_FILE']}"]["action"],
-                         "replaced")
-        self.assertIn(f"Copied the amdgpu DKMS patch to {self._patch_target()} (replaced)",
+        self.assertEqual(by_message[f"Wrote {self.paths['_RVS_LIST_FILE']} (replaced)"]
+                         ["action"], "replaced")
+        self.assertIn(f"Copied {self._patch_source()} to {self._patch_target()} (replaced)",
                       by_message)
 
     def test_azure_linux_success(self):
@@ -525,11 +523,11 @@ class InstallTests(unittest.TestCase):
         # "old" is not an [amd_rocm] section, so no rerun warning.
         self.assertEqual(self._warns_about("already has"), [])
         by_message = self._info_by_message()
-        self.assertEqual(by_message[f"Wrote {self.paths['_UDEV_RULES_FILE']}"]["action"],
-                         "replaced")
-        self.assertEqual(by_message[f"Appended to {self.paths['_AMD_ROCM_REPO_FILE']}"]
+        self.assertEqual(by_message[f"Wrote {self.paths['_UDEV_RULES_FILE']} (replaced)"]
+                         ["action"], "replaced")
+        self.assertEqual(by_message[f"Wrote {self.paths['_AMD_ROCM_REPO_FILE']} (appended)"]
                          ["action"], "appended")
-        self.assertEqual(by_message[f"Wrote {self.paths['_INIT_SCRIPT']}"]["action"],
+        self.assertEqual(by_message[f"Wrote {self.paths['_INIT_SCRIPT']} (created)"]["action"],
                          "created")
 
         Path(self.paths["_BLACKLIST_FILE"]).write_text("blacklist foo\n", encoding="utf-8")
@@ -599,9 +597,9 @@ class InstallTests(unittest.TestCase):
         packages = [kw for msg, kw in by_message.items()
                     if msg.startswith("Installing ROCm without MIVisionX")]
         self.assertEqual(packages[0]["packages"], _ROCM_PACKAGES)
-        self.assertIn(f"Wrote {self.paths['_UDEV_RULES_FILE']}", messages)
-        self.assertIn(f"Wrote {self.paths['_DKMS_CONF_FILE']}", messages)
-        self.assertIn(f"Appended to {self.paths['_BLACKLIST_FILE']}", messages)
+        self.assertIn(f"Wrote {self.paths['_UDEV_RULES_FILE']} (created)", messages)
+        self.assertIn(f"Wrote {self.paths['_DKMS_CONF_FILE']} (created)", messages)
+        self.assertIn(f"Wrote {self.paths['_BLACKLIST_FILE']} (created)", messages)
         self.assertIn("Recorded ROCM=6.4.4", messages)
         self.assertIn("Started and enabled rocmstartup.service", messages)
         self.assertEqual(messages[-1], "ROCm 6.4.4 installed and configured")
@@ -626,7 +624,7 @@ class InstallTests(unittest.TestCase):
     def test_ubuntu_missing_url_or_sha_returns_3(self):
         self.assertEqual(self._install("ubuntu24.04", {"version": "6.4.4"}), 3)
         self.download.assert_not_called()
-        self.assertIn("url/sha256", self.error.call_args.args[1])
+        self.assertIn("missing url, sha256", self.error.call_args.args[1])
 
     def test_ubuntu2604_missing_amdgpu_version_returns_3(self):
         for amdgpu_cfg in (None, {}, {"version": ""}):
@@ -634,7 +632,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(self._install("ubuntu26.04", _U2604_CFG,
                                                amdgpu_cfg=amdgpu_cfg), 3)
                 self.run_mock.assert_not_called()
-                self.assertIn("amdgpu driver version", self.error.call_args.args[1])
+                self.assertIn("'amdgpu' config", self.error.call_args.args[1])
 
     def test_ubuntu_missing_patch_returns_3_before_any_change(self):
         for distro, cfg in (("ubuntu24.04", _UBUNTU_CFG), ("ubuntu26.04", _U2604_CFG)):
@@ -652,9 +650,10 @@ class InstallTests(unittest.TestCase):
         self.run_mock.assert_not_called()
 
     def test_download_failure_returns_3(self):
-        with mock.patch.object(self, "_download", side_effect=RuntimeError("checksum")):
+        with mock.patch.object(self, "_download", side_effect=ChecksumError("checksum")):
             self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 3)
         self.run_mock.assert_not_called()
+        self.assertIn("download of", self.error.call_args.args[1])
         self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
 
     def test_each_failing_command_stops_the_step(self):
@@ -669,7 +668,7 @@ class InstallTests(unittest.TestCase):
                 with self.subTest(distro=distro, command=command):
                     self.assertEqual(self._install(distro, cfg, fail_on=command), 3)
                     self.assertEqual(self._commands(), commands[:index + 1])
-                    self.error.assert_called()
+                    # (The failure is logged by exec_program, mocked here.)
                     # ROCM is recorded only after the udev trigger, like bash.
                     trigger = commands.index(["sudo", "udevadm", "trigger"])
                     recorded = [c.args[0] for c in self.record.call_args_list]
@@ -710,10 +709,17 @@ class InstallTests(unittest.TestCase):
         os.makedirs(self.paths["_UDEV_RULES_FILE"])      # a directory can't be opened
         self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 3)
         self.assertNotIn(["udevadm", "control", "--reload-rules"], self._commands())
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not write", self.error.call_args.args[1])
 
     def test_dkms_conf_write_error_returns_3(self):
         os.makedirs(self.paths["_DKMS_CONF_FILE"])
+        self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 3)
+        self.assertNotIn(["amdgpu-install", "-y", "--usecase=graphics"], self._commands())
+        self.assertIn("could not write", self.error.call_args.args[1])
+        self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
+
+    def test_dkms_patch_copy_error_returns_3(self):
+        os.makedirs(self._patch_target())               # cp onto a directory fails
         self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 3)
         self.assertNotIn(["amdgpu-install", "-y", "--usecase=graphics"], self._commands())
         self.assertIn("file operation failed", self.error.call_args.args[1])
