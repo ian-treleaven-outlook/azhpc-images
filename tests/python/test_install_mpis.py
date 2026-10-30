@@ -405,8 +405,7 @@ class InstallTests(unittest.TestCase):
         for name, value in (("_INSTALL_PREFIX", self.opt), ("_WORK_DIR", self.work),
                             ("_ROCM_DIR", self.rocm), ("_LD_SO_CONF_DIR", self.ld_dir),
                             ("_PKGCONFIG_DIRS", (self.pc_lib,)),
-                            ("_PKGCONFIG_DIRS_RPM", (self.pc_lib, self.pc_lib64)),
-                            ("_PATCH_TMP_PARENT", self.patch_tmp)):
+                            ("_PKGCONFIG_DIRS_RPM", (self.pc_lib, self.pc_lib64))):
             patcher = mock.patch.object(mpis, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -431,8 +430,6 @@ class InstallTests(unittest.TestCase):
     def _fake_capture(self, command, op, *, cwd=None, env=None, failure_is_error=True):
         self.assertEqual(op, _OP)
         self.captures.append((command, cwd, env, failure_is_error))
-        if command == ["nproc"]:
-            return self.nproc
         if command[0].endswith("/ucx_info"):
             return self.ucx_info
         if command[0] == "ldd":
@@ -447,13 +444,13 @@ class InstallTests(unittest.TestCase):
 
     def _install(self, distro="ubuntu22.04", arch="x86_64", gpu="NVIDIA", sku="A100",
                  family=None, node_type="azure_vm_regular", configs=None,
-                 fail_on=None, nproc=(0, f"{_NPROC}\n"), pin_ok=True, download_error=None,
+                 fail_on=None, pin_ok=True, download_error=None,
                  write_error=None, extra_env=None, netlink=_BUGGY_NETLINK,
                  ucx_tarballs=("ucx-1.20.0.tar.gz",), ucx_info=(0, "# Library version: 1.20.0\n"),
                  ldd=None, pkg_config=(0, f"{_PMIX_INTERNAL}\n")):
         self.calls, self.captures, self.fail_on = [], [], fail_on
         self.netlink, self.ucx_info, self.ldd, self.pkg_config = netlink, ucx_info, ldd, pkg_config
-        self.nproc = nproc
+
         self.record_points = []
         configs = dict(_CONFIGS if configs is None else configs)
         env = {"DISTRIBUTION": distro, "ARCHITECTURE": arch, "GPU": gpu, "SKU": sku,
@@ -480,10 +477,11 @@ class InstallTests(unittest.TestCase):
             if write_error:
                 raise write_error
 
-        def fake_mkdtemp(dir=None):
-            # A fixed name, so a command list from one run matches the next.
-            self.assertEqual(dir, self.patch_tmp)
-            path = os.path.join(dir, "tmp.ucx")
+        def fake_mkdtemp(prefix=None, dir=None):
+            # A fixed name under the test's own dir, so a command list from
+            # one run matches the next.
+            self.assertIsNone(dir)
+            path = os.path.join(self.patch_tmp, "tmp.ucx")
             os.mkdir(path)
             return path
 
@@ -492,14 +490,15 @@ class InstallTests(unittest.TestCase):
         # failure shares one error mock, and write_file's "Wrote ..." lines go
         # to the same info mock as the step's own.
         info, warn, error, error_detail = (mock.MagicMock() for _ in range(4))
-        with mock.patch.object(mpis.tempfile, "mkdtemp", side_effect=fake_mkdtemp), \
+        with mock.patch.object(files.tempfile, "mkdtemp", side_effect=fake_mkdtemp), \
              mock.patch.object(component_config, "config_for",
                                side_effect=lambda c, e: configs.get(c)) as config, \
              mock.patch.object(download, "download_and_verify",
                                side_effect=fake_download) as download_mock, \
              mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(mpis, "run_capture", side_effect=self._fake_capture), \
-             mock.patch.object(mpis, "write_component_version",
+             mock.patch.object(mpis, "cpu_count", return_value=_NPROC), \
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=fake_record) as record, \
              mock.patch.object(mpis, "dnf_pin_packages", return_value=pin_ok) as pin, \
              mock.patch.object(mpis, "log_info", new=info), \
@@ -508,6 +507,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(mpis, "log_error_detail", new=error_detail), \
              mock.patch.object(files, "log_info", new=info), \
              mock.patch.object(files, "log_error", new=error), \
+             mock.patch.object(component_config, "log_info", new=info), \
              mock.patch.object(download, "log_error", new=error), \
              mock.patch.object(component_config, "log_error", new=error):
             result = mpis.install(env)
@@ -612,11 +612,11 @@ class InstallTests(unittest.TestCase):
                 _HPCX_URL, "ucx/hpcx-rebuild", [f"--with-pmix={pmix}"])) + self._impi_commands()
         self.assertEqual(commands, expected)
         self.assertEqual(self._captured(), [
-            ["nproc"], [f"{ucx}/bin/ucx_info", "-v"],
+            [f"{ucx}/bin/ucx_info", "-v"],
             ["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
         # ucx_info runs against the rebuilt UCX's libs only; ldd's exit code is an answer.
-        self.assertEqual(self.captures[1][2]["LD_LIBRARY_PATH"], f"{ucx}/lib")
-        self.assertFalse(self.captures[2][3])
+        self.assertEqual(self.captures[0][2]["LD_LIBRARY_PATH"], f"{ucx}/lib")
+        self.assertFalse(self.captures[1][3])
 
         # cwd: work dir for downloads/tar/scripts, source dir for the builds.
         cwds = [c[1] for c in self.calls]
@@ -686,10 +686,10 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any(m.startswith("Rebuilt ompi_info loads ") for m in messages))
         for component, version in (("HPCX", "2.25.1"), ("MVAPICH", "4.1"),
                                    ("OMPI", "5.0.10"), ("IMPI", "2021.16.1")):
-            self.assertIn(f"Recorded {component}={version}", messages)
+            self.assertIn(f"Recorded {component} {version}", messages)
         ld_conf = os.path.join(self.ld_dir, "hpcx-ucx.conf")
         self.assertIn(f"Wrote {ld_conf} (created)", messages)
-        self.assertTrue(any(m.startswith("Created symlink") and "/mpi/hpcx ->" in m
+        self.assertTrue(any(m.startswith("Linked ") and "/mpi/hpcx ->" in m
                             for m in messages))
         summary = self.info.call_args_list[-1]
         self.assertEqual(summary.args[1], "MPIs installed: HPCX=2.25.1, MVAPICH=4.1, "
@@ -717,8 +717,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._commands(), expected)
         self.assertNotIn("CUDA_HOME", self.calls[3][2])
         # No UCX rebuild: no patch, no ucx_info.
-        self.assertEqual(self._captured(), [["nproc"],
-                                            ["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
+        self.assertEqual(self._captured(), [["ldd", f"{path}/hpcx-rebuild/bin/ompi_info"]])
         self.assertEqual(_read(os.path.join(self.ld_dir, "hpcx-ucx.conf")), f"{path}/ucx/lib\n")
 
     def test_ncv6_uses_inbox_hpcx_and_libfabric(self):
@@ -837,8 +836,8 @@ class InstallTests(unittest.TestCase):
         expected = self._hpcx_start(_HPCX_URL) + self._hpcx_end(_HPCX_URL) + \
             self._ompi_commands(self._ompi_ucx_configure(_HPCX_URL, "ucx", _INTERNAL.split()))
         self.assertEqual(self._commands(), expected)
-        self.assertEqual(self._captured(), [["nproc"], ["pkg-config", "--modversion", "pmix"]])
-        self.assertEqual(self.captures[1][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
+        self.assertEqual(self._captured(), [["pkg-config", "--modversion", "pmix"]])
+        self.assertEqual(self.captures[0][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
         config_names = [c.args[0] for c in self.config.call_args_list]
         for name in ("pmix", "mvapich", "impi"):
             self.assertNotIn(name, config_names)
@@ -866,7 +865,7 @@ class InstallTests(unittest.TestCase):
         path = self._hpcx_path(_HPCX_URL)
         self.assertEqual(self._commands(), self._hpcx_start(_HPCX_URL) +
                          self._hpcx_end(_HPCX_URL) + self._impi_commands())
-        self.assertEqual(self.captures[1][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
+        self.assertEqual(self.captures[0][2]["PKG_CONFIG_PATH"], f"{path}/ompi5/lib/pkgconfig")
         self.assertEqual(self._records(), [("HPCX", "2.25.1"), ("PMIX", _PMIX_INTERNAL),
                                            ("IMPI", "2021.16.1")])
         self.pin.assert_not_called()
@@ -971,7 +970,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((lines[0], lines[-1]), (f"{ucx_log.name} line 10",
                                                  f"{ucx_log.name} line 49"))
         self.assertIn("hpcx_rebuild.sh failed", self.error.call_args.args[1])
-        self.assertEqual(self._captured(), [["nproc"]])
+        self.assertEqual(self._captured(), [])
 
     def test_rebuild_failure_without_logs_warns(self):
         rebuild = self._rebuild(_HPCX_URL, "--cuda", "--with-hcoll", "--ompi-extra-config",
@@ -1140,9 +1139,6 @@ class InstallTests(unittest.TestCase):
         self.record.assert_called_once_with("HPCX", "2.25.1")
         self.assertEqual(os.listdir(self._mpi_dir()), [])        # pin comes before the modulefile
 
-    def test_nproc_failure_returns_3(self):
-        self.assertEqual(self._install(nproc=(1, "")), 3)
-        self.assertEqual(self.calls, [])
 
     def test_missing_source_folder_returns_3(self):
         original = self._fake_exec

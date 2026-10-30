@@ -64,7 +64,9 @@ Deliberate differences
     happened; bash works in the distro build dir and ends with
     `rm -rf *.tbz *.tar.gz *offline.sh; rm -rf -- */`, which deletes EVERY
     subdirectory there (warned about, not ported).
-  * nproc is read once; a source folder tar didn't create fails clearly.
+  * The CPU count for `make -j` is read once, with cpu_count() (the affinity
+    count `nproc` prints, without running it); a source folder tar didn't
+    create fails clearly.
   * hpcx_rebuild.sh gets CUDA_HOME through its environment (bash:
     `env CUDA_HOME=... hpcx_rebuild.sh`); on failure the tails of its UCX and
     Open MPI logs are logged as error details (bash: `tail -n 40`).
@@ -74,7 +76,10 @@ Deliberate differences
   * An internal PMIx version pkg-config prints as empty fails.
   * Toolkit spellings: `tar -xf` for every unpack (bash `tar -xvf`, and
     `tar -xzf ... -C` for the UCX source), and write_file creates
-    /etc/ld.so.conf.d if it is missing.
+    /etc/ld.so.conf.d if it is missing. `mkdir -p`, `mktemp -d`, `ln -s` /
+    `ln -sf` and write_component_version go through make_dirs(),
+    make_temp_dir(), symlink() and record_version(), which log their own
+    failures. The `mv`s, `cp -r` and `sed -i` stay bash's commands.
 """
 
 from __future__ import annotations
@@ -82,17 +87,17 @@ from __future__ import annotations
 import glob
 import os
 import re
-import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 
-from utils.component_config import DEFAULT_NODE_TYPE, require_config, write_component_version
+from utils.component_config import DEFAULT_NODE_TYPE, record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths, write_file
+from utils.files import (extract_tarball, fresh_dir, make_dirs, make_temp_dir, remove_paths,
+                         symlink, write_file)
 from utils.logger import log_debug, log_error, log_error_detail, log_info, log_warn
 from utils.package_pinning import dnf_pin_packages
-from utils.process import run, run_all, run_capture
+from utils.process import cpu_count, run, run_all, run_capture
 from utils.sku import NETWORK_MODE_NO_RDMA, sku_network_mode, sku_uses_ucx
 
 _OP = "install-mpis"
@@ -113,8 +118,6 @@ _ROCM_DIR = "/opt/rocm"                       # only for the "is ROCm installed"
 _LD_SO_CONF_DIR = "/etc/ld.so.conf.d"
 _PKGCONFIG_DIRS = ("/usr/local/lib/pkgconfig",)
 _PKGCONFIG_DIRS_RPM = ("/usr/local/lib/pkgconfig", "/usr/local/lib64/pkgconfig")
-# Parent of the UCX patch's scratch dir; None is $TMPDIR or /tmp, like `mktemp -d`.
-_PATCH_TMP_PARENT: str | None = None
 
 # Literal in bash; only used in generated text, arguments and the environment.
 _LIBFABRIC_PATH = "/opt/libfabric"
@@ -706,23 +709,6 @@ def _log_plan(plan: _Plan) -> None:
 # --------------------------------------------------------------------------- #
 # Small steps shared by the phases. Each logs its own failure.
 # --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: cpu_count(op, env=None) -> int | None
-# (bash `$(nproc)`); install_nccl, install_rccl and install_cuda_samples run nproc too.
-def _nproc(env: dict[str, str]) -> int | None:
-    """Run `nproc` (CPUs this process may use) and return it as a number."""
-    rc, output = run_capture(["nproc"], _OP, env=env)
-    if rc != 0:
-        return None
-    try:
-        value = int(output.strip())
-    except ValueError:
-        value = 0
-    if value < 1:
-        log_error(_OP, f"unexpected nproc output: {output.strip()!r}")
-        return None
-    return value
-
-
 def _fetch(cfg: dict) -> bool:
     """bash's download_and_verify of cfg's url into the work dir."""
     return fetch_verified(cfg["url"], cfg["sha256"], _OP, _WORK_DIR) is not None
@@ -742,10 +728,11 @@ def _build_from_source(env: dict[str, str], cfg: dict, configure: list[str],
                    cwd=source, env=env)
 
 
-def _record(component: str, version: str, report: _Report) -> None:
-    write_component_version(component, version)
+def _record(component: str, version: str, report: _Report) -> bool:
+    if not record_version(component, version, _OP):
+        return False
     report.recorded[component] = version
-    log_info(_OP, f"Recorded {component}={version}", component=component, version=version)
+    return True
 
 
 def _pin(packages: list[str], env: dict[str, str], report: _Report) -> bool:
@@ -777,8 +764,6 @@ def _append_modulefile(path: str, text: str, *, rerun_check: bool = True) -> boo
     return write_file(path, text, _OP, append=True)
 
 
-# TODO(ADO 1001): toolkit candidate: symlink(target, link, op, *, force=False) -> bool
-# (bash `ln -s` / `ln -sf`, logging the link); install_amd_libs makes symlinks too.
 def _link_path(target: str, link: str) -> str:
     """Where GNU ln (without -n) puts the link: inside `link` if it's a directory."""
     if os.path.isdir(link):
@@ -786,10 +771,10 @@ def _link_path(target: str, link: str) -> str:
     return link
 
 
-def _ln_s(target: str, link: str, report: _Report) -> bool:
-    """bash `ln -s target link`: fails if `link` already exists."""
+def _ln_s(target: str, link: str, report: _Report, *, force: bool = False) -> bool:
+    """bash `ln -s target link` (`ln -sf` with force=True)."""
     link = _link_path(target, link)
-    if os.path.lexists(link):
+    if not force and os.path.lexists(link):
         # BASH ISSUE (kept): plain `ln -s` (no -f) fails when the link exists,
         # which stops the bash script on any rerun over an existing image.
         log_error(_OP, f"cannot create symlink {link}: it already exists. bash's "
@@ -797,20 +782,10 @@ def _ln_s(target: str, link: str, report: _Report) -> bool:
                        "rerun-safe; remove the old MPI modulefiles first",
                   path=link, target=target)
         return False
-    os.symlink(target, link)
+    if not symlink(target, link, _OP, force=force):
+        return False
     report.symlinks.append(link)
-    log_info(_OP, f"Created symlink {link} -> {target}", path=link, target=target)
     return True
-
-
-def _ln_sf(target: str, link: str, report: _Report) -> None:
-    """bash `ln -sf target link`: replace an existing file/link."""
-    link = _link_path(target, link)
-    if os.path.lexists(link):
-        os.remove(link)     # a directory here raises, as `ln -sf` fails on one
-    os.symlink(target, link)
-    report.symlinks.append(link)
-    log_info(_OP, f"Created symlink {link} -> {target}", path=link, target=target)
 
 
 def _tail_lines(path: str, count: int) -> list[str]:
@@ -837,9 +812,9 @@ def _install_hpcx(env: dict[str, str], plan: _Plan, report: _Report) -> _Hpcx | 
     if plan.internal_pmix and not _record_internal_pmix(env, plan, hpcx, report):
         return None
     # hpcx_rebuild.sh installs fresh Open MPI (and, on AMD, UCX) metadata; fix it too.
-    if not (_fix_ladir(env, hpcx) and _register_hpcx_libs(env, hpcx)):
+    if not (_fix_ladir(env, hpcx) and _register_hpcx_libs(env, hpcx)
+            and _link_pkgconfig(plan, hpcx, report)):
         return None
-    _link_pkgconfig(plan, hpcx, report)
     if plan.rpm and not _pin(["ucx*"], env, report):        # exclude ucx from updates
         return None
     if not _write_hpcx_modulefiles(plan, hpcx, report):
@@ -863,9 +838,9 @@ def _unpack_hpcx(env: dict[str, str], plan: _Plan, report: _Report) -> _Hpcx | N
     if not (_fetch(cfg)
             and extract_tarball(url_basename(cfg["url"]), _OP, cwd=_WORK_DIR, env=env)
             and run(["mv", folder, _INSTALL_PREFIX], _OP, cwd=_WORK_DIR, env=env)
-            and _fix_ladir(env, hpcx)):
+            and _fix_ladir(env, hpcx)
+            and _record("HPCX", cfg["version"], report)):
         return None
-    _record("HPCX", cfg["version"], report)
     return hpcx
 
 
@@ -951,9 +926,11 @@ def _patch_ucx_source_netlink_dump(env: dict[str, str], plan: _Plan, hpcx: _Hpcx
     tarball = _find_ucx_tarball(hpcx)
     if tarball is None:
         return False
-    work_dir = tempfile.mkdtemp(dir=_PATCH_TMP_PARENT)
+    work_dir = make_temp_dir(_OP)
+    if work_dir is None:
+        return False
     try:
-        return _patch_ucx_tarball(env, plan, tarball, work_dir, report)
+        return _patch_ucx_tarball(env, plan, tarball, str(work_dir), report)
     finally:
         remove_paths(work_dir, op=_OP)
 
@@ -1094,8 +1071,7 @@ def _record_internal_pmix(env: dict[str, str], plan: _Plan, hpcx: _Hpcx,
         return False
     log_info(_OP, f"Internal PMIx {version} (from {pkg_config_path})",
              pkg_config_path=pkg_config_path, pmix_version=version)
-    _record("PMIX", version, report)
-    return True
+    return _record("PMIX", version, report)
 
 
 def _register_hpcx_libs(env: dict[str, str], hpcx: _Hpcx) -> bool:
@@ -1105,25 +1081,30 @@ def _register_hpcx_libs(env: dict[str, str], hpcx: _Hpcx) -> bool:
             and run(["ldconfig"], _OP, cwd=_WORK_DIR, env=env))
 
 
-def _link_pkgconfig(plan: _Plan, hpcx: _Hpcx, report: _Report) -> None:
+def _hpcx_pc_files(hpcx: _Hpcx) -> list[str]:
+    """The HCOLL, SHARP and UCX .pc files (bash: for f in <tree>/lib/pkgconfig/*.pc;
+    [[ -f ]] || continue). sorted() approximates bash's glob order; only the
+    order the links are made in can differ, not the result."""
+    return [pc_file for tree in (hpcx.hcoll, hpcx.sharp, hpcx.ucx)
+            for pc_file in sorted(glob.glob(f"{tree}/lib/pkgconfig/*.pc"))
+            if os.path.isfile(pc_file)]
+
+
+def _link_pkgconfig(plan: _Plan, hpcx: _Hpcx, report: _Report) -> bool:
     """Symlink HCOLL/SHARP/UCX .pc files into the system pkg-config dirs.
 
     So module-free builds resolve the same HCOLL, SHARP and UCX that
     `module load mpi/hpcx` would put on PKG_CONFIG_PATH.
     """
+    pc_files = _hpcx_pc_files(hpcx)
     for pkgconfig_dir in plan.pkgconfig_dirs:
-        os.makedirs(pkgconfig_dir, exist_ok=True)
-        linked = 0
-        for tree in (hpcx.hcoll, hpcx.sharp, hpcx.ucx):
-            # sorted() approximates bash's glob order; only the order the links
-            # are made in can differ, not the result.
-            for pc_file in sorted(glob.glob(f"{tree}/lib/pkgconfig/*.pc")):
-                if not os.path.isfile(pc_file):     # bash: [[ -f ]] || continue
-                    continue
-                _ln_sf(pc_file, f"{pkgconfig_dir}/{os.path.basename(pc_file)}", report)
-                linked += 1
-        log_info(_OP, f"Linked {linked} HPC-X pkg-config file(s) into {pkgconfig_dir}",
-                 path=pkgconfig_dir, count=linked)
+        if not (make_dirs(pkgconfig_dir, op=_OP)
+                and all(_ln_s(pc_file, f"{pkgconfig_dir}/{os.path.basename(pc_file)}",
+                              report, force=True) for pc_file in pc_files)):
+            return False
+        log_info(_OP, f"Linked {len(pc_files)} HPC-X pkg-config file(s) into "
+                      f"{pkgconfig_dir}", path=pkgconfig_dir, count=len(pc_files))
+    return True
 
 
 def _write_hpcx_modulefiles(plan: _Plan, hpcx: _Hpcx, report: _Report) -> bool:
@@ -1160,8 +1141,8 @@ def _install_mvapich(env: dict[str, str], plan: _Plan, hpcx: _Hpcx, nproc: int,
              transport_lib=transport_lib)
     if not _build_from_source(env, plan.mvapich, configure, nproc):
         return False
-    _record("MVAPICH", version, report)
-    return _write_mvapich_modulefile(plan, version, transport_lib, report)
+    return (_record("MVAPICH", version, report)
+            and _write_mvapich_modulefile(plan, version, transport_lib, report))
 
 
 def _write_mvapich_modulefile(plan: _Plan, version: str, transport_lib: str,
@@ -1192,8 +1173,8 @@ def _install_ompi(env: dict[str, str], plan: _Plan, hpcx: _Hpcx, nproc: int,
              pmix_flag=" ".join(pmix_flags), transport_lib=transport_lib)
     if not _build_from_source(env, plan.ompi, configure, nproc):
         return False
-    _record("OMPI", version, report)
-    return _write_ompi_modulefile(plan, version, hpcx, transport_lib, report)
+    return (_record("OMPI", version, report)
+            and _write_ompi_modulefile(plan, version, hpcx, transport_lib, report))
 
 
 def _write_ompi_modulefile(plan: _Plan, version: str, hpcx: _Hpcx, transport_lib: str,
@@ -1220,9 +1201,9 @@ def _install_impi(env: dict[str, str], plan: _Plan, report: _Report) -> bool:
             and run(["bash", url_basename(cfg["url"]), "-s", "-a", "-s", "--eula", "accept"],
                     _OP, cwd=_WORK_DIR, env=env)
             and run(["mv", f"{modulefiles}/mpi", f"{modulefiles}/impi"], _OP,
-                    cwd=_WORK_DIR, env=env)):
+                    cwd=_WORK_DIR, env=env)
+            and _record("IMPI", cfg["version"], report)):
         return False
-    _record("IMPI", cfg["version"], report)
     return _write_impi_modulefile(plan, report)
 
 
@@ -1244,19 +1225,18 @@ def _write_impi_modulefile(plan: _Plan, report: _Report) -> bool:
 # --------------------------------------------------------------------------- #
 # The step.
 # --------------------------------------------------------------------------- #
-def _prepare_dirs(plan: _Plan) -> None:
+def _prepare_dirs(plan: _Plan) -> bool:
     """bash: mkdir -p ${MPI_MODULE_FILES_DIRECTORY}; plus our empty work dir."""
-    os.makedirs(plan.mpi_dir, exist_ok=True)
+    if not make_dirs(plan.mpi_dir, op=_OP):
+        return False
     log_info(_OP, f"MPI modulefiles go to {plan.mpi_dir}", path=plan.mpi_dir)
-    remove_paths(_WORK_DIR, op=_OP)
-    os.makedirs(_WORK_DIR, exist_ok=True)
+    return fresh_dir(_WORK_DIR, _OP)
 
 
 def _install_all(env: dict[str, str], plan: _Plan, nproc: int,
                  report: _Report) -> _Hpcx | None:
     """bash's phases in order; None at the first failure."""
-    _prepare_dirs(plan)
-    hpcx = _install_hpcx(env, plan, report)
+    hpcx = _install_hpcx(env, plan, report) if _prepare_dirs(plan) else None
     ok = (hpcx is not None
           and _install_mvapich(env, plan, hpcx, nproc, report)
           and _install_ompi(env, plan, hpcx, nproc, report)
@@ -1284,16 +1264,10 @@ def install(env: dict[str, str]) -> int:
     if plan is None:
         return 3
     _log_plan(plan)
-    nproc = _nproc(env)
-    if nproc is None:
-        return 3
     report = _Report()
     try:
-        hpcx = _install_all(env, plan, nproc, report)
-    except OSError as exc:
-        # Work dir, pkg-config links, modulefile symlinks, versions file.
-        log_error(_OP, f"file operation failed: {exc}", path=getattr(exc, "filename", None))
-        return 3
+        # bash runs $(nproc) for each `make -j`; read once here.
+        hpcx = _install_all(env, plan, cpu_count(), report)
     finally:
         remove_paths(_WORK_DIR, op=_OP)     # only the scratch area this step created
     if hpcx is None:
