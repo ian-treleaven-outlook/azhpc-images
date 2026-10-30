@@ -750,6 +750,15 @@ locals {
   _python_cli_node_type_check = (!local.use_python_cli || contains(local.python_cli_node_types, local.target_node_type)) ? true : file("ERROR: use_python_cli is set, but the Python CLI does not build TARGET_NODE_TYPE=${local.target_node_type} yet (python_cli_node_types in packer/variables.pkr.hcl).")
 }
 
+variable "capture_image_fingerprint" {
+  type        = string
+  description = "Capture an image fingerprint (tools/image_fingerprint.py) after validation and download it to /tmp/image_manifests, for comparing two builds with tools/compare_images.py. Unset or false: not captured."
+  default     = env("CAPTURE_IMAGE_FINGERPRINT")
+}
+locals {
+  capture_image_fingerprint = try(convert(lower(var.capture_image_fingerprint), bool), false)
+}
+
 # =============================================================================
 # Credentials Variables
 # =============================================================================

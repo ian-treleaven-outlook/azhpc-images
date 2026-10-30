@@ -429,6 +429,36 @@ build {
     ]
   }
 
+  # Comparison builds (docs/python-cli-builds.md): record config files, /opt
+  # layout, modulefiles, enabled units and pip packages next to the build
+  # evidence, then remove the file so nothing is left in the image.
+  provisioner "shell" {
+    name           = "(Comparison builds) Capture image fingerprint"
+    except         = local.capture_image_fingerprint ? [] : ["azure-arm.hpc"]
+    inline_shebang = var.default_inline_shebang
+    inline = [
+      "PY=$(command -v python3 || echo /usr/libexec/platform-python); sudo $PY /home/${local.ssh_username}/azhpc-images/tools/image_fingerprint.py --out /tmp/image-fingerprint.json",
+    ]
+  }
+
+  provisioner "file" {
+    name        = "(Comparison builds) Download image fingerprint"
+    except      = local.capture_image_fingerprint ? [] : ["azure-arm.hpc"]
+    direction   = "download"
+    generated   = true
+    source      = "/tmp/image-fingerprint.json"
+    destination = "/tmp/image_manifests/image-fingerprint.json"
+  }
+
+  provisioner "shell" {
+    name           = "(Comparison builds) Remove image fingerprint from image"
+    except         = local.capture_image_fingerprint ? [] : ["azure-arm.hpc"]
+    inline_shebang = var.default_inline_shebang
+    inline = [
+      "sudo rm -f /tmp/image-fingerprint.json",
+    ]
+  }
+
   provisioner "shell" {
     name            = "Collect post-build evidence"
     script          = "scripts/collect_build_evidence.sh"
