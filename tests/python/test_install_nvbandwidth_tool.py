@@ -2,9 +2,10 @@
 
 Two kinds of test:
 
-  * The pure helpers (dependency_packages, configured_ref, configured_commit)
-    are tested directly. configured_ref/configured_commit were
-    also compared with real jq/bash in WSL on the same configs.
+  * The pure helpers (dependency_packages, configured_commit) are tested
+    directly. configured_commit was also compared with real jq/bash in WSL
+    on the same configs. (configured_ref is utils.repo_source's; test_toolkit
+    covers it.)
   * install() is tested with exec_program (in utils.process, behind run and
     run_script, and in utils.package_installer, which runs the dependency
     installs) replaced by one fake that records each command and imitates
@@ -32,7 +33,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvbandwidth_tool as m
-from utils import component_config, package_installer, process
+from utils import component_config, files, package_installer, process, repo_source
 from utils.build_config import BuildConfig, build_plan
 from utils.distro import Distro
 
@@ -122,16 +123,6 @@ class HelperTests(unittest.TestCase):
             with self.subTest(distribution=other):
                 self.assertEqual(deps(other, "x86_64"), ())
 
-    def test_configured_ref_follows_jq_and_bash_defaults(self):
-        ref = m.configured_ref
-        self.assertEqual(ref({}, "0.9"), "v0.9")
-        self.assertEqual(ref({"ref": "v0.8"}, "0.9"), "v0.8")
-        self.assertEqual(ref({"ref": "v0.8", "branch": "main"}, "0.9"), "v0.8")
-        self.assertEqual(ref({"branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": None, "branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": False, "branch": "main"}, "0.9"), "main")
-        self.assertEqual(ref({"ref": "", "branch": "main"}, "0.9"), "v0.9")
-
     def test_configured_commit_is_empty_when_unset(self):
         self.assertEqual(m.configured_commit({"commit": _COMMIT}), _COMMIT)
         self.assertEqual(m.configured_commit({}), "")
@@ -209,15 +200,21 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(m, "write_repo_source_info", side_effect=fake_source), \
-             mock.patch.object(m, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(m, "log_info") as log_info, \
+             mock.patch.object(component_config, "log_info"), \
+             mock.patch.object(files, "log_info") as files_info, \
+             mock.patch.object(repo_source, "log_info"), \
              mock.patch.object(m, "log_warn") as log_warn, \
              mock.patch.object(component_config, "log_error") as log_error, \
+             mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(repo_source, "log_error", log_error), \
              mock.patch.object(m, "log_error", log_error):
             rc = m.install(env)
         return rc, fake, {"record": record, "info": log_info, "warn": log_warn,
-                          "error": log_error, "pkg_error": pkg_error}
+                          "files_info": files_info, "error": log_error,
+                          "pkg_error": pkg_error}
 
     def _build_calls(self, *, ref="v0.9", commit=_COMMIT):
         calls = [(["git", "clone", "--branch", ref, _URL], str(self.work))]
@@ -245,7 +242,9 @@ class InstallTests(unittest.TestCase):
         start = mocks["info"].call_args_list[0].kwargs
         self.assertEqual((start["version"], start["ref"], start["commit"], start["source"]),
                          ("0.9", "v0.9", _COMMIT, _URL))
-        self.assertIn(f"Installed {self.dest / 'nvbandwidth'}", self._messages(mocks["info"]))
+        moved = [c.kwargs["path"] for c in mocks["files_info"].call_args_list
+                 if c.args[1].startswith("Moved ")]
+        self.assertEqual(moved, [str(self.dest / "nvbandwidth")])
         self.assertEqual(self._messages(mocks["info"])[-1],
                          f"nvbandwidth 0.9 installed to {self.dest}")
 
@@ -292,8 +291,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual((self.dest / "nvbandwidth").read_text(encoding="utf-8"),
                          "built binary\n")
-        installed = [c for c in mocks["info"].call_args_list
-                     if c.args[1].startswith("Installed ")]
+        installed = [c for c in mocks["files_info"].call_args_list
+                     if c.args[1].startswith("Moved ")]
         self.assertEqual(installed[0].kwargs["action"], "replaced")
 
     def test_real_versions_json_honours_the_baremetal_3p_override(self):
