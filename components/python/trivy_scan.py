@@ -77,7 +77,7 @@ below reproduces exactly that argument list.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "trivy-scan" Step. Deleting `action=` from that Step makes the build run the
 bash script again, which is why the .sh file is kept. (packer/build.pkr.hcl and
 the distros/*/install.sh scripts still call the bash script directly.)
@@ -111,7 +111,7 @@ import time
 from utils.logger import log_error, log_info
 from utils.process import exec_program, run_capture
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "trivy-scan"
 
 # The GitHub API call bash makes to find the newest Trivy release.

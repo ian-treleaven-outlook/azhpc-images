@@ -41,7 +41,7 @@ newline after its last line.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "add-udev-rules" Step. When a Step has an action, the build calls the Python
 function instead of running the bash script. Deleting `action=` from that Step
 makes the build run the bash script again. That is why the .sh file is kept.
@@ -64,7 +64,7 @@ from __future__ import annotations
 from utils.logger import log_error, log_info
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line from this module uses
+# The Step's `op` label in plans/steps.py. Every log line from this module uses
 # it, so this step's output can be found in a build log.
 _OP = "add-udev-rules"
 

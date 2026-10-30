@@ -101,7 +101,7 @@ cuda13 on Azure Linux too, does not try to "fix" it from SKU, and warns on V100.
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-dcgm" Step. Deleting `action=` from that Step makes the build run the
 bash script again, which is why the .sh file is kept.
 
@@ -147,7 +147,7 @@ from utils.logger import log_debug, log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-dcgm"
 
 # Where the probe's (and the Azure Linux marker's) temporary directory is

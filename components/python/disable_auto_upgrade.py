@@ -76,7 +76,7 @@ import re
 from utils.logger import log_error, log_info
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py. Every log line from this module uses it.
+# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "disable-auto-upgrade"
 
 # The apt configuration file that bash edits with sed.

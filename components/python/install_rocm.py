@@ -145,7 +145,7 @@ constants below):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-rocm" Step (AMD images only). Deleting `action=` from that Step makes
 the build run the bash script again, which is why the .sh file is kept.
 
@@ -244,7 +244,7 @@ from utils.logger import log_debug, log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-rocm"
 
 # Bash's distro branches that are exact matches on these values.

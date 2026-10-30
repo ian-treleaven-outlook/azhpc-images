@@ -48,7 +48,7 @@ trailing whitespace):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-azsecpack-prereqs" Step, which runs on every distro, as in bash.
 Deleting `action=` from that Step makes the build run the bash script again.
 That is why the .sh file is kept.
@@ -91,7 +91,7 @@ from utils.logger import log_error, log_info
 from utils.package_installer import install_packages
 from utils.process import run_capture
 
-# The Step's `op` label in build_config.py. Every log line from this module uses it.
+# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "install-azsecpack-prereqs"
 
 # bash: `if [ "$PAGE_SIZE" = "65536" ]`. 64 KB pages, the only size on which

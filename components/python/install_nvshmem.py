@@ -38,7 +38,7 @@ The original bash, for comparison:
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-nvshmem" Step. When a Step has an action, the build calls the Python
 function instead of running the bash script. Deleting `action=` from that Step
 makes the build run the bash script again, which is why the .sh file is kept.
@@ -79,7 +79,7 @@ from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import run_capture
 
-# The Step's `op` label in build_config.py. Every log line from this module uses it.
+# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "install-nvshmem"
 
 # Exact match, as in bash.

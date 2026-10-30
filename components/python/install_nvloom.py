@@ -65,7 +65,7 @@ Linux one, but with apt packages and no patch):
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-nvloom" Step. When a Step has an action, the build calls the Python
 function instead of running the bash script. Deleting `action=` from that Step
 makes the build run the bash script again, which is why the .sh file is kept.
@@ -120,7 +120,7 @@ from utils.package_installer import install_packages
 from utils.process import exec_program
 from utils.repo_source import write_repo_source_info
 
-# The Step's `op` label in build_config.py. Every log line from this module uses it.
+# The Step's `op` label in plans/steps.py. Every log line from this module uses it.
 _OP = "install-nvloom"
 
 # Where the nvloom_cli binary is installed (bash's dest_dir).

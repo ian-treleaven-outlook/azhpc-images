@@ -7,7 +7,8 @@ import sys
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from utils.build_config import resolve_config, ConfigError, ImageBuilder, build_plan
+from utils.build_config import (resolve_config, ConfigError, ImageBuilder, build_plan,
+                                pre_bootstrap_plan)
 from utils import logger
 
 VERSION = "0.1.0"
@@ -47,8 +48,10 @@ REQUIRED:
                                         (VR200 is built as GB200, as in bash)
                                 AMD    : MI300X | MI300 | MI400 | MI500
                                         (MI300X is the SKU packer passes)
-    --os <OS>               Target OS: Ubuntu24 | Ubuntu22 | Azure3 |
-                                    Alma9 | Alma8 | Rocky9 | Rocky8
+    --os <OS>               Target OS: Ubuntu22 | Ubuntu24 | Ubuntu26 | Azure3 |
+                                    Alma8 | Alma9 | Rocky8 | Rocky9 | RHEL8 | RHEL9
+                            Building needs a Python plan for the OS (today:
+                            Ubuntu24); versions/validate accept them all.
 
 OPTIONS:
     --spec <PATH>           Path to versions.json
@@ -114,12 +117,12 @@ def cmd_install(args_list) -> int:
 def cmd_versions(args_list) -> int:
     """`azhpc versions --os <OS> --vendor <V> --gpu <SKU>` — print the resolved
     component versions for a target without building anything."""
-    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS, build_sku
+    from utils.build_config import DISTRIBUTIONS, GPU_ARGS, VALID_GPUS, build_sku
     from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_report import resolve_report, format_report
 
     p = argparse.ArgumentParser(prog="azhpc versions")
-    p.add_argument("--os", required=True, choices=sorted(DISTRO_DIRS))
+    p.add_argument("--os", required=True, choices=sorted(DISTRIBUTIONS))
     p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
     p.add_argument("--gpu", required=True)
     p.add_argument("--arch", default="x86_64")
@@ -141,7 +144,7 @@ def cmd_versions(args_list) -> int:
         return 2
     versions = json.loads(spec.read_text(encoding="utf-8"))
 
-    distribution = DISTRO_DIRS[ns.os].split("/")[-1]
+    distribution = DISTRIBUTIONS[ns.os]
     report = resolve_report(
         versions, distribution=distribution, architecture=ns.arch,
         gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
@@ -155,12 +158,12 @@ def cmd_versions(args_list) -> int:
 def cmd_validate(args_list) -> int:
     """`azhpc validate --os <OS> --vendor <V> --gpu <SKU>` — check versions.json
     for internal consistency for a target. Exit 0 if clean, 1 if issues."""
-    from utils.build_config import DISTRO_DIRS, GPU_ARGS, VALID_GPUS, build_sku
+    from utils.build_config import DISTRIBUTIONS, GPU_ARGS, VALID_GPUS, build_sku
     from utils.component_config import DEFAULT_NODE_TYPE, NODE_TYPES
     from utils.version_validate import check_cuda_consistency
 
     p = argparse.ArgumentParser(prog="azhpc validate")
-    p.add_argument("--os", required=True, choices=sorted(DISTRO_DIRS))
+    p.add_argument("--os", required=True, choices=sorted(DISTRIBUTIONS))
     p.add_argument("--vendor", required=True, choices=sorted(GPU_ARGS))
     p.add_argument("--gpu", required=True)
     p.add_argument("--arch", default="x86_64")
@@ -182,7 +185,7 @@ def cmd_validate(args_list) -> int:
         return 2
     versions = json.loads(spec.read_text(encoding="utf-8"))
 
-    distribution = DISTRO_DIRS[ns.os].split("/")[-1]
+    distribution = DISTRIBUTIONS[ns.os]
     issues = check_cuda_consistency(
         versions, distribution=distribution, architecture=ns.arch,
         gpu=GPU_ARGS[ns.vendor], sku=build_sku(ns.gpu), node_type=ns.node_type,
@@ -201,16 +204,19 @@ def cmd_validate(args_list) -> int:
 def print_build_plan(config) -> None:
     """Print the ordered steps a build would run, for --dry-run."""
     # Keep only the steps that apply to this target (drop the gated-out ones).
+    pre = [step for step in pre_bootstrap_plan(config) if step.when(config)]
     steps = [step for step in build_plan(config) if step.when(config)]
 
     print(f"# Build plan for {config.vendor}/{config.gpu} on {config.os} "
-          f"({config.architecture}) — {len(steps)} steps:")
+          f"({config.architecture}) — {len(pre) + len(steps)} steps:")
 
     # Columns: number, step name, bash script, and whether it runs as python/bash
     # (plus the resync ticket when a stale Python port falls back to bash).
-    for number, step in enumerate(steps, start=1):
+    # Steps the distro runs before install_utils.sh are listed first, marked.
+    for number, step in enumerate(pre + steps, start=1):
         runner = step.runner + (f", resync {step.resync}" if step.resync else "")
-        print(f"  {number:2d}. {step.op:<34} {step.script:<40} ({runner})")
+        when = ", before install_utils.sh" if number <= len(pre) else ""
+        print(f"  {number:2d}. {step.op:<34} {step.script:<40} ({runner}{when})")
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)

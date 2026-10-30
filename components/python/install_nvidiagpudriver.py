@@ -57,7 +57,7 @@ step's work dir (bash runs them from the distro build dir, its own cwd).
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-nv-driver" Step (NVIDIA, not NCv6). Deleting `action=` makes the
 build run the bash script again, which is why the .sh file is kept.
 install() returns 0 for success or 3 for failure, logs problems and never lets
@@ -159,7 +159,7 @@ from utils.package_pinning import dnf_pin_packages
 from utils.process import exec_program, run_capture
 from utils.sku import NETWORK_MODE_MRC, sku_network_mode
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-nv-driver"
 
 # Our own download/build directory, also the cwd of the nested scripts.

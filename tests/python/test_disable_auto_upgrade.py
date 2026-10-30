@@ -213,7 +213,9 @@ class BashSourceTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 class BuildPlanWiringTests(unittest.TestCase):
     def test_step_is_no_longer_in_the_build_plan(self):
-        for os_name in ("Ubuntu24", "Ubuntu22"):
+        # Every distro plan except Ubuntu 26.04's, whose install.sh still runs it.
+        from utils.plans import PLANS
+        for os_name in sorted(set(PLANS) - {"Ubuntu26"}):
             with self.subTest(os=os_name):
                 cfg = BuildConfig(vendor="NVidia", gpu="A100", os=os_name,
                                   fips=False, spec_path=None)

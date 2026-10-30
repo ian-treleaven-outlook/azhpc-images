@@ -46,7 +46,7 @@ runs upstream's commands itself.)
 
 How it fits into the Python build
 ---------------------------------
-utils/build_config.py sets this module's install() as the `action=` of the
+utils/plans/steps.py sets this module's install() as the `action=` of the
 "install-mpifileutils" Step. install() receives the build environment and
 returns 0 for success or 3 for failure; it logs problems and never lets an
 exception escape. Each command stops the step if it fails, like `set -e`.
@@ -90,7 +90,7 @@ from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import exec_program
 
-# The Step's `op` label in build_config.py; used on every log line.
+# The Step's `op` label in plans/steps.py; used on every log line.
 _OP = "install-mpifileutils"
 
 _AZURE_LINUX = "azurelinux3.0"
