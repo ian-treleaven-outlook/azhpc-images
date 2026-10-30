@@ -77,15 +77,21 @@ Deliberate differences from bash
     record rpm's "package rccl is not installed"). Ubuntu 26.04: an empty
     TheRock `rev-parse` fails (bash would fetch an empty commit). A source
     folder the clone/tarball didn't create fails with a clear message.
-  * `nproc` is read once for the sed edit and `make -j`; the rccl-tests
-    script still calls $(nproc) itself. A non-numeric result fails the step.
+  * The CPU count is read once, with cpu_count() (the affinity count `nproc`
+    prints, without running it), for the sed edit and `make -j`; the
+    rccl-tests script still calls $(nproc) itself.
   * `mkdir -p /opt/rccl-tests`, the rocm-systems checkout and its repo info
     run before `module load mpi/hpcx` (bash loads it first; git doesn't need
     HPC-X).
   * Toolkit normalisations: the tarball is unpacked with `tar -xf` (bash
     `tar -xzf`); `rm -rf`s go through remove_paths(), which never fails the
     build; the rccl-tests script drops bash's trailing `module unload` (the
-    shell exits).
+    shell exits); bash's `mkdir ./<folder>/build` is make_dirs() (`mkdir
+    -p`; the source tree is fresh, so there is no build dir to trip over);
+    the RCCL and perftest clones go through git_clone() (same commands, and
+    a clone that creates no directory fails there); the rpm read is
+    installed_package_version() (same command and output); CMakeLists.txt
+    is edited with edit_file() (a sed -i that keeps every other byte).
 """
 
 from __future__ import annotations
@@ -98,14 +104,15 @@ import shlex
 from dataclasses import dataclass
 from typing import Callable
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import extract_tarball, remove_paths, write_file
+from utils.files import (edit_file, extract_tarball, file_has_line, fresh_dir, make_dirs,
+                         remove_paths, write_file)
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
-from utils.process import run, run_all, run_capture, run_script
-from utils.repo_source import write_repo_source_info
+from utils.package_installer import install_packages, installed_package_version
+from utils.process import cpu_count, run, run_all, run_capture, run_script
+from utils.repo_source import git_clone, write_repo_source_info
 
 _OP = "install-rccl"
 
@@ -282,11 +289,6 @@ def linker_jobs(mem_gb: int) -> int:
     return max(1, min(_MAX_LINKER_JOBS, jobs))
 
 
-def azure_linux_rccl_version(rpm_output: str) -> str | None:
-    """`rpm -q --queryformat '%{VERSION}-%{RELEASE}' rccl` output -> version."""
-    return rpm_output.strip() or None
-
-
 def rccl_tests_script(rccl_prefix: str, cmake_args: list[str]) -> list[str]:
     """The lines that build rccl-tests and copy *_perf to /opt/rccl-tests.
 
@@ -328,50 +330,27 @@ def perftest_package_lists(distro: Distro) -> list[list[str]]:
 # --------------------------------------------------------------------------- #
 # Small helpers.
 # --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: file_has_line(path, line) -> bool (for the
-# "already there; appending again, as bash does" warning before `>>`).
-def _has_line(path: str, line: str) -> bool:
-    """True if `path` already has `line`; a missing/unreadable file is "no"."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return line in handle.read().splitlines()
-    except OSError:
+def _edit_cmakelists(path: str, nproc: int, jobs: int) -> bool:
+    """Apply the two sed edits to RCCL's CMakeLists.txt in place."""
+    changes = {}
+
+    def transform(text: str) -> str:
+        text, changes["compile"] = set_compile_jobs(text, nproc)
+        text, changes["link"] = set_link_jobs(text, jobs)
+        return text
+
+    if not edit_file(path, transform, _OP):
         return False
-
-
-# TODO(ADO 1001): toolkit candidate: cpu_count(op, env=) -> int | None
-# (bash `$(nproc)`, checked to be a positive number).
-def _nproc(env: dict[str, str]) -> int | None:
-    rc, output = run_capture(["nproc"], _OP, env=env)
-    if rc != 0:
-        return None                     # run_capture has logged the failure
-    value = int(output.strip()) if output.strip().isdigit() else 0
-    if value < 1:
-        log_error(_OP, f"unexpected nproc output: {output.strip()!r}")
-        return None
-    return value
-
-
-# TODO(ADO 1001): toolkit candidate: edit_file(path, transform, op) -> bool
-# (bash `sed -i`, byte-preserving: surrogateescape + newline="").
-def _edit_cmakelists(path: str, nproc: int, jobs: int) -> None:
-    """Apply the two sed edits to RCCL's CMakeLists.txt in place. Raises
-    OSError; install() catches it."""
-    with open(path, encoding="utf-8", errors="surrogateescape", newline="") as handle:
-        text = handle.read()
-    text, compile_changes = set_compile_jobs(text, nproc)
-    text, link_changes = set_link_jobs(text, jobs)
-    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
-        handle.write(text)
-    log_info(_OP, f"Edited {path} in place: compile -parallel-jobs={nproc}, "
-                  f"link -parallel-jobs={jobs}", path=path,
-             compile_lines_changed=compile_changes, link_lines_changed=link_changes)
-    for kind, count in (("compile", compile_changes), ("link", link_changes)):
+    log_info(_OP, f"Set compile -parallel-jobs={nproc}, link -parallel-jobs={jobs} "
+                  f"in {path}", path=path, compile_lines_changed=changes["compile"],
+             link_lines_changed=changes["link"])
+    for kind, count in changes.items():
         if count == 0:
             # sed silently changes nothing; the build then uses upstream values.
             log_warn(_OP, f"no target_{kind}_options(rccl PRIVATE ... -parallel-jobs=) "
                           f"line matched in {path}; left unchanged, as sed would",
                      path=path)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -420,25 +399,16 @@ def _ubuntu2604_rccl_version(env: dict[str, str], inputs: _Inputs) -> str | None
     return version
 
 
-# TODO(ADO 1001): toolkit candidate: installed_package_version(package, env, op)
-# -> str | None (rpm -q --queryformat / dpkg-query -W -f='${Version}').
 def _install_packaged(env: dict[str, str], inputs: _Inputs) -> str | None:
     log_info(_OP, f"Installing RCCL on {inputs.distro} from the ROCm dnf packages "
                   "(Azure Linux ships RCCL packaged)", source="dnf",
              **inputs.start_fields())
     if not install_packages(_AZURE_LINUX_RCCL_PACKAGES, env, _OP):
         return None
-    rc, output = run_capture(
-        ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", "rccl"], _OP, env=env)
-    version = azure_linux_rccl_version(output) if rc == 0 else None
-    if version is None:
-        log_error(_OP, "could not read the installed rccl version from rpm",
-                  exit_code=rc, output=output.strip())
-    return version
+    # bash: rpm -q --queryformat '%{VERSION}-%{RELEASE}' rccl
+    return installed_package_version("rccl", env, _OP)
 
 
-# TODO(ADO 1001): toolkit candidate: git_clone(url, dest, op, *, ref=None,
-# commit=None, cwd=, env=) -> bool (git clone --branch <ref> + git checkout).
 def _fetch_source(env: dict[str, str], config: dict, folder: str, tarball: str) -> bool:
     """Put the RCCL source in _WORK_DIR/<folder>: git clone, or the tarball."""
     ref = rccl_ref(config)
@@ -447,27 +417,47 @@ def _fetch_source(env: dict[str, str], config: dict, folder: str, tarball: str) 
         log_info(_OP, "RCCL source: git clone of a pinned ref/commit "
                       "(works around ROCm/rccl#1877)",
                  source="git", ref=ref, commit=commit, folder=folder)
-        return (run(["git", "clone", "--branch", ref, _RCCL_GIT_URL, folder], _OP,
-                    cwd=_WORK_DIR, env=env)
-                and run(["git", "checkout", commit], _OP,
-                        cwd=os.path.join(_WORK_DIR, folder), env=env))
+        return git_clone(_RCCL_GIT_URL, _OP, ref=ref, commit=commit, dest=folder,
+                         cwd=_WORK_DIR, env=env) is not None
     log_info(_OP, "RCCL source: release tarball (no ref/branch in versions.json)",
              source="tarball", url=config["url"], folder=folder)
-    return (fetch_verified(config["url"], config["sha256"], _OP, _WORK_DIR) is not None
-            and extract_tarball(tarball, _OP, cwd=_WORK_DIR, env=env))
+    if not (fetch_verified(config["url"], config["sha256"], _OP, _WORK_DIR) is not None
+            and extract_tarball(tarball, _OP, cwd=_WORK_DIR, env=env)):
+        return False
+    source_dir = os.path.join(_WORK_DIR, folder)
+    if not os.path.isdir(source_dir):
+        log_error(_OP, f"RCCL source folder {source_dir} was not created by "
+                       f"extracting {tarball}", path=source_dir)
+        return False
+    return True
 
 
-def _tune_parallelism(cmakelists: str, nproc: int) -> None:
+def _record_rccl_repo(env: dict[str, str], config: dict, source_dir: str) -> bool:
+    """RCCL_REPO_* for a git clone; a tarball has none, as in bash."""
+    ref = rccl_ref(config)
+    if uses_git_clone(ref):
+        return write_repo_source_info("RCCL", source_dir, _OP,
+                                      commit=str(config["commit"]), ref=ref, env=env)
+    log_info(_OP, "RCCL built from the release tarball; no repo commit/ref to "
+                  "record, as in bash", source="tarball")
+    return True
+
+
+def _tune_parallelism(cmakelists: str, nproc: int) -> bool:
     """The two sed edits: compile with every CPU, link ~1 job per 16 GB."""
-    with open(_MEMINFO, encoding="utf-8") as handle:
-        mem_gb = mem_gb_from_meminfo(handle.read())
+    try:
+        with open(_MEMINFO, encoding="utf-8") as handle:
+            mem_gb = mem_gb_from_meminfo(handle.read())
+    except OSError as exc:
+        log_error(_OP, f"could not read {_MEMINFO}: {exc}", path=_MEMINFO)
+        return False
     if mem_gb is None:
         log_warn(_OP, f"no MemTotal in {_MEMINFO}; treating RAM as 0 GB like bash")
         mem_gb = 0
     jobs = linker_jobs(mem_gb)
     log_info(_OP, f"RCCL link parallelism: detected {mem_gb} GB RAM -> "
                   f"-parallel-jobs={jobs}", mem_gb=mem_gb, linker_jobs=jobs, nproc=nproc)
-    _edit_cmakelists(cmakelists, nproc, jobs)
+    return _edit_cmakelists(cmakelists, nproc, jobs)
 
 
 def _build_rccl(env: dict[str, str], build_dir: str, version: str, nproc: int) -> bool:
@@ -486,29 +476,21 @@ def _build_rccl(env: dict[str, str], build_dir: str, version: str, nproc: int) -
 
 def _install_from_source(env: dict[str, str], inputs: _Inputs) -> str | None:
     config = inputs.config
-    version, ref = str(config["version"]), rccl_ref(config)
+    version = str(config["version"])
     tarball = tarball_name(str(config["url"]))
     folder = source_folder_name(tarball)
     source_dir = os.path.join(_WORK_DIR, folder)
+    build_dir = os.path.join(source_dir, "build")
     log_info(_OP, f"Installing RCCL {version} on {inputs.distro} from source (no "
                   "usable RCCL package on this distro)", version=version,
-             source=str(config["url"]), ref=ref, commit=str(config.get("commit")),
-             gpu_targets=_AMD_GPU_TARGETS, **inputs.start_fields())
-    if not _fetch_source(env, config, folder, tarball):
-        return None
-    if not os.path.isdir(source_dir):
-        log_error(_OP, f"RCCL source folder {source_dir} was not created by the "
-                       "clone/extract", path=source_dir)
-        return None
-    os.mkdir(os.path.join(source_dir, "build"))     # plain mkdir: fails if present
-    _tune_parallelism(os.path.join(source_dir, "CMakeLists.txt"), inputs.nproc)
-    if not _build_rccl(env, os.path.join(source_dir, "build"), version, inputs.nproc):
-        return None
-    if not uses_git_clone(ref):
-        log_info(_OP, "RCCL built from the release tarball; no repo commit/ref to "
-                      "record, as in bash", source="tarball")
-    elif not write_repo_source_info("RCCL", source_dir, _OP, commit=str(config["commit"]),
-                                    ref=ref, env=env):
+             source=str(config["url"]), ref=rccl_ref(config),
+             commit=str(config.get("commit")), gpu_targets=_AMD_GPU_TARGETS,
+             **inputs.start_fields())
+    if not (_fetch_source(env, config, folder, tarball)
+            and make_dirs(build_dir, op=_OP)
+            and _tune_parallelism(os.path.join(source_dir, "CMakeLists.txt"), inputs.nproc)
+            and _build_rccl(env, build_dir, version, inputs.nproc)
+            and _record_rccl_repo(env, config, source_dir)):
         return None
     remove_paths(source_dir, os.path.join(_WORK_DIR, tarball), op=_OP)
     log_info(_OP, f"RCCL {version} installed to {_SOURCE_RCCL_PREFIX}; source removed",
@@ -529,7 +511,7 @@ def _configure_sysctl(env: dict[str, str], distro: Distro) -> bool:
         log_info(_OP, "Not applying sysctl settings now (Ubuntu only in bash); "
                       "they take effect at boot from sysctl.conf")
     # Bash's two `echo ... | tee -a` lines append even on a rerun.
-    already = [setting for setting in _SYSCTL_SETTINGS if _has_line(_SYSCTL_CONF, setting)]
+    already = [setting for setting in _SYSCTL_SETTINGS if file_has_line(_SYSCTL_CONF, setting)]
     if already:
         log_warn(_OP, f"{_SYSCTL_CONF} already has {', '.join(already)}; "
                       "appending again, as bash does on a rerun",
@@ -585,8 +567,8 @@ def _checkout_rocm_systems_therock(env: dict[str, str], inputs: _Inputs) -> bool
 
 
 def _build_rccl_tests(env: dict[str, str], inputs: _Inputs) -> bool:
-    os.makedirs(_RCCL_TESTS_DIR, exist_ok=True)
-    if not (inputs.branch.checkout_rocm_systems(env, inputs)
+    if not (make_dirs(_RCCL_TESTS_DIR, op=_OP)
+            and inputs.branch.checkout_rocm_systems(env, inputs)
             and write_repo_source_info("RCCL_TESTS", os.path.join(_WORK_DIR, "rocm-systems"),
                                        _OP, env=env)):
         return False
@@ -616,11 +598,11 @@ def _build_perftest(env: dict[str, str], inputs: _Inputs) -> bool:
         return False
     log_info(_OP, "Building perftest with ROCm support",
              url=_PERFTEST_GIT_URL, prefix=_PERFTEST_PREFIX_DIR, phase="perftest")
-    source_dir = os.path.join(_WORK_DIR, "perftest")
-    if not (run(["git", "clone", _PERFTEST_GIT_URL], _OP, cwd=_WORK_DIR, env=env)
-            and write_repo_source_info("PERFTEST", source_dir, _OP, env=env)):
+    source_dir = git_clone(_PERFTEST_GIT_URL, _OP, cwd=_WORK_DIR, env=env)
+    if not (source_dir
+            and write_repo_source_info("PERFTEST", source_dir, _OP, env=env)
+            and make_dirs(_PERFTEST_PREFIX_DIR, op=_OP)):
         return False
-    os.makedirs(_PERFTEST_PREFIX_DIR, exist_ok=True)
     if not run_all([
         ["./autogen.sh"],
         ["./configure", "--enable-rocm", "--with-rocm=/opt/rocm",
@@ -680,20 +662,16 @@ def _resolve_inputs(env: dict[str, str], distro: Distro) -> _Inputs | None:
         if rocm is None:
             return None
         rocm_version = str(rocm["version"])
-    nproc = _nproc(env)
-    if nproc is None:
-        return None
-    return _Inputs(distro, branch, config, rocm_version, nproc)
+    # bash runs $(nproc) for the sed edit and each `make -j`; read once here.
+    return _Inputs(distro, branch, config, rocm_version, cpu_count())
 
 
 def _install_all(env: dict[str, str], inputs: _Inputs) -> str | None:
     """Steps 1-4; the RCCL version, or None (logged) at the first failure."""
     version = inputs.branch.install_rccl(env, inputs)
-    if version is None:
-        return None
-    write_component_version("RCCL", version)
-    log_info(_OP, f"Recorded RCCL={version}", component="RCCL", version=version)
-    if not (_configure_sysctl(env, inputs.distro)
+    if not (version is not None
+            and record_version("RCCL", version, _OP)
+            and _configure_sysctl(env, inputs.distro)
             and _build_rccl_tests(env, inputs)
             and _build_perftest(env, inputs)):
         return None
@@ -707,15 +685,8 @@ def install(env: dict[str, str]) -> int:
         return 3
     # An empty scratch area, so a failed run's leftovers can't break `git
     # clone` / `mkdir build`; removed whatever happens (our addition).
-    remove_paths(_WORK_DIR, op=_OP)
     try:
-        os.makedirs(_WORK_DIR, exist_ok=True)
-        version = _install_all(env, inputs)
-    except OSError as exc:
-        # mkdir, CMakeLists edit, meminfo, and the versions file.
-        log_error(_OP, f"file operation failed: {exc}",
-                  path=getattr(exc, "filename", None))
-        return 3
+        version = _install_all(env, inputs) if fresh_dir(_WORK_DIR, _OP) else None
     finally:
         remove_paths(_WORK_DIR, op=_OP)
     if version is None:

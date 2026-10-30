@@ -1,7 +1,7 @@
 """Unit tests for components/python/install_rccl.py.
 
-  * Pure helpers (folder naming, ref choice, sed edits, memory maths, rpm and
-    CMake version parsing, the rccl-tests script and cmake arguments) are
+  * Pure helpers (folder naming, ref choice, sed edits, memory maths, CMake
+    version parsing, the rccl-tests script and cmake arguments) are
     tested directly with real inputs. The expected values for the sed edits,
     memory maths, jq ref choice and awk version parsing were produced with
     real GNU sed/awk/jq/bash. Key lines are also compared with the bash script
@@ -9,7 +9,7 @@
   * install() runs with every external effect mocked: config lookup, download,
     exec_program (in utils.process, where run/run_all/run_script/extract_tarball
     run commands, and in utils.package_installer for the apt-get/dnf
-    installs), run_capture (nproc, rpm, git rev-parse),
+    installs), run_capture (rpm, git rev-parse), cpu_count,
     write_repo_source_info and the versions file. A fake exec_program creates
     the directories that
     `git clone` / `git init` / `tar` would, so the real Python file handling
@@ -30,7 +30,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_rccl
-from utils import component_config, download, files, package_installer, process
+from utils import component_config, download, files, package_installer, process, repo_source
 from utils.build_config import BuildConfig, build_plan
 from utils.download import ChecksumError
 
@@ -216,11 +216,6 @@ class PureHelperTests(unittest.TestCase):
     def test_no_memtotal(self):
         self.assertIsNone(install_rccl.mem_gb_from_meminfo("MemFree: 5 kB\n"))
 
-    def test_rpm_version(self):
-        self.assertEqual(install_rccl.azure_linux_rccl_version("2.22.3-1.azl3\n"),
-                         "2.22.3-1.azl3")
-        self.assertIsNone(install_rccl.azure_linux_rccl_version(" \n"))
-
     def test_rccl_tests_script(self):
         # The lines after run_script's `module load mpi/hpcx` header.
         script = "\n".join(install_rccl.rccl_tests_script("/opt/rocm", _U2604_CMAKE_ARGS)) + "\n"
@@ -342,7 +337,7 @@ class InstallTests(unittest.TestCase):
         os.makedirs(path)
         Path(path, "CMakeLists.txt").write_text(_CMAKELISTS, encoding="utf-8")
 
-    def _install(self, distro, cfg, *, fail_on=None, fail_rc=2, nproc=(0, f"{_NPROC}\n"),
+    def _install(self, distro, cfg, *, fail_on=None, fail_rc=2,
                  rpm=(0, "2.22.3-1.azl3"), rev_parse=(0, f"{_THEROCK_PIN}\n"),
                  write_error=None, repo_ok=True, rocm_cfg=_ROCM_2604_CFG,
                  download_error=None):
@@ -350,8 +345,6 @@ class InstallTests(unittest.TestCase):
         self.repo_dirs_existed = {}
 
         def fake_capture(command, op, *, cwd=None, env=None):
-            if command == ["nproc"]:
-                return nproc
             if command[:2] == ["git", "-C"]:
                 self.events.append(("capture", "rev-parse"))
                 return rev_parse
@@ -389,9 +382,11 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(process, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
              mock.patch.object(install_rccl, "run_capture", side_effect=fake_capture) as cap, \
+             mock.patch.object(package_installer, "run_capture", new=cap), \
+             mock.patch.object(install_rccl, "cpu_count", return_value=_NPROC), \
              mock.patch.object(install_rccl, "write_repo_source_info",
                                side_effect=fake_repo) as repo, \
-             mock.patch.object(install_rccl, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=fake_record) as record, \
              mock.patch.object(install_rccl, "log_info") as info, \
              mock.patch.object(install_rccl, "log_warn") as warn, \
@@ -400,6 +395,9 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_error", new=error), \
              mock.patch.object(files, "log_info", new=info), \
              mock.patch.object(files, "log_error", new=error), \
+             mock.patch.object(component_config, "log_info", new=info), \
+             mock.patch.object(repo_source, "log_info", new=info), \
+             mock.patch.object(repo_source, "log_error", new=error), \
              mock.patch.object(download, "log_error", new=error), \
              mock.patch.object(component_config, "log_error", new=error):
             result = install_rccl.install(env)
@@ -612,7 +610,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((jobs["mem_gb"], jobs["linker_jobs"], jobs["nproc"]), (1510, 16, 96))
         self.assertEqual(by_message["Building RCCL 2.22.3 into /opt/rccl for gfx90a;gfx942"]
                          ["gpu_targets"], "gfx90a;gfx942")
-        self.assertIn("Recorded RCCL=2.22.3", by_message)
+        self.assertIn("Recorded RCCL 2.22.3", by_message)
         self.assertEqual(by_message[f"Installed 1 rccl-tests binaries in {self.tests_dir}"]
                          ["binaries"], ["all_reduce_perf"])
         self.assertEqual(self.info.call_args_list[-1].args[1],
@@ -678,11 +676,6 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self._install("ubuntu22.04", cfg), 0)
         self.download.assert_called_once()
 
-    def test_bad_nproc_returns_3(self):
-        for result in ((1, ""), (0, "abc\n"), (0, "0\n")):
-            with self.subTest(result=result):
-                self.assertEqual(self._install("ubuntu24.04", _CLONE_CFG, nproc=result), 3)
-                self.assertEqual(self.calls, [])
 
     def test_rpm_failure_returns_3(self):
         for rpm in ((1, "package rccl is not installed\n"), (0, "")):
@@ -721,7 +714,21 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(self, "_make_source"):     # clone creates nothing
             self.assertEqual(self._install("ubuntu24.04", _CLONE_CFG), 3)
         self.assertNotIn("cmake", [c[0] for c in self._commands()])
-        self.assertIn("was not created", self.error.call_args.args[1])
+        self.assertIn("git clone did not create", self.error.call_args.args[1])
+
+    def test_unreadable_meminfo_or_cmakelists_returns_3_before_cmake(self):
+        # bash: `mem_gb=$(awk ... /proc/meminfo)` / `sed -i` fail under set -e.
+        self.meminfo.unlink()
+        self.assertEqual(self._install("ubuntu24.04", _CLONE_CFG), 3)
+        self.assertNotIn("cmake", [c[0] for c in self._commands()])
+        self.assertIn("could not read", self.error.call_args.args[1])
+        self.assertFalse(os.path.exists(self.work))
+
+        self.meminfo.write_text(f"MemTotal:       {_MEM_KB} kB\n", encoding="utf-8")
+        with mock.patch.object(self, "_make_source", side_effect=os.makedirs):
+            self.assertEqual(self._install("ubuntu24.04", _CLONE_CFG), 3)
+        self.assertNotIn("cmake", [c[0] for c in self._commands()])
+        self.assertIn("could not read", self.error.call_args.args[1])
 
     def test_sysctl_conf_write_error_returns_3(self):
         os.makedirs(self.sysctl_conf)          # a directory can't be opened for append
