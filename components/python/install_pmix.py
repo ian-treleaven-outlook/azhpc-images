@@ -9,7 +9,7 @@ component-versions file. One handler per bash branch:
   * Ubuntu 26.04  nothing: it uses the PMIx 5 stack bundled with HPC-X
                   (install_mpis records that version).
   * Ubuntu        the Microsoft Slurm apt repo + pin file, the Microsoft repo
-                  package if missing, then `apt update`, install and
+                  package if missing, then `apt-get update`, install and
                   `apt-mark hold` of pmix=<version> and the -dev packages.
   * Azure Linux   pmix from the distro repos; the version recorded is the one
                   dnf installed, NOT versions.json's.
@@ -25,8 +25,9 @@ Deliberate differences
 ----------------------
   * Package installs go through install_packages(), spelled `apt-get install
     -y -o Dpkg::Use-Pty=0` / `dnf install -y` (bash: `apt install -y` /
-    `dnf -y install`). `rpm -i`, `apt update`, `apt-mark hold`,
-    `dnf config-manager` and `dnf update` run as in bash. A RHEL-like distro
+    `dnf -y install`), and bash's `apt update` is refresh_package_index()'s
+    `apt-get update`. `rpm -i`, `apt-mark hold`, `dnf config-manager` and
+    `dnf update` run as in bash. A RHEL-like distro
     install_packages() doesn't know (e.g. CentOS) fails at the pmix install;
     bash's else branch would use dnf.
   * OS versions come from DISTRIBUTION ($ID$VERSION_ID, see
@@ -42,20 +43,20 @@ Deliberate differences
   * The Microsoft repo package (.deb/.rpm) is downloaded into a scratch
     directory, removed afterwards, instead of the distro build directory.
     Like bash there is no checksum: curl fetches it from packages.microsoft.com.
-  * write_file creates /etc/apt/sources.list.d if it is missing.
+  * write_file creates /etc/apt/sources.list.d if it is missing; the pin and
+    repo files are copied with copy_file() (`cp`, logged).
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
-from utils.files import remove_paths, write_file
+from utils.files import copy_file, make_dirs, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import install_packages, refresh_package_index
 from utils.process import run, run_all, run_capture
 
 _OP = "install-pmix"
@@ -166,21 +167,6 @@ def pmix_match_count(dnf_output: str, architecture: str) -> int:
 # --------------------------------------------------------------------------- #
 # Repository setup.
 # --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: copy_file(src, dest, op) -> bool (bash `cp`,
-# logging created/replaced); a dozen ports copy files with shutil.
-def _copy_file(source: str, dest: str) -> bool:
-    """bash `cp source dest` onto a file: copy the contents only."""
-    action = "replaced" if os.path.lexists(dest) else "created"
-    try:
-        shutil.copyfile(source, dest)
-    except OSError as exc:
-        log_error(_OP, f"could not copy {source} to {dest}: {exc}", path=dest, source=source)
-        return False
-    log_info(_OP, f"Copied {source} to {dest} ({action})", path=dest, source=source,
-             action=action)
-    return True
-
-
 def _ensure_ms_repo_package(marker: str, url: str, env: dict[str, str], *,
                             with_rpm: bool) -> bool:
     """Install packages-microsoft-prod unless `marker` (its repo file) exists.
@@ -206,7 +192,8 @@ def _install_ms_repo_package(url: str, env: dict[str, str], *, with_rpm: bool) -
     log_info(_OP, f"Installing the Microsoft repo package {filename} (sets up the "
                   "packages.microsoft.com signing key)", url=url,
              installer="rpm -i" if with_rpm else "install_packages")
-    os.makedirs(_WORK_DIR, exist_ok=True)
+    if not make_dirs(_WORK_DIR, op=_OP):
+        return False
     try:
         if not run(["curl", "-sSL", "-O", url], _OP, cwd=_WORK_DIR, env=env):
             return False
@@ -214,12 +201,19 @@ def _install_ms_repo_package(url: str, env: dict[str, str], *, with_rpm: bool) -
             installed = run(["rpm", "-i", filename], _OP, cwd=_WORK_DIR, env=env)
         else:
             installed = install_packages([f"./{filename}"], env, _OP, cwd=_WORK_DIR)
-        if not installed:
-            return False
-        # bash's `rm <file>` stops the script if the file is gone.
-        os.remove(os.path.join(_WORK_DIR, filename))
+        return installed and _remove_download(os.path.join(_WORK_DIR, filename))
     finally:
         remove_paths(_WORK_DIR, op=_OP)
+
+
+def _remove_download(path: str) -> bool:
+    """bash `rm <file>`: unlike `rm -rf` (remove_paths), a missing file stops
+    the script under `set -e`, so this one stays a strict remove."""
+    try:
+        os.remove(path)
+    except OSError as exc:
+        log_error(_OP, f"could not remove {path}: {exc}", path=path)
+        return False
     return True
 
 
@@ -240,9 +234,9 @@ def _install_ubuntu(env: dict[str, str], distro: Distro, version: str) -> str | 
                   "packages-microsoft-prod.deb")
     packages = ubuntu_packages(version)
     ok = (write_file(_SLURM_APT_LIST, line, _OP)
-          and _copy_file(pin, _SLURM_APT_PIN)
+          and copy_file(pin, _SLURM_APT_PIN, _OP)
           and _ensure_ms_repo_package(_MS_PROD_APT_LIST, ms_package, env, with_rpm=False)
-          and run(["apt", "update"], _OP, env=env)
+          and refresh_package_index(env, _OP)
           and install_packages(packages, env, _OP)
           # Held so routine upgrades don't replace them. bash holds
           # "pmix=<version>" (not just "pmix"), and so do we.
@@ -262,7 +256,11 @@ def _install_azurelinux(env: dict[str, str], distro: Distro, version: str) -> st
 
 
 def _installed_azure_linux_version(env: dict[str, str]) -> str | None:
-    """The pmix version `dnf list installed` reports, parsed as bash does."""
+    """The pmix version `dnf list installed` reports, parsed as bash does.
+
+    Not installed_package_version(): rpm's %{RELEASE} keeps the ".azl3" that
+    bash's sed drops, so the recorded version would change.
+    """
     architecture = env.get("ARCHITECTURE", "")
     rc, output = run_capture(["dnf", "list", "installed"], _OP, env=env)
     if rc != 0:
@@ -296,7 +294,7 @@ def _install_rhel(env: dict[str, str], distro: Distro, version: str) -> str | No
                              f"slurm-el{major}.repo")
     ms_package = f"https://packages.microsoft.com/config/rhel/{major}/packages-microsoft-prod.rpm"
     enable = [["dnf", "config-manager", "--set-enabled", extra_repo]] if extra_repo else []
-    ok = (_copy_file(repo_file, _SLURM_YUM_REPO)
+    ok = (copy_file(repo_file, _SLURM_YUM_REPO, _OP)
           and _ensure_ms_repo_package(_MS_PROD_YUM_REPO, ms_package, env, with_rpm=True)
           and run_all([*enable, ["dnf", "update", "-y"]], _OP, env=env)
           and install_packages(rhel_packages(version, major), env, _OP))
@@ -327,14 +325,7 @@ def install(env: dict[str, str]) -> int:
     handler = _handler_for(distro)
     log_info(_OP, f"Installing PMIx on {distro}", distro=str(distro), version=version,
              handler=handler.__name__.removeprefix("_install_"))
-    try:
-        recorded = handler(env, distro, version)
-        if recorded is None:
-            return 3
-        write_component_version("PMIX", recorded)
-    except OSError as exc:
-        # The versions file under /opt, or removing the downloaded package.
-        log_error(_OP, f"file operation failed: {exc}", path=getattr(exc, "filename", None))
+    recorded = handler(env, distro, version)
+    if recorded is None or not record_version("PMIX", recorded, _OP):
         return 3
-    log_info(_OP, f"Recorded PMIX={recorded}", component="PMIX", version=recorded)
     return 0

@@ -204,8 +204,9 @@ class _InstallTestBase(unittest.TestCase):
         with mock.patch.object(process, "exec_program", side_effect=fake_exec) as ex, \
              mock.patch.object(package_installer, "exec_program", new=ex), \
              mock.patch.object(install_pmix, "run_capture", return_value=capture) as cap, \
-             mock.patch.object(install_pmix, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_pmix, "log_warn") as log_warn, \
              mock.patch.object(install_pmix, "log_error"), \
              mock.patch.object(component_config, "log_error"), \
@@ -223,7 +224,7 @@ class _InstallTestBase(unittest.TestCase):
 
 class UbuntuTests(_InstallTestBase):
     _APT = [
-        ["apt", "update"],
+        ["apt-get", "update"],
         [*_APT_INSTALL, f"pmix={_VERSION}", "libevent-dev", "libhwloc-dev"],
         ["apt-mark", "hold", f"pmix={_VERSION}", "libevent-dev", "libhwloc-dev"],
     ]
@@ -317,7 +318,7 @@ class UbuntuTests(_InstallTestBase):
 
     def test_apt_update_failure_returns_3(self):
         self._touch("_MS_PROD_APT_LIST")
-        rc, commands, _, _, _ = self._install(_env("ubuntu24.04"), fail_on=["apt", "update"])
+        rc, commands, _, _, _ = self._install(_env("ubuntu24.04"), fail_on=["apt-get", "update"])
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, self._APT[:1])
