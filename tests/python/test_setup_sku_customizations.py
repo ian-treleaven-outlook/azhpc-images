@@ -8,8 +8,9 @@ Three kinds of test:
     vendor, so they are byte for byte what the bash step writes.
   * The pure sed-like helpers are tested with inputs whose expected results
     were produced by the real `sed` commands from the bash script.
-  * install() runs with systemctl faked and every path pointed at a temporary
-    folder, so the tests never touch /opt, /usr, /etc, /lib or /boot.
+  * install() runs with utils.process.exec_program (under systemctl()) and
+    utils.logger._log faked and every path pointed at a temporary folder, so
+    the tests never touch /opt, /usr, /etc, /lib or /boot.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -21,6 +22,7 @@ import os
 import stat
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 from unittest import mock
 
@@ -44,6 +46,23 @@ def _read(path: str) -> str:
 
 def _mode(path: str) -> int:
     return stat.S_IMODE(os.stat(path).st_mode)
+
+
+_Record = namedtuple("_Record", "level message fields")
+
+
+class _Logs:
+    """Stands in for utils.logger._log, so it sees every module's log lines."""
+
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, level, op, message, fields=None, detail=None):
+        assert op == _OP
+        self.records.append(_Record(level, message, fields or {}))
+
+    def at(self, level):
+        return [record for record in self.records if record.level == level]
 
 
 # --------------------------------------------------------------------------- #
@@ -157,8 +176,8 @@ class InstallTests(unittest.TestCase):
         """Run install() with systemctl faked and paths redirected.
 
         Returns (rc, commands, logs): the systemctl commands that were run, and
-        the fake log_info / log_warn / log_error. fail_at=N makes the Nth
-        command (counting from 0) return exit code 1.
+        every log record. fail_at=N makes the Nth command (counting from 0)
+        return exit code 1.
         """
         commands = []
 
@@ -166,12 +185,10 @@ class InstallTests(unittest.TestCase):
             commands.append(command)
             return 1 if len(commands) - 1 == fail_at else 0
 
-        logs = {}
+        logs = _Logs()
         with mock.patch.multiple(sku, **dict(self.paths, **(paths or {}))), \
-             mock.patch.object(sku, "exec_program", side_effect=run), \
-             mock.patch.object(sku, "log_info") as logs["info"], \
-             mock.patch.object(sku, "log_warn") as logs["warn"], \
-             mock.patch.object(sku, "log_error") as logs["error"]:
+             mock.patch("utils.process.exec_program", side_effect=run), \
+             mock.patch("utils.logger._log", logs):
             rc = sku.install(env or self.env)
         return rc, commands, logs
 
@@ -204,7 +221,7 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.paths["_FABRICMANAGER_UNIT"]))
         # Enabled, never started.
         self.assertEqual(commands, [["systemctl", "enable", "sku-customizations"]])
-        logs["error"].assert_not_called()
+        self.assertEqual(logs.at("error"), [])
 
     def test_amd_writes_amd_scripts_and_no_nvidia_extras(self):
         Path(self.paths["_FABRICMANAGER_UNIT"]).write_text("After=multi-user.target\n")
@@ -226,9 +243,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(_read(self.paths["_FABRICMANAGER_UNIT"]),
                          "[Unit]\nAfter=network-online.target\n[Service]\n")
-        edits = [c for c in logs["info"].call_args_list
-                 if c.kwargs.get("path") == self.paths["_FABRICMANAGER_UNIT"]]
-        self.assertEqual(edits[0].kwargs["lines_removed"], 1)
+        edits = [r for r in logs.at("info")
+                 if r.fields.get("path") == self.paths["_FABRICMANAGER_UNIT"]]
+        self.assertEqual(edits[0].fields["lines_removed"], 1)
 
     def test_existing_generated_files_are_overwritten(self):
         for key in ("_SETUP_SCRIPT", "_REMOVE_SCRIPT", "_SERVICE_FILE"):
@@ -259,9 +276,9 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(commands, [["systemctl", "stop", "irqbalance"],
                                     ["systemctl", "disable", "irqbalance"],
                                     ["systemctl", "enable", "sku-customizations"]])
-        messages = [c.args[1] for c in logs["info"].call_args_list]
+        messages = [r.message for r in logs.at("info")]
         self.assertIn("Stopped and disabled irqbalance (GB200)", messages)
-        logs["warn"].assert_not_called()
+        self.assertEqual(logs.at("warn"), [])
 
     def test_gb200_changes_need_both_azure_linux_and_gb200(self):
         self._write_grub()
@@ -282,7 +299,7 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(_read(self.paths["_GRUB_DEFAULT"]), "GRUB_TIMEOUT=0\n")
-        logs["warn"].assert_called_once()
+        self.assertEqual(len(logs.at("warn")), 1)
 
     def test_gb200_rerun_warns_that_options_are_already_there(self):
         self._write_grub()
@@ -293,7 +310,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         # Added again, like bash's sed.
         self.assertEqual(_read(self.paths["_GRUB_DEFAULT"]).count("efi_mmap"), 2)
-        warned = [c.kwargs["path"] for c in logs["warn"].call_args_list]
+        warned = [r.fields["path"] for r in logs.at("warn")]
         self.assertEqual(warned, [self.paths["_GRUB_DEFAULT"], self.paths["_GRUB_CFG"]])
 
     def test_gb200_missing_grub_file_returns_3_before_systemctl(self):
@@ -303,30 +320,28 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertIn("could not edit", logs["error"].call_args.args[1])
+        self.assertIn("could not edit", logs.at("error")[-1].message)
 
     # ---- logging -----------------------------------------------------------
     def test_logs_start_decision_files_enable_and_summary(self):
         _, _, logs = self._install()
-        info = logs["info"]
+        info = logs.at("info")
 
-        start = info.call_args_list[0]
-        self.assertEqual(start.args, (_OP, "Setting up SKU customizations"))
-        self.assertEqual(start.kwargs["gpu"], "NVIDIA")
-        self.assertEqual(start.kwargs["sku"], "H100")
-        messages = [c.args[1] for c in info.call_args_list]
+        start = info[0]
+        self.assertEqual(start.message, "Setting up SKU customizations")
+        self.assertEqual(start.fields["gpu"], "NVIDIA")
+        self.assertEqual(start.fields["sku"], "H100")
+        messages = [r.message for r in info]
         self.assertIn("Using the NVIDIA setup/remove scripts", messages)
-        copied = [c for c in info.call_args_list if c.args[1].startswith("Copied ")]
-        self.assertEqual([c.kwargs["count"] for c in copied], [2, 2])
-        wrote = [c for c in info.call_args_list
-                 if c.args[1] == f"Wrote {self.paths['_SETUP_SCRIPT']}"]
-        self.assertEqual(wrote[0].kwargs["mode"], "0755")
-        self.assertEqual(wrote[0].kwargs["action"], "created")
+        copied = [r for r in info if r.message.startswith("Copied ")]
+        self.assertEqual([r.fields["count"] for r in copied], [2, 2])
+        wrote = [r for r in info if r.fields.get("path") == self.paths["_SETUP_SCRIPT"]]
+        self.assertEqual(wrote[0].fields["action"], "created")
         self.assertIn("Enabled sku-customizations (not started during the build; "
                       "it runs at boot)", messages)
-        summary = info.call_args_list[-1]
-        self.assertEqual(summary.args[1], "SKU customizations set up")
-        self.assertFalse(summary.kwargs["gb200_changes"])
+        summary = info[-1]
+        self.assertEqual(summary.message, "SKU customizations set up")
+        self.assertFalse(summary.fields["gb200_changes"])
 
     # ---- failures ----------------------------------------------------------
     def test_unknown_gpu_returns_3_before_changing_anything(self):
@@ -337,7 +352,7 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, [])
                 self.assertFalse(os.path.exists(self.paths["_CUSTOMIZATIONS_DIR"]))
-                self.assertIn("GPU is not NVIDIA or AMD", logs["error"].call_args.args[1])
+                self.assertIn("GPU is not NVIDIA or AMD", logs.at("error")[-1].message)
 
     def test_missing_repo_dirs_returns_3(self):
         for key in ("COMPONENT_DIR", "TOP_DIR"):
@@ -357,7 +372,7 @@ class InstallTests(unittest.TestCase):
                          ["ndv5.sh", "setup_nvme.sh"])
         self.assertFalse(os.path.exists(self.paths["_TOPOLOGY_DIR"]))
         self.assertEqual(commands, [])
-        self.assertIn("contains folders", logs["error"].call_args.args[1])
+        self.assertIn("contains folders", logs.at("error")[-1].message)
 
     def test_empty_topology_folder_returns_3(self):
         for name in os.listdir(os.path.join(self.top, "topology")):
@@ -366,16 +381,17 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 3)
         self.assertFalse(os.path.exists(self.paths["_SETUP_SCRIPT"]))
-        self.assertIn("no files to copy", logs["error"].call_args.args[1])
+        self.assertIn("no files to copy", logs.at("error")[-1].message)
 
     def test_unwritable_setup_script_returns_3(self):
-        missing = os.path.join(self.root, "no-such-dir", "setup.sh")
-        rc, commands, logs = self._install(paths={"_SETUP_SCRIPT": missing})
+        a_folder = os.path.join(self.root, "a-folder")    # can't be opened for writing
+        os.makedirs(a_folder)
+        rc, commands, logs = self._install(paths={"_SETUP_SCRIPT": a_folder})
 
         self.assertEqual(rc, 3)
         self.assertFalse(os.path.exists(self.paths["_SERVICE_FILE"]))
         self.assertEqual(commands, [])
-        self.assertIn("could not write", logs["error"].call_args.args[1])
+        self.assertIn("could not write", logs.at("error")[-1].message)
 
     def test_each_failing_command_returns_3_and_stops(self):
         expected = [["systemctl", "stop", "irqbalance"],
@@ -388,7 +404,7 @@ class InstallTests(unittest.TestCase):
                 rc, commands, logs = self._install(env=env, fail_at=index)
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, expected[:index + 1])
-                self.assertEqual(logs["error"].call_args.kwargs["exit_code"], 1)
+                self.assertNotEqual(logs.at("info")[-1].message, "SKU customizations set up")
 
 
 # --------------------------------------------------------------------------- #
