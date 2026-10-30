@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import no_rdma_network as m
-from utils import package_installer
+from utils import files, package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _INSTALL_SH = (Path(__file__).resolve().parents[2] / "distros" / "ubuntu24.04"
@@ -62,8 +62,9 @@ class BlacklistManaIbTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
 
     def _run(self):
-        with mock.patch.object(m, "log_info") as info, \
-             mock.patch.object(m, "log_error") as error:
+        with mock.patch.object(m, "log_info"), \
+             mock.patch.object(files, "log_info") as info, \
+             mock.patch.object(files, "log_error") as error:
             rc = m.blacklist_mana_ib({"SKU": "NCv6"})
         return rc, info, error
 
@@ -81,11 +82,10 @@ class BlacklistManaIbTests(unittest.TestCase):
         self.assertEqual(info.call_args.kwargs["action"], "replaced")
 
     def test_write_error_returns_3(self):
-        with mock.patch.object(Path, "write_text", side_effect=PermissionError("denied")):
-            rc, _, error = self._run()
+        self.path.mkdir()   # a directory can't be opened for writing
+        rc, _, error = self._run()
         self.assertEqual(rc, 3)
         error.assert_called_once()
-
 
 class BuildPlanWiringTests(unittest.TestCase):
     def _ops(self, gpu):
