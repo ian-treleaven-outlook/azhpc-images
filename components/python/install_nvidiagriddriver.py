@@ -75,7 +75,8 @@ install() receives the build environment (a dict) and returns 0 for success or
 
 Behaviour kept from bash
 ------------------------
-  * Commands, arguments and order are the same, and the first failing command
+  * Commands, arguments and order are the same (apart from the toolkit
+    install's spelling, below), and the first failing command
     stops the step (bash's `set -e`). The driver installer is run by its
     fixed name, NVIDIA-Linux-x86_64-<version>-grid-azure.run, not by the name
     of the downloaded file (we warn when the two differ: the run then fails).
@@ -92,12 +93,15 @@ Behaviour kept from bash
     checked against the real tools in WSL.
   * /etc/profile.d/cuda.sh gets exactly the bytes the two echo | tee lines
     write (checked against bash in WSL; a test also compares it with the .sh).
-  * Nothing checks the distro, like bash. The apt command only works on
-    Ubuntu, so on any other distro we log a warning and carry on; apt then
-    fails the step, as it would fail the bash script.
+  * Nothing checks the distro, like bash. Bash's apt only works on Ubuntu,
+    so on any other distro we log a warning, carry on, and fail the step at
+    the CUDA toolkit install, where bash's apt fails. (We don't run the
+    install there: install_packages() would pick that distro's dnf.)
 
 Deliberate differences from bash
 --------------------------------
+  * The toolkit install goes through install_packages(), which normalises
+    `apt install -y` to `apt-get install -y -o Dpkg::Use-Pty=0`.
   * Missing config fails up front, before anything is installed: the GRID
     url, sha256 and version, and the CUDA driver.version. Bash would download
     "null", run a missing installer, or `apt install cuda-toolkit-null` after
@@ -136,6 +140,7 @@ from components.python import install_cuda_samples
 from utils.component_config import config_for, write_component_version
 from utils.download import download_and_verify
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py; used on every log line.
@@ -440,7 +445,7 @@ def _check_cuda_apt_source() -> None:
     """Log whether NVIDIA's CUDA apt source is configured (bash doesn't check).
 
     install_cuda_repo_and_dkms.sh adds it during the bootstrap; without it the
-    `apt install cuda-toolkit-...` below can't find the package.
+    cuda-toolkit install below can't find the package.
     """
     sources = sorted(glob.glob(os.path.join(_APT_SOURCES_DIR, _CUDA_APT_SOURCE_GLOB)))
     if sources:
@@ -488,7 +493,7 @@ def install(env: dict[str, str]) -> int:
     if not distribution.startswith("ubuntu"):
         log_warn(_OP, "install_nvidiagriddriver.sh assumes Ubuntu (apt) but "
                       "doesn't check the distro; continuing like bash, so the "
-                      "apt command will fail", distro=distribution)
+                      "step fails at the CUDA toolkit install", distro=distribution)
 
     try:
         # Start from an empty work directory (see the module docstring).
@@ -524,12 +529,17 @@ def install(env: dict[str, str]) -> int:
             return 3
 
         # ---- 3. CUDA toolkit (repo added by the bootstrap, see docstring) -----
+        if not distribution.startswith("ubuntu"):
+            # install_packages() would pick dnf here; bash runs apt and fails.
+            log_error(_OP, f"cannot install {toolkit}: install_nvidiagriddriver.sh "
+                           f"installs it with apt, which {distribution or '(unset)'} "
+                           "doesn't have; failing here, where bash's apt fails",
+                      package=toolkit, distro=distribution)
+            return 3
         _check_cuda_apt_source()
         log_info(_OP, f"Installing {toolkit} from the NVIDIA CUDA apt repository",
                  package=toolkit, cuda_toolkit_version=values["cuda_version"])
-        if not _run_all([["apt", "install", "-y", toolkit]], env):
-            log_error(_OP, f"CUDA toolkit installation failed ({toolkit})",
-                      package=toolkit, distro=distribution)
+        if not install_packages([toolkit], env, _OP, cwd=_WORK_DIR):
             return 3
 
         # ---- 4. /etc/profile.d/cuda.sh -------------------------------------------
