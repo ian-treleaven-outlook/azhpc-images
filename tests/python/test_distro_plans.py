@@ -118,9 +118,10 @@ class ResolveConfigTests(unittest.TestCase):
                              "AMD GPU support is not implemented yet for X.")
             self.assertEqual(self._resolve("Ubuntu24").vendor, "NVidia")
 
+    @unittest.skipUnless(PENDING, "every --os has a plan")
     def test_build_plan_refuses_an_os_without_a_plan(self):
         with self.assertRaises(ConfigError):
-            build_plan(_cfg("Azure3", "NVidia", "A100"))
+            build_plan(_cfg(next(iter(PENDING)), "NVidia", "A100"))
 
 
 class InstallShParityTests(unittest.TestCase):
