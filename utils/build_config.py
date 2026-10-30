@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, install_azsecpack_prereqs
+from components.python import install_mpifileutils, install_libfabric, install_intel_libs, install_hpcdiag, install_monitoring_tools, install_nvbandwidth_tool, install_aznfs, install_doca, write_kernel_os_version, disable_predictive_interface_renaming, add_udev_rules, copy_test_file, install_nvshmem, install_nvloom, install_pmix, trivy_scan, install_amd_libs, install_health_checks, disable_cloudinit, hpc_tuning, install_azure_persistent_rdma_naming, setup_sku_customizations, install_docker, install_dcgm, install_rocm, install_rccl, install_waagent, install_mpis, install_nvidiagpudriver, install_nvidiagriddriver, install_nccl, install_lustre_client, no_rdma_network, install_azsecpack_prereqs
 from utils.sku import sku_has_infiniband
 from utils.system_prep import prepare_system
 from utils.component_config import DEFAULT_NODE_TYPE
@@ -278,8 +278,14 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
         Step("install-doca", "install_doca.sh", action=install_doca.install,
              when=lambda c: sku_has_infiniband(c.gpu)),
+        # No-RDMA SKUs (NCv6): install.sh's inline rdma-core install, then
+        # libfabric, then the mana_ib blacklist (see no_rdma_network.py).
+        Step("install-rdma-core", action=no_rdma_network.install_rdma_core,
+             when=lambda c: not sku_has_infiniband(c.gpu)),
         Step("install-libfabric", "install_libfabric.sh",
              action=install_libfabric.install,
+             when=lambda c: not sku_has_infiniband(c.gpu)),
+        Step("blacklist-mana-ib", action=no_rdma_network.blacklist_mana_ib,
              when=lambda c: not sku_has_infiniband(c.gpu)),
 
         # AMD: ROCm comes before PMIx/MPI, as in install.sh, so that
