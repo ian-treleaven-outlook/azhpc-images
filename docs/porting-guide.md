@@ -3,16 +3,15 @@
 A contributor guide for the incremental port of the bash image-build
 orchestration to Python.
 
-**Status:** [`build_plan()`](../utils/build_config.py#L191) in
-[`build_config.py`](../utils/build_config.py#L191), called from
-[`azhpc.py`](../azhpc.py#L192), has 36 steps; **all 36 run natively in Python**,
-matching upstream `Azure/azhpc-images@0c2b8f9` (October 2026; see §12).
+**Status:** each distro has its own build plan in [`utils/plans/`](../utils/plans/__init__.py),
+run by `azhpc.py`. The Ubuntu 24.04 plan
+([`ubuntu24_04.py`](../utils/plans/ubuntu24_04.py)) has 36 steps; **all 36 run
+natively in Python**, matching upstream `Azure/azhpc-images@0c2b8f9` (October
+2026; see §12). Other distros get their plans in ADO 992–997.
 Before them, the bootstrap makes `utils/set_properties.sh`'s system changes
 (`utils/system_prep.py`: apt upgrade, jq, ...) and runs `install_utils.sh`.
 Each bash script is kept as that step's fallback and parity reference: delete a
-Step's `action=`, or mark it `resync=`, and it runs the bash script again. The
-plan mirrors `distros/ubuntu24.04/install.sh`; the other distros' `install.sh`
-scripts still differ from it in places (see §12).
+Step's `action=`, or mark it `resync=`, and it runs the bash script again.
 
 > Much of the design rationale here comes from Gio Martinez's project
 > presentation, *Azure HPC Images Python Refactor* (Aug 2026). He designed and
@@ -75,9 +74,10 @@ what every line was supposed to do.
 
 ## 2. How the port works
 
-`distros/<os>/install.sh` is the authoritative bash orchestrator.
-`utils/build_config.py` mirrors it as a **build plan** — an ordered list of
-`Step` objects:
+`distros/<os>/install.sh` is the authoritative bash orchestrator. Each distro
+has a **build plan** in `utils/plans/<folder>.py` that mirrors its install.sh
+line for line — an ordered list of `Step` objects (`utils/plans/step.py`), built
+from the shared step library in `utils/plans/steps.py`:
 
 ```python
 @dataclass(frozen=True)
@@ -107,10 +107,13 @@ else:
 ### Porting is one reversible line
 
 ```python
-Step("install-lustre", "install_lustre_client.sh"),                    # bash
+# utils/plans/steps.py
+def lustre(**kw):
+    return Step("install-lustre", "install_lustre_client.sh", **kw)          # bash
 
-Step("install-mpifileutils", "install_mpifileutils.sh",
-     action=install_mpifileutils.install),                             # ported
+def mpifileutils(**kw):
+    return Step("install-mpifileutils", "install_mpifileutils.sh",
+                action=install_mpifileutils.install, **kw)                  # ported
 ```
 
 Adding `action=` ports it. **Deleting `action=` reverts it** — back to code
@@ -406,7 +409,7 @@ remaining scripts.
 | Shell that must share one shell (e.g. `module load` then build) | `install_mpifileutils.py` — the build step |
 | Three-way distro branching | `install_doca.py` |
 | Needs stdout parsed from a command | `install_nccl.py` / `run_capture` |
-| Inline shell in `install.sh` with no component script | `_cleanup_downloads` in `build_config.py`; `no_rdma_network.py` |
+| Inline shell in `install.sh` with no component script | `cleanup_downloads` in `utils/plans/steps.py`; `no_rdma_network.py` |
 
 ---
 
@@ -417,9 +420,11 @@ remaining scripts.
    downloaded file, and version written.
 3. **Create `components/python/<name>.py`** with a docstring naming the bash
    script it ports, and an `install(env) -> int`.
-4. **Attach the action** in `build_plan()` — add `action=<module>.install` to the
-   existing `Step`. Keep `script=` and `when=` exactly as they are.
-5. **Import your module** at the top of `utils/build_config.py`.
+4. **Attach the action** in `utils/plans/steps.py` — import your module there
+   and add `action=<module>.install` to its step function. Keep `script=` as it
+   is; distro plans set `when=`.
+5. **Check the plans**: every distro plan that runs the script now runs your
+   port, so its tests should cover each distro branch of the bash.
 6. **Write tests** (below).
 7. **Run the suite:** `python -m unittest discover -s tests/python`
 8. **Open a PR** against `modern/python`.
@@ -486,7 +491,7 @@ stale. If your component has interesting resolution (SKU-nested or
   `DEBIAN_FRONTEND=noninteractive`. Don't re-set it or add `-y` hacks.
 - **Order matters.** Some steps depend on earlier ones (`install_lustre_client.sh`
   must precede `install_mpifileutils.sh` so Lustre support compiles in). Don't
-  reorder `build_plan()` to suit a port.
+  reorder a distro plan to suit a port.
 - **Log labels must match the step's `op`**, or output can't be correlated.
 
 ---
@@ -535,21 +540,45 @@ bash: upstream #566 removed the dedicated `install_nvidiagpudriver_gb200.sh`, an
 the shared script switches to IMEX/CDMM when `NVLINK_RACKSCALE=true` (packer sets
 it for GB*/VR* SKUs).
 
-### Known gap: distros other than Ubuntu 24.04
+### One plan per distro
 
-`build_plan()` follows `distros/ubuntu24.04/install.sh`. The other distros'
-`install.sh` scripts differ from it in which component scripts they run — for
-example Azure Linux uses `install_mofed.sh` instead of `install_doca.sh` and
-doesn't run `install_lustre_client.sh`; AlmaLinux and Rocky don't run
-`add-udev-rules.sh` and run extra scripts such as `network-config.sh`.
-`DISTRO_DIRS` also names `almalinux9.7`/`rocky9.7` directories that don't exist
-(they are `9.x`), and upstream added RHEL 8.10/9.x and Ubuntu 26.04, which the
-CLI doesn't offer yet. Only the Ubuntu-only and Azure Linux cloud-init skips
-are handled so far; the rest needs per-distro plans (ADO 991–997) before other
-distros use the Python path.
+Each distro's install.sh runs a different list of scripts, in a different
+order: Azure Linux uses `install_mofed.sh` instead of `install_doca.sh` and has
+no Lustre; AlmaLinux, Rocky and RHEL add `fix_setools_cyclecloud.sh` and
+`network-config.sh`; Ubuntu 22.04 runs `remove_unused_packages.sh` before
+`install_utils.sh`; Ubuntu 26.04 has no PMIx step. So each gets its own plan in
+`utils/plans/`, registered in `PLANS` (`utils/plans/__init__.py`):
+
+```python
+DistroPlan(
+    build=ubuntu24_04.build,          # steps after install_utils.sh, in order
+    pre_bootstrap=...,                # steps before install_utils.sh (optional)
+    vendors=frozenset({"NVidia"}),    # what install.sh accepts (optional)
+    vendor_error="AMD GPU support is not implemented yet for AlmaLinux.",
+)
+```
+
+A build runs set_properties.sh's system changes, the plan's pre-bootstrap
+steps, `install_utils.sh`, then the plan's steps.
+
+The CLI accepts every distro folder as `--os` (Ubuntu22/24/26, Azure3,
+Alma8/9, Rocky8/9, RHEL8/9). `versions` and `validate` work for all of them;
+building needs a plan, and an OS without one stops with the ticket that will
+add it (`PENDING`): Ubuntu 22.04 ADO 992, Ubuntu 26.04 ADO 993, Azure Linux
+ADO 994, AlmaLinux ADO 995, Rocky ADO 996, RHEL ADO 997.
+
+**Adding a distro:** write `utils/plans/<folder>.py` with `build(cfg)` (and
+`pre_bootstrap(cfg)` if needed), reading top to bottom like its install.sh;
+register it in `PLANS` and drop it from `PENDING`; add its folder to
+`python_cli_os_by_folder` in `packer/variables.pkr.hcl`. The tests in
+`tests/python/test_distro_plans.py` then check it against its own install.sh
+automatically: the same order, every script covered across representative
+SKUs, every script present, and the cleanup word for word.
+
+The Python code needs Python 3.10 or newer. AlmaLinux/Rocky 8 ship 3.6 and 9
+ship 3.9, so those plans need a newer `python3` on the build VM.
 
 ---
-
 ## 13. Where this is headed
 
 Beyond the component ports, three things carried over from the project's
@@ -572,7 +601,7 @@ Python CLI through Packer and comparing it with a bash-built one.
 ## 14. Reference
 
 - Working branch: `modern/python`
-- Build plan: `utils/build_config.py` → `build_plan()`
+- Build plans: `utils/plans/` (one per distro; shared steps in `steps.py`), run by `utils/build_config.py` → `ImageBuilder`
 - Ported components: `components/python/`
 - Tests: `tests/python/` — `python -m unittest discover -s tests/python`
 - Entry point: `python3 azhpc.py --vendor NVidia --gpu A100 --os Ubuntu24`
