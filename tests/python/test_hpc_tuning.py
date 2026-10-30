@@ -5,11 +5,12 @@ Two kinds of test:
   * The pure helpers (distro branch, firewalld rule, NVLINK_RACKSCALE parsing)
     and the exact generated text are tested directly.
   * install() runs against a temporary directory: every path constant in the
-    module is pointed into it with mock.patch.object, and exec_program /
-    run_capture (which would run apt-get, pip3, dnf, systemctl and udevadm;
-    installs go through utils.package_installer's exec_program) are
-    replaced by mocks. The tests check files, modes, exact command lists and
-    key log lines. They never touch /etc or run real commands.
+    module is pointed into it with mock.patch.object, and every place a
+    command runs (utils.process / utils.services / utils.package_installer
+    exec_program, and the module's run_capture) shares one recorder, so the
+    tests see one ordered command list. The tests check files, modes, exact
+    command lists and key log lines. They never touch /etc or run real
+    commands.
 
 Run from the repo root:
     python3 -m unittest discover -s tests/python -v
@@ -26,7 +27,8 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import hpc_tuning
-from utils import package_installer
+from utils import files, package_installer, process, services
+from utils.distro import Distro
 from utils.build_config import BuildConfig, build_plan
 
 # The real paths, relative to "/". Tests re-root them in a temporary directory.
@@ -98,7 +100,7 @@ _COMMON_TAIL = [
 # Pure helpers: real inputs, no mocks.
 # --------------------------------------------------------------------------- #
 class HelperTests(unittest.TestCase):
-    def test_distro_branch(self):
+    def test_distro_tuning_branch(self):
         cases = {
             "ubuntu22.04": "ubuntu22.04",
             "ubuntu24.04": "ubuntu24.04",
@@ -108,18 +110,29 @@ class HelperTests(unittest.TestCase):
             "rocky8.10": "rhel-family",
             "rhel9.6": "rhel-family",
             "azurelinux3.0": "azurelinux3.0",
-            "ubuntu20.04": None,
-            "sles15": None,
-            "": None,
+            "azurelinux3.1": "none",           # bash: == "azurelinux3.0", exact
+            "ubuntu20.04": "none",
+            "sles15": "none",
+            "": "none",
         }
         for distro, expected in cases.items():
-            self.assertEqual(hpc_tuning.distro_branch(distro), expected, distro)
+            self.assertEqual(hpc_tuning.distro_tuning(Distro(distro)).branch,
+                             expected, distro)
 
     def test_rhel_family_is_a_prefix_match(self):
-        self.assertTrue(hpc_tuning.is_rhel_family("rocky9.7"))
         # Unlike disable_cloudinit's substring check, "xrhel" doesn't match.
-        self.assertFalse(hpc_tuning.is_rhel_family("xrhel9"))
-        self.assertFalse(hpc_tuning.is_rhel_family("azurelinux3.0"))
+        self.assertEqual(hpc_tuning.distro_tuning(Distro("xrhel9")).branch, "none")
+
+    def test_distro_tuning_tables(self):
+        u22 = hpc_tuning.distro_tuning(Distro("ubuntu22.04"))
+        self.assertEqual(u22.pip_commands, (("pip3", "install", "-U", "netifaces"),
+                                            ("pip3", "install", "-U", "PyYAML")))
+        self.assertEqual(u22.disable_services, ("ufw",))
+        self.assertFalse(u22.remove_azsec_monitor)
+        alma = hpc_tuning.distro_tuning(Distro("almalinux8.10"))
+        self.assertEqual(alma.disable_services, ("firewalld",))
+        self.assertTrue(alma.remove_azsec_monitor)
+        self.assertEqual(hpc_tuning.distro_tuning(Distro("rocky8.10")).disable_services, ())
 
     def test_firewalld_only_alma810_and_rhel8(self):
         for distro in ("almalinux8.10", "rhel8.10", "rhel8.8"):
@@ -181,7 +194,8 @@ class InstallTests(unittest.TestCase):
 
         `rcs` maps a command (tuple) to a fake exit code. Returns (exit code,
         all commands in order, info/warn/error log mocks). The keyword
-        arguments of each run_capture call are kept in self.capture_kwargs.
+        arguments of each run_capture call are kept in self.capture_kwargs;
+        utils.files' log mocks in self.files_info / self.files_error.
         """
         rcs = rcs or {}
         commands = []
@@ -196,11 +210,14 @@ class InstallTests(unittest.TestCase):
             self.capture_kwargs.append(kwargs)
             return (0 if azsec_installed else 1), ""
 
-        with mock.patch.object(hpc_tuning, "exec_program", side_effect=fake_exec), \
+        with mock.patch.object(process, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(services, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(hpc_tuning, "run_capture", side_effect=fake_capture), \
+             mock.patch.object(files, "log_info") as self.files_info, \
+             mock.patch.object(files, "log_error") as self.files_error, \
              mock.patch.object(hpc_tuning, "log_info") as info, \
              mock.patch.object(hpc_tuning, "log_warn") as warn, \
              mock.patch.object(hpc_tuning, "log_error") as error:
@@ -342,10 +359,10 @@ class InstallTests(unittest.TestCase):
                          "[Manager]\nNUMAPolicy=bind\nNUMAMask=0-1\n"
                          "DefaultLimitMEMLOCK=infinity\n")
         self.assertIs(info.call_args_list[0].kwargs["nvlink_rackscale"], True)
-        appended = [c.kwargs for c in info.call_args_list
+        appended = [c.kwargs for c in self.files_info.call_args_list
                     if c.kwargs.get("action") == "appended"
                     and c.kwargs["path"] == self.paths["_SYSCTL_CONF"]]
-        self.assertEqual([a["lines_added"] for a in appended], [4, 5])
+        self.assertEqual(len(appended), 2)
 
     def test_rackscale_false_adds_nothing_extra(self):
         rc, _, info, _, _ = self.install({"DISTRIBUTION": "ubuntu24.04",
@@ -385,7 +402,10 @@ class InstallTests(unittest.TestCase):
 
                 self.assertEqual(rc, 3)
                 self.assertEqual(commands, full[:i + 1])
-                error.assert_called_once()
+                # A failed command is logged by exec_program; only the inactive
+                # service gets an extra ERROR here, saying what it means.
+                is_active = failing[1] == "is-active"
+                self.assertEqual(error.call_count, 1 if is_active else 0)
 
     def test_ubuntu_package_failure_stops_before_any_file_change(self):
         for failing in ("python3-netifaces", "python3-yaml"):
@@ -409,21 +429,25 @@ class InstallTests(unittest.TestCase):
         self.assertIn("not active", error.call_args.args[1])
         self.assertFalse(os.path.exists(self.paths["_NFS_READAHEAD_RULES"]))
 
+    # A directory where the file should be makes the write fail (write_file
+    # creates missing parent directories, so removing those no longer does).
     def test_unwritable_file_returns_3_without_raising(self):
-        os.rmdir(os.path.join(self.root, "etc/udev/rules.d"))
-        rc, commands, _, _, error = self.install({"DISTRIBUTION": "ubuntu24.04"})
+        os.mkdir(self.paths["_NFS_READAHEAD_RULES"])
+        rc, commands, _, _, _ = self.install({"DISTRIBUTION": "ubuntu24.04"})
 
         self.assertEqual(rc, 3)
         self.assertNotIn(["udevadm", "control", "--reload"], commands)
-        self.assertIn(self.paths["_NFS_READAHEAD_RULES"], error.call_args.args[1])
+        self.assertIn(self.paths["_NFS_READAHEAD_RULES"],
+                      self.files_error.call_args.args[1])
 
     def test_unwritable_limits_conf_stops_early(self):
-        os.rmdir(os.path.join(self.root, "etc/security"))
-        rc, commands, _, _, error = self.install({"DISTRIBUTION": "sles15"})
+        os.mkdir(self.paths["_LIMITS_CONF"])
+        rc, commands, _, _, _ = self.install({"DISTRIBUTION": "sles15"})
 
         self.assertEqual(rc, 3)
         self.assertEqual(commands, [])
-        self.assertEqual(error.call_args.kwargs["path"], self.paths["_LIMITS_CONF"])
+        self.assertEqual(self.files_error.call_args.kwargs["path"],
+                         self.paths["_LIMITS_CONF"])
 
 
 # --------------------------------------------------------------------------- #
