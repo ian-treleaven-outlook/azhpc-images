@@ -467,15 +467,37 @@ class HpcdiagTests(unittest.TestCase):
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
              mock.patch.object(install_hpcdiag, "download") as dl, \
              mock.patch("tarfile.open") as taropen, \
+             mock.patch.object(process, "exec_program", return_value=0) as ex, \
              mock.patch("shutil.copy") as cp, \
-             mock.patch("shutil.rmtree"), \
              mock.patch("pathlib.Path.mkdir"), \
-             mock.patch("pathlib.Path.unlink"):
+             mock.patch.object(install_hpcdiag, "remove_paths") as rm:
             taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 0)
-        dl.assert_called_once()
-        cp.assert_called_once()
+        dl.assert_called_once_with("https://x/tarball/hpcdiag-1", Path("/tmp/hpcdiag-1"))
+        ex.assert_called_once_with(["tar", "-xf", "/tmp/hpcdiag-1"], "install-hpcdiag",
+                                   cwd="/tmp", env={})
+        cp.assert_called_once_with(
+            Path("/tmp/topdir/Linux/src/gather_azhpc_vm_diagnostics.sh"),
+            "/opt/azurehpc/diagnostics")
+        rm.assert_called_once_with(Path("/tmp/hpcdiag-1"), Path("/tmp/topdir"),
+                                   op="install-hpcdiag")
+
+    def test_install_fails_when_tar_fails(self):
+        api_json = json.dumps({"tarball_url": "https://x/tarball/hpcdiag-1"}).encode()
+        resp_cm = mock.MagicMock()
+        resp_cm.__enter__.return_value.read.return_value = api_json
+        with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
+             mock.patch.object(install_hpcdiag, "download"), \
+             mock.patch("tarfile.open") as taropen, \
+             mock.patch.object(process, "exec_program", return_value=2), \
+             mock.patch("shutil.copy") as cp, \
+             mock.patch.object(install_hpcdiag, "remove_paths") as rm:
+            taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
+            rc = install_hpcdiag.install(env={})
+        self.assertEqual(rc, 3)
+        cp.assert_not_called()
+        rm.assert_not_called()
 
     def test_install_fails_when_no_tarball_url(self):
         api_json = json.dumps({"name": "r1"}).encode()

@@ -1,9 +1,17 @@
 """install_hpcdiag.py — Python port of components/install_hpcdiag.sh.
 
-Fetch the latest azhpc-diagnostics release from the GitHub API, download and
-extract its source tarball, and install the diagnostics script. The GitHub API
-response is parsed natively with json (replacing `curl | grep | cut`), and there
-is no checksum (GitHub publishes none for source tarballs).
+Installs the azhpc-diagnostics script: asks the GitHub API for the latest
+release's source tarball, downloads and unpacks it in /tmp, copies
+Linux/src/gather_azhpc_vm_diagnostics.sh into /opt/azurehpc/diagnostics, then
+removes the tarball and the unpacked tree (bash `rm -r`).
+
+Kept bash behaviour: no checksum (GitHub publishes none for source
+tarballs), and the unpacked directory is the archive's first entry (bash:
+`tar -xzvf ... | head -1`).
+
+Deliberate differences: the API response is parsed as JSON instead of
+`curl | grep tarball_url | cut -d\\" -f4`, and the work happens in /tmp
+rather than the current directory.
 """
 
 from __future__ import annotations
@@ -15,7 +23,10 @@ import urllib.request
 from pathlib import Path
 
 from utils.download import download
-from utils.logger import log_info, log_error
+from utils.files import extract_tarball, remove_paths
+from utils.logger import log_error, log_info
+
+_OP = "install-hpcdiag"
 
 _API_URL = "https://api.github.com/repos/Azure/azhpc-diagnostics/releases/latest"
 _DEST_DIR = "/opt/azurehpc/diagnostics"
@@ -24,54 +35,80 @@ _DIAG_SCRIPT = "Linux/src/gather_azhpc_vm_diagnostics.sh"
 
 
 def latest_tarball_url(api_response: str):
-    """Return the source tarball URL from a GitHub 'latest release' response.
-
-    Replaces the shell `curl ... | grep tarball_url | cut ...` with a plain
-    JSON lookup. Returns None if the field is absent.
-    """
+    """The source tarball URL from a GitHub 'latest release' response, or None."""
     data = json.loads(api_response)
     return data.get("tarball_url") or None
 
 
-def install(env: dict[str, str]) -> int:
-    """Install the azhpc diagnostics script. Returns 0 on success, 3 on failure."""
-    log_info("install-hpcdiag", "Installing azhpc diagnostics")
+def tarball_top_dir(tarball) -> str:
+    """The archive's first entry's top-level directory (bash `| head -1`)."""
+    with tarfile.open(tarball) as archive:
+        return archive.getnames()[0].split("/")[0]
 
-    # 1. find the latest release's source tarball (native JSON, no curl|grep|cut)
+
+def _latest_release_url() -> str | None:
     try:
         with urllib.request.urlopen(_API_URL) as resp:
             url = latest_tarball_url(resp.read().decode("utf-8"))
     except OSError as exc:
-        log_error("install-hpcdiag", f"failed to query GitHub API: {exc}")
-        return 3
+        log_error(_OP, f"failed to query GitHub API: {exc}", url=_API_URL)
+        return None
     if not url:
-        log_error("install-hpcdiag", "no tarball_url in GitHub API response")
-        return 3
+        log_error(_OP, "no tarball_url in GitHub API response "
+                       "(possible rate limiting)", url=_API_URL)
+    return url
 
-    # 2. download (GitHub publishes no checksum for source tarballs)
+
+def _download(url: str) -> Path | None:
+    """bash `wget "$DOWNLOAD_URL"`: no checksum exists to verify."""
+    # TODO(ADO 1001): toolkit candidate: fetch(url, op, dest_dir) -> Path | None,
+    # fetch_verified() for downloads that have no published checksum.
     dest = Path(_WORK_DIR) / Path(url).name
     try:
         download(url, dest)
     except OSError as exc:
-        log_error("install-hpcdiag", f"download failed: {exc}")
-        return 3
+        log_error(_OP, f"download of {url} failed: {exc}", url=url)
+        return None
+    return dest
 
-    # 3. extract and locate the unpacked top-level directory
-    with tarfile.open(dest) as archive:
-        top = archive.getnames()[0].split("/")[0]
-        archive.extractall(_WORK_DIR, filter="data")
-    unpacked = Path(_WORK_DIR) / top
 
-    # 4. install the diagnostics script
-    Path(_DEST_DIR).mkdir(parents=True, exist_ok=True)
-    shutil.copy(unpacked / _DIAG_SCRIPT, _DEST_DIR)
-
-    # 5. cleanup
-    shutil.rmtree(unpacked, ignore_errors=True)
+def _unpack(tarball: Path, env: dict[str, str]) -> Path | None:
+    """Unpack in /tmp; the unpacked directory, or None."""
     try:
-        dest.unlink()
-    except OSError:
-        pass
+        top = tarball_top_dir(tarball)
+    except (OSError, tarfile.TarError, IndexError) as exc:
+        log_error(_OP, f"could not read {tarball}: {exc}", path=str(tarball))
+        return None
+    if not extract_tarball(tarball, _OP, cwd=_WORK_DIR, env=env):
+        return None
+    return Path(_WORK_DIR) / top
 
-    log_info("install-hpcdiag", f"diagnostics installed to {_DEST_DIR}")
+
+def _install_script(unpacked: Path) -> bool:
+    """bash `mkdir -p $DESTINATION_DIR` and `cp .../gather_azhpc_vm_diagnostics.sh`."""
+    try:
+        Path(_DEST_DIR).mkdir(parents=True, exist_ok=True)
+        shutil.copy(unpacked / _DIAG_SCRIPT, _DEST_DIR)
+    except OSError as exc:
+        log_error(_OP, f"could not install {_DIAG_SCRIPT} to {_DEST_DIR}: {exc}")
+        return False
+    return True
+
+
+def install(env: dict[str, str]) -> int:
+    """Install the azhpc diagnostics script. Returns 0 on success, 3 on failure."""
+    log_info(_OP, "Installing azhpc diagnostics")
+    url = _latest_release_url()
+    if url is None:
+        return 3
+    tarball = _download(url)
+    if tarball is None:
+        return 3
+    unpacked = _unpack(tarball, env)
+    if unpacked is None:
+        return 3
+    if not _install_script(unpacked):
+        return 3
+    remove_paths(tarball, unpacked, op=_OP)
+    log_info(_OP, f"diagnostics installed to {_DEST_DIR}", source=url)
     return 0
