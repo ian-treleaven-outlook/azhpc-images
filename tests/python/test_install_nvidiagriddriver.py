@@ -4,13 +4,15 @@
     tested directly. Their results were also compared against real
     grep/sed/echo and grep/awk/cut in bash (WSL), and CUDA_PROFILE_CONTENT
     against the file the two `echo | tee` lines render.
-  * install() is tested with its external effects mocked: config_for,
-    download_and_verify, exec_program (the module's and
+  * install() is tested with its external effects mocked where they run:
+    utils.component_config.config_for, utils.download.download_and_verify,
+    exec_program (utils.process's, behind run(), and
     utils.package_installer's, which runs the toolkit install, share one fake
     that performs `cp` so the licensing edits run on real temporary files),
-    run_capture (nvcc),
-    write_component_version and install_cuda_samples.install. Every path
-    constant points into a temporary directory.
+    run_capture (nvcc), write_component_version and
+    install_cuda_samples.install. The module's and the toolkit's log calls
+    share one mock per level, so assertions see every message in order.
+    Every path constant points into a temporary directory.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_nvidiagriddriver -v
@@ -27,7 +29,8 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvidiagriddriver as grid
-from utils import package_installer
+from utils import component_config, files, package_installer, process
+from utils import download as download_module
 from utils.build_config import BuildConfig, build_plan
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -203,23 +206,28 @@ class InstallTests(unittest.TestCase):
             return Path(dest_dir) / os.path.basename(url)
 
         exec_program = mock.Mock(side_effect=fake_exec)
-        with mock.patch.object(grid, "config_for",
+        log_info, log_warn, log_error = mock.Mock(), mock.Mock(), mock.Mock()
+        with mock.patch.object(component_config, "config_for",
                                side_effect=lambda c, e: configs.get(c)) as config_for, \
-             mock.patch.object(grid, "download_and_verify",
+             mock.patch.object(component_config, "log_error", log_error), \
+             mock.patch.object(download_module, "download_and_verify",
                                side_effect=download or fake_download) as dl, \
-             mock.patch.object(grid, "exec_program", exec_program), \
+             mock.patch.object(download_module, "log_error", log_error), \
+             mock.patch.object(process, "exec_program", exec_program), \
              mock.patch.object(package_installer, "exec_program", exec_program), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
+             mock.patch.object(files, "log_info", log_info), \
+             mock.patch.object(files, "log_error", log_error), \
              mock.patch.object(grid, "run_capture", return_value=nvcc) as run_capture, \
              mock.patch.object(grid, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(grid.install_cuda_samples, "install",
                                return_value=samples_rc,
                                side_effect=samples_error) as samples, \
-             mock.patch.object(grid, "log_info") as log_info, \
-             mock.patch.object(grid, "log_warn") as log_warn, \
-             mock.patch.object(grid, "log_error") as log_error:
+             mock.patch.object(grid, "log_info", log_info), \
+             mock.patch.object(grid, "log_warn", log_warn), \
+             mock.patch.object(grid, "log_error", log_error):
             rc = grid.install(env)
         return rc, {"config_for": config_for, "download": dl, "exec": exec_program,
                     "capture": run_capture, "record": record, "samples": samples,
@@ -281,11 +289,11 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(any("Installing NVIDIA GRID driver 595.91.07 and "
                             "cuda-toolkit-13-2" in msg for msg in info))
         self.assertTrue(any(msg.startswith("Set EnableUI=FALSE") for msg in info))
-        self.assertTrue(any(msg.startswith("Appended IgnoreSP=FALSE") for msg in info))
+        self.assertTrue(any(msg.startswith("Appending IgnoreSP=FALSE") for msg in info))
+        self.assertIn(f"Wrote {self.conf} (appended)", info)
         self.assertTrue(any(msg.startswith("Removed 1 line(s) starting with FeatureType=0")
                             for msg in info))
-        self.assertTrue(any(msg.startswith("Created ") and self.profile in msg
-                            for msg in info))
+        self.assertIn(f"Wrote {self.profile} (created)", info)
         self.assertTrue(any("Recorded CUDA version 13.2.51" == msg for msg in info))
         self.assertTrue(any(msg.startswith("NVIDIA CUDA apt source present")
                             for msg in info))
@@ -310,7 +318,7 @@ class InstallTests(unittest.TestCase):
         with open(self.profile, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), grid.CUDA_PROFILE_CONTENT)
         self.assertEqual(os.stat(self.profile).st_mode & 0o777, 0o644)
-        self.assertTrue(any(msg.startswith("Replaced ") for msg in self._messages(m["info"])))
+        self.assertIn(f"Wrote {self.profile} (replaced)", self._messages(m["info"]))
 
     def test_stale_work_dir_is_emptied_first(self):
         os.makedirs(os.path.join(self.work, "old"))
@@ -428,9 +436,12 @@ class InstallTests(unittest.TestCase):
                 # The fake fails every command with that first word; "bash" is
                 # first, the persistence script last.
                 self.assertEqual(self._commands(m), expected[:index + 1])
-                # install_packages() logs its own failure.
-                errors = m["pkg_error"] if command is _TOOLKIT_INSTALL else m["error"]
-                errors.assert_called()
+                # exec_program (mocked here) and install_packages() log their
+                # own failures; the port adds nothing.
+                if command is _TOOLKIT_INSTALL:
+                    m["pkg_error"].assert_called()
+                if index == 0:           # the driver failed: nothing recorded
+                    m["record"].assert_not_called()
                 self.assertFalse(os.path.exists(self.work))
 
     def test_nvcc_failure_or_empty_version(self):
@@ -460,10 +471,11 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(len(self._commands(m)), 1)          # stopped after the driver
         self.assertIn("denied", m["error"].call_args.args[1])
 
-    def test_cp_failure_is_named(self):
+    def test_cp_failure_stops_before_editing(self):
         rc, m = self._install(fail_on="cp")
         self.assertEqual(rc, 3)
-        self.assertIn("could not copy", m["error"].call_args.args[1])
+        self.assertEqual(self._commands(m)[-1], ["cp", self.template, self.conf])
+        self.assertFalse(os.path.exists(self.conf))
 
     def test_unwritable_profile(self):
         os.makedirs(self.profile)               # a directory: open() fails
