@@ -27,21 +27,17 @@ Deliberate differences:
     through utils.services.
   * `sudo dnf list installed` runs without sudo (the build already runs as
     root).
-  * A failing `ofed_info`, or a first line with fewer than four
-    '-'-separated fields, fails the step, as in install_doca.py. Bash would
-    record "" or e.g. "0.7.0-" and carry on.
+  * An unreadable `ofed_info` version fails the step, as for DOCA (see
+    utils/ofed.py). Bash would record "" or e.g. "0.7.0-" and carry on.
 """
 
 from __future__ import annotations
 
 import re
 
-# TODO(toolkit): parse_ofed_version is needed by install_doca and install_mofed;
-# move it to the toolkit (e.g. utils/ofed.py).
-from components.python.install_doca import parse_ofed_version
-from utils.component_config import record_version
 from utils.files import write_file
-from utils.logger import log_error, log_info, log_warn
+from utils.logger import log_info, log_warn
+from utils.ofed import record_ofed_version
 from utils.package_installer import install_packages
 from utils.process import run_capture
 from utils.services import systemctl
@@ -148,18 +144,6 @@ def _log_release_version(env: dict[str, str]) -> None:
                  package=package)
 
 
-def _record_ofed_version(env: dict[str, str]) -> bool:
-    """Record OFED as `ofed_info` reports it (the version the image tests check)."""
-    rc, output = run_capture(["ofed_info"], _OP, env=env)
-    version = parse_ofed_version(output) if rc == 0 else None
-    if not version:
-        first = output.split("\n", 1)[0]
-        log_error(_OP, "could not read the OFED version from ofed_info",
-                  exit_code=rc, first_line=first)
-        return False
-    return record_version("OFED", version, _OP)
-
-
 def _configure_openibd(env: dict[str, str]) -> bool:
     """Start openibd after udev settles, restart it on failure, and enable it."""
     return (write_file(_OPENIBD_DROP_IN, _OPENIBD_OVERRIDE, _OP)
@@ -172,7 +156,7 @@ def install(env: dict[str, str]) -> int:
     if not _install_mofed(env):
         return 3
     _log_release_version(env)
-    if not _record_ofed_version(env):
+    if not record_ofed_version(env, _OP):
         return 3
     if not _configure_openibd(env):
         return 3

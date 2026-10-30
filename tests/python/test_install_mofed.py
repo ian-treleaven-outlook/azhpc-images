@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_mofed as m
+from utils import ofed
 from utils.plans import steps
 
 _OP = "install-mofed"
@@ -112,7 +113,7 @@ class InstallTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.drop_in = os.path.join(tmp.name, "openibd.service.d", "override.conf")
-        for name in ("log_info", "log_warn", "log_error"):
+        for name in ("log_info", "log_warn"):
             patcher = mock.patch.object(m, name)
             setattr(self, name, patcher.start())
             self.addCleanup(patcher.stop)
@@ -129,10 +130,12 @@ class InstallTests(unittest.TestCase):
              mock.patch("utils.files.log_info"), \
              mock.patch.object(m, "install_packages", side_effect=list(install_rc)) as pkgs, \
              mock.patch.object(m, "run_capture", side_effect=capture) as run_capture, \
-             mock.patch.object(m, "record_version", return_value=record) as record_version, \
+             mock.patch.object(ofed, "run_capture", side_effect=capture), \
+             mock.patch.object(ofed, "record_version", return_value=record) as record_version, \
+             mock.patch.object(ofed, "log_error") as ofed_error, \
              mock.patch.object(m, "systemctl", return_value=systemctl) as systemctl_mock:
             rc = m.install(env)
-        self.pkgs, self.run_capture = pkgs, run_capture
+        self.pkgs, self.run_capture, self.ofed_error = pkgs, run_capture, ofed_error
         self.record_version, self.systemctl = record_version, systemctl_mock
         return rc
 
@@ -155,7 +158,7 @@ class InstallTests(unittest.TestCase):
         released = [c for c in self.log_info.call_args_list
                     if c.kwargs.get("release_version")]
         self.assertEqual(released[0].kwargs["release_version"], "24.10-20")
-        self.log_error.assert_not_called()
+        self.ofed_error.assert_not_called()
 
     def test_aarch64_uses_the_hwe_kernel_packages_and_release_package(self):
         env = {"DISTRIBUTION": "azurelinux3.0", "ARCHITECTURE": "aarch64"}
@@ -192,12 +195,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.record_version.assert_not_called()
         self.systemctl.assert_not_called()
-        self.log_error.assert_called_once()
+        self.ofed_error.assert_called_once()
 
     def test_unparsable_ofed_info_returns_3(self):
         rc = self._install(ofed_info=(0, "MLNX_OFED_LINUX-24.10\n"))
         self.assertEqual(rc, 3)
-        self.assertEqual(self.log_error.call_args.kwargs["first_line"], "MLNX_OFED_LINUX-24.10")
+        self.assertEqual(self.ofed_error.call_args.kwargs["first_line"], "MLNX_OFED_LINUX-24.10")
 
     def test_failing_record_version_returns_3(self):
         self.assertEqual(self._install(record=False), 3)

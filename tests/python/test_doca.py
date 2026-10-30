@@ -1,7 +1,7 @@
 """Unit tests for components/python/install_doca.py.
 
   * Pure helpers are tested directly. parse_apt_cache_version,
-    parse_ofed_version, strip_dnf_excludes, rpm_marker_provides and
+    strip_dnf_excludes, rpm_marker_provides and
     installed_doca_packages were also compared with the real awk/sed/sort
     pipelines in WSL, and apt_marker_control / rpm_marker_spec with the
     heredocs rendered by real bash.
@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_doca
-from utils import component_config, download, files, package_installer, process
+from utils import component_config, download, files, ofed, package_installer, process
 from utils.distro import Distro
 from utils.download import ChecksumError
 from utils.build_config import BuildConfig, build_plan
@@ -77,14 +77,6 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(parse("Package: openmpi\n"))
         self.assertIsNone(parse("Version:\nVersion: 2\n"))     # awk prints "" and exits
         self.assertIsNone(parse(""))
-
-    def test_parse_ofed_version(self):
-        parse = install_doca.parse_ofed_version
-        self.assertEqual(parse(_OFED_OUT), "25.10-1.7.1")
-        self.assertEqual(parse("a-b-c-d-e\nsecond\n"), "c-d")
-        self.assertEqual(parse("x-y-1.2:-3.4:"), "1.2-3.4")
-        self.assertIsNone(parse(""))
-        self.assertIsNone(parse("only-two"))
 
     def test_strip_dnf_excludes_like_sed(self):
         strip = install_doca.strip_dnf_excludes
@@ -190,6 +182,10 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # ofed_info runs in utils/ofed.py (record_ofed_version).
+        mock.patch.object(ofed, "run_capture", side_effect=self._fake_capture).start()
+        self.ofed_error = mock.patch.object(ofed, "log_error").start()
+        self.addCleanup(mock.patch.stopall)
         root = Path(self._tmp.name)
         self.top = root / "top"
         (self.top / "internal_bits").mkdir(parents=True)
@@ -619,7 +615,7 @@ class InstallTests(unittest.TestCase):
             with self.subTest(ofed=ofed):
                 self.assertEqual(self._install(ofed=ofed), 3)
                 self.record.assert_called_once_with("DOCA", "3.2.3")
-                self.assertIn("OFED version", self.error.call_args_list[0].args[1])
+                self.assertIn("OFED version", self.ofed_error.call_args.args[1])
                 self.assertFalse(self.dropin.exists())
 
     def test_unwritable_versions_file_returns_3(self):
