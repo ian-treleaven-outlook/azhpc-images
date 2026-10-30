@@ -6,7 +6,8 @@ Two kinds of test:
     and the exact generated text are tested directly.
   * install() runs against a temporary directory: every path constant in the
     module is pointed into it with mock.patch.object, and exec_program /
-    run_capture (which would run apt, pip3, dnf, systemctl and udevadm) are
+    run_capture (which would run apt-get, pip3, dnf, systemctl and udevadm;
+    installs go through utils.package_installer's exec_program) are
     replaced by mocks. The tests check files, modes, exact command lists and
     key log lines. They never touch /etc or run real commands.
 
@@ -25,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import hpc_tuning
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 # The real paths, relative to "/". Tests re-root them in a temporary directory.
@@ -80,6 +82,8 @@ def _unquoted_heredoc(name: str) -> str:
 
 _AZSEC_PROBE = ["dnf", "list", "installed", "azsec-monitor"]
 _AZSEC_REMOVE = ["dnf", "remove", "-y", "azsec-monitor"]
+# bash's `apt install -y <pkg>`, as install_packages() runs it.
+_APT_INSTALL = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
 
 # The commands every distro runs after the distro block.
 _COMMON_TAIL = [
@@ -193,6 +197,9 @@ class InstallTests(unittest.TestCase):
             return (0 if azsec_installed else 1), ""
 
         with mock.patch.object(hpc_tuning, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
              mock.patch.object(hpc_tuning, "run_capture", side_effect=fake_capture), \
              mock.patch.object(hpc_tuning, "log_info") as info, \
              mock.patch.object(hpc_tuning, "log_warn") as warn, \
@@ -249,8 +256,8 @@ class InstallTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(commands, [
-            ["apt", "install", "-y", "python3-netifaces"],
-            ["apt", "install", "-y", "python3-yaml"],
+            [*_APT_INSTALL, "python3-netifaces"],
+            [*_APT_INSTALL, "python3-yaml"],
             ["systemctl", "disable", "ufw"],
         ] + _COMMON_TAIL)
 
@@ -260,8 +267,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         error.assert_not_called()
         self.assertEqual(commands, [
-            ["apt", "install", "-y", "python3-netifaces"],
-            ["apt", "install", "-y", "python3-yaml"],
+            [*_APT_INSTALL, "python3-netifaces"],
+            [*_APT_INSTALL, "python3-yaml"],
             ["systemctl", "disable", "ufw"],
         ] + _COMMON_TAIL)
         self.assertEqual(self.read("_NFS_READAHEAD_RULES"), _UDEV_RULE)
@@ -381,13 +388,16 @@ class InstallTests(unittest.TestCase):
                 error.assert_called_once()
 
     def test_ubuntu_package_failure_stops_before_any_file_change(self):
-        rc, commands, _, _, _ = self.install(
-            {"DISTRIBUTION": "ubuntu24.04"},
-            rcs={("apt", "install", "-y", "python3-netifaces"): 100})
+        for failing in ("python3-netifaces", "python3-yaml"):
+            with self.subTest(package=failing):
+                rc, commands, _, _, _ = self.install(
+                    {"DISTRIBUTION": "ubuntu24.04"},
+                    rcs={(*_APT_INSTALL, failing): 100})
 
-        self.assertEqual(rc, 3)
-        self.assertEqual(len(commands), 1)
-        self.assertFalse(os.path.exists(self.paths["_LIMITS_CONF"]))
+                self.assertEqual(rc, 3)
+                self.assertEqual(commands[-1], [*_APT_INSTALL, failing])
+                self.assertNotIn(["systemctl", "disable", "ufw"], commands)
+                self.assertFalse(os.path.exists(self.paths["_LIMITS_CONF"]))
 
     def test_inactive_sunrpc_service_returns_3(self):
         rc, commands, _, _, error = self.install(

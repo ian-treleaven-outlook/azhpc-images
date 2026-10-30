@@ -132,11 +132,16 @@ it doesn't call config_for() or write_component_version().
 
 Deliberate differences
 ----------------------
-None in behaviour. Mechanical details: files are written with Python instead
-of echo/cat/tee, and `sudo` is dropped from `sudo tee` and
-`sudo systemctl daemon-reexec` (the build already runs as root, where sudo is
-a no-op). Each file's appended lines are written in one go rather than one
-echo at a time; the result is identical.
+None in behaviour. Mechanical details:
+
+  * Files are written with Python instead of echo/cat/tee, and `sudo` is
+    dropped from `sudo tee` and `sudo systemctl daemon-reexec` (the build
+    already runs as root, where sudo is a no-op). Each file's appended lines
+    are written in one go rather than one echo at a time; the result is
+    identical.
+  * Package installs go through install_packages(), so bash's
+    `apt install -y <pkg>` runs as `apt-get install -y -o Dpkg::Use-Pty=0 <pkg>`
+    (the documented normalisation; still one command per package).
 """
 
 from __future__ import annotations
@@ -144,6 +149,7 @@ from __future__ import annotations
 import os
 
 from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.package_installer import install_packages
 from utils.process import exec_program, run_capture
 
 # The Step's `op` label in build_config.py. Every log line from this module uses
@@ -168,14 +174,17 @@ _SUNRPC_SERVICE = "sunrpc_tcp_settings"
 # Prefix matches, as in bash: [[ $DISTRIBUTION == almalinux* ]].
 _RHEL_FAMILY_PREFIXES = ("almalinux", "rocky", "rhel")
 
-# The fixed commands for the two Ubuntu branches, in bash's order.
-_UBUNTU_COMMANDS = {
+# What the two Ubuntu branches install before `systemctl disable ufw`.
+# 22.04 runs pip3 commands as they are; 24.04 installs apt packages, one
+# install_packages() call per package, like bash's one `apt install` per line.
+_UBUNTU_PIP_COMMANDS = {
     "ubuntu22.04": [["pip3", "install", "-U", "netifaces"],
-                    ["pip3", "install", "-U", "PyYAML"],
-                    ["systemctl", "disable", "ufw"]],
-    "ubuntu24.04": [["apt", "install", "-y", "python3-netifaces"],
-                    ["apt", "install", "-y", "python3-yaml"],
-                    ["systemctl", "disable", "ufw"]],
+                    ["pip3", "install", "-U", "PyYAML"]],
+    "ubuntu24.04": [],
+}
+_UBUNTU_APT_PACKAGES = {
+    "ubuntu22.04": [],
+    "ubuntu24.04": ["python3-netifaces", "python3-yaml"],
 }
 
 # Which Ubuntu branch each distribution takes (exact matches, as in bash).
@@ -386,12 +395,17 @@ def _distro_cleanup(env: dict[str, str], distribution: str, branch: str | None) 
                  distro=distribution, branch="none")
         return True
 
-    if branch in _UBUNTU_COMMANDS:
+    if branch in _UBUNTU_PIP_COMMANDS:
         log_info(_OP, "Ubuntu: installing netifaces/PyYAML and disabling ufw",
                  distro=distribution, branch=branch)
-        for command in _UBUNTU_COMMANDS[branch]:
+        for command in _UBUNTU_PIP_COMMANDS[branch]:
             if not _run(command, env):
                 return False
+        for package in _UBUNTU_APT_PACKAGES[branch]:
+            if not install_packages([package], env, _OP):
+                return False
+        if not _run(["systemctl", "disable", "ufw"], env):
+            return False
         log_info(_OP, "Disabled the ufw service", service="ufw")
         return True
 
