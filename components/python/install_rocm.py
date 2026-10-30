@@ -65,7 +65,11 @@ Deliberate differences from bash
 --------------------------------
   * Installs go through install_packages(): `apt-get install -y -o
     Dpkg::Use-Pty=0` / `dnf install -y` (bash: `apt install -y`, `apt-get
-    install -y`, `dnf -y install`).
+    install -y`, `dnf -y install`). Package-index refreshes go through
+    refresh_package_index(): `apt-get update` / `dnf makecache --refresh`
+    (bash: `apt update` / `dnf repolist --refresh`). The AMDGPU/RVS versions
+    are read with installed_package_version() (`dpkg-query -W -f ${Version}`,
+    the same output as bash's `-f='${Version}'`).
   * Unsupported distros fail before changing anything. Bash has no else
     branch: it would install no ROCm yet still write the udev rules, the boot
     service and a ROCM version (versions.json has Rocky entries bash ignores).
@@ -85,26 +89,27 @@ Deliberate differences from bash
     `chmod +x`; the unit gets 0644, what mv of a tee-created file has under
     umask 022.
   * write_file() creates missing parent directories; `rm -f`s go through
-    remove_paths(), which never fails the build.
+    remove_paths(), which never fails the build; `mkdir -p` + `cp` of the
+    DKMS patch go through make_dirs() + copy_file().
 """
 
 from __future__ import annotations
 
 import os
 import platform
-import shutil
 import stat
 from dataclasses import dataclass
 from typing import Callable
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.dkms import check_dkms_status
 from utils.download import fetch_verified
-from utils.files import remove_paths, write_file
+from utils.files import copy_file, file_has_line, make_dirs, remove_paths, write_file
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
-from utils.process import run, run_all, run_capture
+from utils.package_installer import (install_packages, installed_package_version,
+                                     refresh_package_index)
+from utils.process import run, run_all
 from utils.services import systemctl
 
 _OP = "install-rocm"
@@ -311,58 +316,34 @@ def _install_each(package_lists, env: dict[str, str], cwd: str | None = None) ->
     return all(install_packages(packages, env, _OP, cwd=cwd) for packages in package_lists)
 
 
-# TODO(ADO 1001): toolkit candidate: file_has_line(path, line) -> bool (for the
-# "already there; appending again, as bash does" warning before `>>`).
-def _has_line(path: str, line: str) -> bool:
-    """True if `path` already has `line`; a missing/unreadable file is "no"."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return line in handle.read().splitlines()
-    except OSError:
-        return False
-
-
 def _append(path: str, text: str, line: str, what: str) -> bool:
     """bash `>>` / `tee -a`: a rerun appends again, as bash does; we warn
     when `line` is already in the file."""
-    if _has_line(path, line):
+    if file_has_line(path, line):
         log_warn(_OP, f"{path} already has {what}; appending it again, as bash "
                       "does on a rerun", path=path)
     return write_file(path, text, _OP, append=True)
 
 
-# TODO(ADO 1001): toolkit candidate: copy_file(source, dest, op) -> bool
-# (bash `mkdir -p <dir>; cp <source> <dest>`, logging created/replaced).
-def _copy_file(source: str, target: str) -> None:
-    """`mkdir -p` + `cp` (no -p: a new file gets the default mode). Raises
-    OSError; install() catches it."""
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    action = "replaced" if os.path.exists(target) else "created"
-    shutil.copyfile(source, target)
-    log_info(_OP, f"Copied {source} to {target} ({action})",
-             source=source, path=target, action=action)
-
-
-# TODO(ADO 1001): toolkit candidate: installed_package_version(package, env, op)
-# -> str | None (dpkg-query -W -f='${Version}' / rpm -q --queryformat).
-def _dpkg_version(package: str, env: dict[str, str]) -> str | None:
-    """bash `dpkg-query -W -f='${Version}' <package>`: the installed version,
-    or None (logged) when the query fails or prints nothing."""
-    # bash's quotes only stop ${Version} expanding; dpkg-query gets it literally.
-    rc, output = run_capture(["dpkg-query", "-W", "-f=${Version}", package], _OP, env=env)
-    version = output.rstrip("\n") if rc == 0 else ""
-    if not version:
-        log_error(_OP, f"could not read the installed {package} version from dpkg-query",
-                  package=package, exit_code=rc)
+def _make_executable(path: str) -> int | None:
+    """bash `chmod +x`: add the execute bits to the file's mode; the new mode,
+    or None (logged). Kept local: the toolkit's mode= options set a whole
+    mode, while `+x` keeps the rest."""
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode) | 0o111
+        os.chmod(path, mode)
+    except OSError as exc:
+        log_error(_OP, f"could not chmod +x {path}: {exc}", path=path)
         return None
-    return version
+    return mode
 
 
 def _configure_amdgpu_dkms_patches(component_dir: str) -> bool:
     """bash's configure_amdgpu_dkms_patches: the patch + /etc/dkms/amdgpu.conf."""
-    _copy_file(os.path.join(component_dir, _DKMS_PATCH_SOURCE),
-               os.path.join(_DKMS_PATCH_DIR, _DKMS_PATCH_NAME))
-    if not write_file(_DKMS_CONF_FILE, _AMDGPU_DKMS_CONF, _OP):
+    if not (make_dirs(_DKMS_PATCH_DIR, op=_OP)
+            and copy_file(os.path.join(component_dir, _DKMS_PATCH_SOURCE),
+                          os.path.join(_DKMS_PATCH_DIR, _DKMS_PATCH_NAME), _OP)
+            and write_file(_DKMS_CONF_FILE, _AMDGPU_DKMS_CONF, _OP)):
         return False
     log_info(_OP, "amdgpu DKMS builds will apply the pci_resize_resource patch "
                   "unless the driver source already has the fix",
@@ -389,8 +370,7 @@ class _Inputs:
 # --------------------------------------------------------------------------- #
 # Ubuntu 26.04: ROCm 10 from AMD's apt repos.
 # --------------------------------------------------------------------------- #
-# TODO(ADO 1001): toolkit candidate: add_apt_signing_key(url, keyring, op, env=)
-# -> bool (wget + gpg --dearmor + chmod 0644 + rm of the download).
+# Stays local rather than a toolkit add_apt_signing_key(): no other port needs it.
 def _install_amd_apt_keys(env: dict[str, str]) -> bool:
     if not run_all([
         ["install", "-d", "-m", "0755", _KEYRINGS_DIR],
@@ -420,9 +400,7 @@ def _add_amd_apt_repos(env: dict[str, str], kernel: str, driver_url: str) -> boo
                (_RVS_LIST_FILE, _RVS_LIST)]
     if not all(write_file(path, text, _OP) for path, text in sources):
         return False
-    # TODO(ADO 1001): toolkit candidate: refresh_package_index(env, op) -> bool
-    # (apt update / dnf repolist --refresh).
-    return run(["apt", "update"], _OP, env=env)
+    return refresh_package_index(env, _OP)
 
 
 def _install_amdgpu_dkms(env: dict[str, str], inputs: _Inputs) -> bool:
@@ -460,12 +438,9 @@ def _read_installed_rocm_version(config_version: str) -> str | None:
 def _record_package_versions(env: dict[str, str]) -> bool:
     """Record AMDGPU and RVS from dpkg, in bash's order."""
     for component, package in (("AMDGPU", _AMDGPU_DKMS_PACKAGE), ("RVS", _RVS_PACKAGE)):
-        version = _dpkg_version(package, env)
-        if version is None:
+        version = installed_package_version(package, env, _OP)
+        if version is None or not record_version(component, version, _OP):
             return False
-        write_component_version(component, version)
-        log_info(_OP, f"Recorded {component}={version}", component=component,
-                 version=version, package=package)
     return True
 
 
@@ -554,8 +529,7 @@ def _install_azurelinux(env: dict[str, str], inputs: _Inputs) -> str | None:
                         "[amd_rocm]", "an [amd_rocm] section")):
         return None
     log_info(_OP, "Added the AMD ROCm dnf repo", repo="amd_rocm", version=version)
-    # TODO(ADO 1001): toolkit candidate: refresh_package_index (see above).
-    if not (run(["dnf", "repolist", "--refresh"], _OP, env=env)
+    if not (refresh_package_index(env, _OP)
             and _install_each(_AZURE_LINUX_ROCM_PACKAGES, env)):
         return None
     return version
@@ -598,10 +572,9 @@ def _install_boot_service(env: dict[str, str]) -> bool:
     log_info(_OP, "Writing gpu mode probe in init.d", path=_INIT_SCRIPT)
     if not write_file(_INIT_SCRIPT, _INIT_SCRIPT_TEXT, _OP):
         return False
-    # `chmod +x` adds the execute bits to whatever mode the file has.
-    mode = stat.S_IMODE(os.stat(_INIT_SCRIPT).st_mode) | 0o111
-    os.chmod(_INIT_SCRIPT, mode)
-    if not write_file(_SERVICE_FILE, _SERVICE_UNIT, _OP, mode=_SERVICE_FILE_MODE):
+    mode = _make_executable(_INIT_SCRIPT)
+    if mode is None or not write_file(_SERVICE_FILE, _SERVICE_UNIT, _OP,
+                                      mode=_SERVICE_FILE_MODE):
         return False
     # The script polls up to ~15 minutes (91 checks, 10 s apart) for GPUs.
     log_warn(_OP, f"Starting {_SERVICE_NAME} on the build VM, as bash does: its "
@@ -681,8 +654,8 @@ def _configure_gpus(env: dict[str, str], inputs: _Inputs, version: str) -> bool:
     """Steps 2-5: udev, record ROCM (where bash does), blacklist, boot service."""
     if not _setup_udev(env):
         return False
-    write_component_version("ROCM", version)
-    log_info(_OP, f"Recorded ROCM={version}", component="ROCM", version=version)
+    if not record_version("ROCM", version, _OP):
+        return False
     if inputs.distro.is_ubuntu and not _blacklist_amdgpu(env, inputs.kernel):
         return False
     return _install_boot_service(env)
@@ -701,14 +674,8 @@ def install(env: dict[str, str]) -> int:
     if inputs is None:
         return 3
     _log_start(inputs)
-    try:
-        version = branch.install(env, inputs)
-        if version is None or not _configure_gpus(env, inputs, version):
-            return 3
-    except OSError as exc:
-        # The DKMS patch copy, chmod, and the versions file in /opt.
-        log_error(_OP, f"file operation failed: {exc}",
-                  path=getattr(exc, "filename", None))
+    version = branch.install(env, inputs)
+    if version is None or not _configure_gpus(env, inputs, version):
         return 3
     log_info(_OP, f"ROCm {version} installed and configured",
              version=version, distro=distro.name,

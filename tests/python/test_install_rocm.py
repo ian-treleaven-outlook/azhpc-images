@@ -78,7 +78,7 @@ _AZL_COMMANDS = [
     [*_DNF, "azurelinux-repos-amd"],
     [*_DNF, f"kernel-drivers-gpu-{_KERNEL}"],
     [*_DNF, "amdgpu", "amdgpu-firmware", "amdgpu-headers"],
-    ["dnf", "repolist", "--refresh"],
+    ["dnf", "makecache", "--refresh"],      # bash: dnf repolist --refresh
     [*_DNF, "rocm-dev", "rocm-validation-suite", "rocm-bandwidth-test"],
     [*_DNF, "rocm-smi-lib", "rocm-core", "rocm-device-libs",
      "rocm-llvm", "rocm-validation-suite"],
@@ -264,7 +264,7 @@ class InstallTests(unittest.TestCase):
             ["gpg", "--batch", "--yes", "--dearmor", "-o", p["_AMDGPU_KEYRING"],
              p["_AMDGPU_KEY_DOWNLOAD"]],
             ["chmod", "0644", p["_AMDROCM_KEYRING"], p["_AMDGPU_KEYRING"]],
-            ["apt", "update"],
+            ["apt-get", "update"],                 # bash: apt update
             [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"],
             [*_APT, "amdrocm-core-sdk10.0", "amdrocm10-rvs"],
             ["ldconfig"],
@@ -318,12 +318,12 @@ class InstallTests(unittest.TestCase):
                                side_effect=self._download) as fetch, \
              mock.patch.object(process, "exec_program", side_effect=fake_exec) as run, \
              mock.patch.object(package_installer, "exec_program", new=run), \
-             mock.patch.object(install_rocm, "run_capture",
+             mock.patch.object(package_installer, "run_capture",
                                side_effect=fake_capture) as capture, \
              mock.patch.object(install_rocm, "check_dkms_status",
                                return_value=dkms_ok) as dkms, \
              mock.patch.object(install_rocm.platform, "release", return_value=kernel), \
-             mock.patch.object(install_rocm, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_rocm, "log_info") as info, \
              mock.patch.object(install_rocm, "log_warn") as warn, \
@@ -331,6 +331,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error", new=error), \
              mock.patch.object(files, "log_info", new=info), \
+             mock.patch.object(component_config, "log_info", new=info), \
              mock.patch.object(files, "log_error", new=error), \
              mock.patch.object(download, "log_error", new=error), \
              mock.patch.object(component_config, "log_error", new=error):
@@ -425,8 +426,8 @@ class InstallTests(unittest.TestCase):
         self.dkms.assert_called_once_with(["amdgpu"], "install-rocm", mock.ANY,
                                           kernel=_KERNEL)
         self.assertEqual([c.args[0] for c in self.capture.call_args_list], [
-            ["dpkg-query", "-W", "-f=${Version}", "amdgpu-dkms"],
-            ["dpkg-query", "-W", "-f=${Version}", "amdrocm10-rvs"]])
+            ["dpkg-query", "-W", "-f", "${Version}", "amdgpu-dkms"],
+            ["dpkg-query", "-W", "-f", "${Version}", "amdrocm10-rvs"]])
         # AMDGPU and RVS in the branch, then ROCM (from .info/version) later.
         self.assertEqual(self.record.call_args_list, [
             mock.call("AMDGPU", _AMDGPU_DPKG), mock.call("RVS", _RVS_DPKG),
@@ -455,7 +456,7 @@ class InstallTests(unittest.TestCase):
         def watch(command):
             if command == [*_APT, "amdgpu-dkms", "amdgpu-dkms-firmware"]:
                 order.append(("dkms-install", os.path.exists(self.paths["_DKMS_CONF_FILE"])))
-            if command == ["apt", "update"]:
+            if command == ["apt-get", "update"]:
                 order.append(("apt-update", os.path.exists(self.paths["_AMDGPU_LIST_FILE"]),
                               os.path.exists(self.paths["_DKMS_CONF_FILE"])))
         self.assertEqual(self._install("ubuntu26.04", _U2604_CFG, watch=watch), 0)
@@ -475,12 +476,12 @@ class InstallTests(unittest.TestCase):
                      if msg.startswith("Installed ROCm SDK reports version 10.0.0")]
         self.assertEqual((installed[0]["installed_version"], installed[0]["config_version"]),
                          ("10.0.0", "10.0"))
-        self.assertIn(f"Recorded AMDGPU={_AMDGPU_DPKG}", by_message)
-        self.assertIn(f"Recorded RVS={_RVS_DPKG}", by_message)
-        self.assertIn("Recorded ROCM=10.0.0", by_message)
+        self.assertIn(f"Recorded AMDGPU {_AMDGPU_DPKG}", by_message)
+        self.assertIn(f"Recorded RVS {_RVS_DPKG}", by_message)
+        self.assertIn("Recorded ROCM 10.0.0", by_message)
         self.assertEqual(by_message[f"Wrote {self.paths['_AMDGPU_LIST_FILE']} (created)"]
                          ["action"], "created")
-        self.assertIn(f"Copied {self._patch_source()} to {self._patch_target()} (created)",
+        self.assertIn(f"Copied {self._patch_source()} -> {self._patch_target()} (created)",
                       by_message)
         self.assertEqual(self._info_messages()[-1], "ROCm 10.0.0 installed and configured")
 
@@ -492,7 +493,7 @@ class InstallTests(unittest.TestCase):
         by_message = self._info_by_message()
         self.assertEqual(by_message[f"Wrote {self.paths['_RVS_LIST_FILE']} (replaced)"]
                          ["action"], "replaced")
-        self.assertIn(f"Copied {self._patch_source()} to {self._patch_target()} (replaced)",
+        self.assertIn(f"Copied {self._patch_source()} -> {self._patch_target()} (replaced)",
                       by_message)
 
     def test_azure_linux_success(self):
@@ -600,7 +601,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn(f"Wrote {self.paths['_UDEV_RULES_FILE']} (created)", messages)
         self.assertIn(f"Wrote {self.paths['_DKMS_CONF_FILE']} (created)", messages)
         self.assertIn(f"Wrote {self.paths['_BLACKLIST_FILE']} (created)", messages)
-        self.assertIn("Recorded ROCM=6.4.4", messages)
+        self.assertIn("Recorded ROCM 6.4.4", messages)
         self.assertIn("Started and enabled rocmstartup.service", messages)
         self.assertEqual(messages[-1], "ROCm 6.4.4 installed and configured")
 
@@ -718,11 +719,13 @@ class InstallTests(unittest.TestCase):
         self.assertIn("could not write", self.error.call_args.args[1])
         self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
 
-    def test_dkms_patch_copy_error_returns_3(self):
-        os.makedirs(self._patch_target())               # cp onto a directory fails
+    def test_dkms_patch_dir_error_returns_3(self):
+        # A file where the patch directory goes: bash's `mkdir -p` fails.
+        Path(self.paths["_DKMS_PATCH_DIR"]).parent.mkdir(parents=True)
+        Path(self.paths["_DKMS_PATCH_DIR"]).write_text("", encoding="utf-8")
         self.assertEqual(self._install("ubuntu24.04", _UBUNTU_CFG), 3)
         self.assertNotIn(["amdgpu-install", "-y", "--usecase=graphics"], self._commands())
-        self.assertIn("file operation failed", self.error.call_args.args[1])
+        self.assertIn("could not create directory", self.error.call_args.args[1])
         self.assertFalse(os.path.exists(self.paths["_WORK_DIR"]))
 
     def test_unwritable_versions_file_returns_3(self):
