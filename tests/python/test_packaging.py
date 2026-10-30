@@ -487,11 +487,11 @@ class HpcdiagTests(unittest.TestCase):
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch.object(download_module, "download") as dl, \
              mock.patch("tarfile.open") as taropen, \
              mock.patch.object(process, "exec_program", return_value=0) as ex, \
-             mock.patch("shutil.copy") as cp, \
-             mock.patch("pathlib.Path.mkdir"), \
+             mock.patch.object(install_hpcdiag, "make_dirs", return_value=True) as mkdir, \
+             mock.patch.object(install_hpcdiag, "copy_file", return_value=True) as cp, \
              mock.patch.object(install_hpcdiag, "remove_paths") as rm:
             taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
             rc = install_hpcdiag.install(env={})
@@ -499,9 +499,11 @@ class HpcdiagTests(unittest.TestCase):
         dl.assert_called_once_with("https://x/tarball/hpcdiag-1", Path("/tmp/hpcdiag-1"))
         ex.assert_called_once_with(["tar", "-xf", "/tmp/hpcdiag-1"], "install-hpcdiag",
                                    cwd="/tmp", env={})
+        # bash: mkdir -p $DESTINATION_DIR; cp <script> $DESTINATION_DIR
+        mkdir.assert_called_once_with("/opt/azurehpc/diagnostics", op="install-hpcdiag")
         cp.assert_called_once_with(
             Path("/tmp/topdir/Linux/src/gather_azhpc_vm_diagnostics.sh"),
-            "/opt/azurehpc/diagnostics")
+            "/opt/azurehpc/diagnostics", "install-hpcdiag")
         rm.assert_called_once_with(Path("/tmp/hpcdiag-1"), Path("/tmp/topdir"),
                                    op="install-hpcdiag")
 
@@ -510,10 +512,10 @@ class HpcdiagTests(unittest.TestCase):
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download"), \
+             mock.patch.object(download_module, "download"), \
              mock.patch("tarfile.open") as taropen, \
              mock.patch.object(process, "exec_program", return_value=2), \
-             mock.patch("shutil.copy") as cp, \
+             mock.patch.object(install_hpcdiag, "copy_file") as cp, \
              mock.patch.object(install_hpcdiag, "remove_paths") as rm:
             taropen.return_value.__enter__.return_value.getnames.return_value = ["topdir/README"]
             rc = install_hpcdiag.install(env={})
@@ -526,7 +528,7 @@ class HpcdiagTests(unittest.TestCase):
         resp_cm = mock.MagicMock()
         resp_cm.__enter__.return_value.read.return_value = api_json
         with mock.patch.object(install_hpcdiag.urllib.request, "urlopen", return_value=resp_cm), \
-             mock.patch.object(install_hpcdiag, "download") as dl, \
+             mock.patch.object(download_module, "download") as dl, \
              mock.patch.object(install_hpcdiag, "log_error") as logged:
             rc = install_hpcdiag.install(env={})
         self.assertEqual(rc, 3)

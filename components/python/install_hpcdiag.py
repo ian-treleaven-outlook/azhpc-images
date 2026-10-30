@@ -17,13 +17,12 @@ rather than the current directory.
 from __future__ import annotations
 
 import json
-import shutil
 import tarfile
 import urllib.request
 from pathlib import Path
 
-from utils.download import download
-from utils.files import extract_tarball, remove_paths
+from utils.download import fetch
+from utils.files import copy_file, extract_tarball, make_dirs, remove_paths
 from utils.logger import log_error, log_info
 
 _OP = "install-hpcdiag"
@@ -59,19 +58,6 @@ def _latest_release_url() -> str | None:
     return url
 
 
-def _download(url: str) -> Path | None:
-    """bash `wget "$DOWNLOAD_URL"`: no checksum exists to verify."""
-    # TODO(ADO 1001): toolkit candidate: fetch(url, op, dest_dir) -> Path | None,
-    # fetch_verified() for downloads that have no published checksum.
-    dest = Path(_WORK_DIR) / Path(url).name
-    try:
-        download(url, dest)
-    except OSError as exc:
-        log_error(_OP, f"download of {url} failed: {exc}", url=url)
-        return None
-    return dest
-
-
 def _unpack(tarball: Path, env: dict[str, str]) -> Path | None:
     """Unpack in /tmp; the unpacked directory, or None."""
     try:
@@ -86,13 +72,8 @@ def _unpack(tarball: Path, env: dict[str, str]) -> Path | None:
 
 def _install_script(unpacked: Path) -> bool:
     """bash `mkdir -p $DESTINATION_DIR` and `cp .../gather_azhpc_vm_diagnostics.sh`."""
-    try:
-        Path(_DEST_DIR).mkdir(parents=True, exist_ok=True)
-        shutil.copy(unpacked / _DIAG_SCRIPT, _DEST_DIR)
-    except OSError as exc:
-        log_error(_OP, f"could not install {_DIAG_SCRIPT} to {_DEST_DIR}: {exc}")
-        return False
-    return True
+    return (make_dirs(_DEST_DIR, op=_OP)
+            and copy_file(unpacked / _DIAG_SCRIPT, _DEST_DIR, _OP))
 
 
 def install(env: dict[str, str]) -> int:
@@ -101,7 +82,7 @@ def install(env: dict[str, str]) -> int:
     url = _latest_release_url()
     if url is None:
         return 3
-    tarball = _download(url)
+    tarball = fetch(url, _OP, _WORK_DIR)          # bash `wget`: GitHub publishes no checksum
     if tarball is None:
         return 3
     unpacked = _unpack(tarball, env)
