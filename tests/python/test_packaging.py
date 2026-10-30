@@ -191,6 +191,12 @@ class NcclDepsTests(unittest.TestCase):
                      "debhelper", "fakeroot", "patchelf"],
                     ["apt", "install", "-y", "zlib1g-dev"]])
 
+    def test_ubuntu26_04_commands(self):
+        rc, commands = self._deps("ubuntu26.04")
+        self.assertEqual(rc, 0)
+        self.assertEqual(commands, [
+            ["apt", "install", "-y", "build-essential", "patchelf", "zlib1g-dev"]])
+
     def test_azure_linux_commands(self):
         rc, commands = self._deps("azurelinux3.0")
         self.assertEqual(rc, 0)
@@ -212,23 +218,23 @@ class NcclDepsTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)        # zlib1g-dev not attempted
 
 
-# Pure string parsing, no mocks needed — parse_openmpi_version digs the version out of
-# `apt-cache show openmpi` output (mirrors the old awk one-liner).
+# Pure string parsing, no mocks needed — parse_apt_cache_version digs the version out of
+# `apt-cache show <pkg>` output (mirrors awk '/^Version:/ {print $2; exit}').
 class DocaVersionParseTests(unittest.TestCase):
     def test_parses_openmpi_version(self):
         sample = "Package: openmpi\nVersion: 4.1.5-1\nArchitecture: amd64\n"
-        self.assertEqual(install_doca.parse_openmpi_version(sample), "4.1.5-1")
+        self.assertEqual(install_doca.parse_apt_cache_version(sample), "4.1.5-1")
 
     def test_takes_first_version(self):
         # Mirrors awk '{...; exit}' — only the first Version line is used.
         sample = "Version: 4.1.5-1\nVersion: 5.0.0-2\n"
-        self.assertEqual(install_doca.parse_openmpi_version(sample), "4.1.5-1")
+        self.assertEqual(install_doca.parse_apt_cache_version(sample), "4.1.5-1")
 
     def test_missing_version_returns_none(self):
-        self.assertIsNone(install_doca.parse_openmpi_version("Package: openmpi\n"))
+        self.assertIsNone(install_doca.parse_apt_cache_version("Package: openmpi\n"))
 
     def test_blank_version_returns_none(self):
-        self.assertIsNone(install_doca.parse_openmpi_version("Version: \n"))
+        self.assertIsNone(install_doca.parse_apt_cache_version("Version: \n"))
 
 
 class MpifileutilsConfigTests(unittest.TestCase):

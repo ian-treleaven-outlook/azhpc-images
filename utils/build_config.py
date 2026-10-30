@@ -276,7 +276,7 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
     return [
         # DOCA-OFED on InfiniBand SKUs; libfabric on non-IB (NCv6)
         Step("install-doca", "install_doca.sh", action=install_doca.install,
-             when=lambda c: sku_has_infiniband(c.gpu), resync="ADO 987"),
+             when=lambda c: sku_has_infiniband(c.gpu)),
         Step("install-libfabric", "install_libfabric.sh",
              action=install_libfabric.install,
              when=lambda c: not sku_has_infiniband(c.gpu)),
@@ -317,10 +317,10 @@ def build_plan(cfg: BuildConfig) -> list[Step]:
 
         # NCCL (NVIDIA), docker (every vendor, as in install.sh), DCGM (NVIDIA)
         Step("install-nccl", "install_nccl.sh", action=install_nccl.install,
-             when=nvidia, resync="ADO 987"),
+             when=nvidia),
         Step("install-docker", "install_docker.sh", action=install_docker.install),
         Step("install-dcgm", "install_dcgm.sh", action=install_dcgm.install,
-             when=nvidia, resync="ADO 987"),
+             when=nvidia),
 
         # --- AMD branch (ROCm itself runs earlier, before PMIx/MPI) ---
         Step("install-rccl", "install_rccl.sh", action=install_rccl.install,

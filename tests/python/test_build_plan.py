@@ -141,9 +141,6 @@ class InstallShParityTests(unittest.TestCase):
 # deliberate change that also updates this test.
 class ResyncTests(unittest.TestCase):
     EXPECTED = {
-        "install-doca": "ADO 987",
-        "install-nccl": "ADO 987",
-        "install-dcgm": "ADO 987",
         "install-lustre": "ADO 988",
         "hpc-tuning": "ADO 988",
         "install-persistent-rdma-naming": "ADO 988",
