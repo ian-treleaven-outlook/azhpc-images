@@ -8,10 +8,10 @@
   * Parity tests check the C probe source, the Azure Linux marker spec and
     the nv-hostengine drop-in against the heredocs in
     components/install_dcgm.sh.
-  * install() is tested with exec_program, run_capture, config_for,
-    write_component_version and the `screen` lookup mocked. Temporary
-    directories (probe, marker rpmbuild), the unit file and the drop-in
-    directory live inside a test-owned temporary directory.
+  * install() is tested with exec_program (wherever the toolkit calls it),
+    run_capture, config_for, write_component_version and the `screen` lookup
+    mocked. Temporary directories (probe, marker rpmbuild), the unit file and
+    the drop-in directory live inside a test-owned temporary directory.
 
 Run from the repo root:
     python3 -m unittest tests.python.test_install_dcgm -v
@@ -19,6 +19,7 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
@@ -27,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_dcgm
-from utils import package_installer
+from utils import component_config, files, package_installer, process, services
 from utils.build_config import BuildConfig, build_plan
 
 _OP = "install-dcgm"
@@ -94,6 +95,22 @@ def _env(distribution="ubuntu24.04", **extra):
 def _heredoc(opening: str) -> str:
     start = _BASH.index(opening + "\n") + len(opening) + 1
     return _BASH[start:_BASH.index("\nEOF\n", start) + 1]
+
+
+def _patch_toolkit(stack, exec_program, *, config=None, error=None):
+    """Patch every place a command can run (one shared exec_program mock keeps
+    them in one ordered list), the config lookups and the error logs."""
+    for module in (process, services, package_installer, install_dcgm):
+        stack.enter_context(mock.patch.object(module, "exec_program", exec_program))
+    stack.enter_context(mock.patch.object(package_installer, "log_info"))
+    stack.enter_context(mock.patch.object(files, "log_info"))
+    error = error or mock.Mock()
+    for module in (package_installer, component_config, install_dcgm):
+        stack.enter_context(mock.patch.object(module, "log_error", error))
+    if config is not None:
+        for module in (component_config, install_dcgm):
+            stack.enter_context(mock.patch.object(module, "config_for", config))
+    return error
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +208,7 @@ class InstallTests(unittest.TestCase):
         self.scratch.mkdir()
         self.dropin_dir = root / "nvidia-dcgm.service.d"
         self.unit = root / "nvidia-dcgm.service"
-        for name, value in (("_PROBE_PARENT_DIR", str(self.scratch)),
+        for name, value in (("_TEMP_PARENT_DIR", str(self.scratch)),
                             ("_DROPIN_DIR", str(self.dropin_dir))):
             patcher = mock.patch.object(install_dcgm, name, value)
             patcher.start()
@@ -256,29 +273,28 @@ class InstallTests(unittest.TestCase):
         def fake_config(component, env):
             return {"cuda": cuda_cfg, "dcgm": dcgm_cfg}[component]
 
-        # One mock for both modules' exec_program keeps every command,
-        # installs included, in one ordered list.
         exec_program = mock.Mock(side_effect=fake_exec)
-        with mock.patch.object(install_dcgm, "exec_program", exec_program), \
-             mock.patch.object(package_installer, "exec_program", exec_program), \
-             mock.patch.object(package_installer, "log_info"), \
-             mock.patch.object(package_installer, "log_error"), \
-             mock.patch.object(install_dcgm, "run_capture",
-                               side_effect=fake_capture) as run_capture, \
-             mock.patch.object(install_dcgm, "config_for",
-                               side_effect=fake_config) as config_for, \
-             mock.patch.object(install_dcgm, "_command_path",
-                               side_effect=lambda name, env: _SCREEN if seen["screen"]
-                               else None), \
-             mock.patch.object(install_dcgm, "write_component_version",
-                               side_effect=write_error) as record, \
-             mock.patch.object(install_dcgm, "log_info") as log_info, \
-             mock.patch.object(install_dcgm, "log_warn") as log_warn, \
-             mock.patch.object(install_dcgm, "log_error") as log_error:
+        config_for = mock.Mock(side_effect=fake_config)
+        with contextlib.ExitStack() as stack:
+            log_error = _patch_toolkit(stack, exec_program, config=config_for)
+            run_capture = stack.enter_context(mock.patch.object(
+                install_dcgm, "run_capture", side_effect=fake_capture))
+            stack.enter_context(mock.patch.object(
+                install_dcgm, "command_exists",
+                side_effect=lambda name, env: seen["screen"]))
+            stack.enter_context(mock.patch.object(
+                install_dcgm, "_command_path",
+                side_effect=lambda name, env: _SCREEN if seen["screen"] else None))
+            record = stack.enter_context(mock.patch.object(
+                install_dcgm, "write_component_version", side_effect=write_error))
+            log_info = stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
+            log_warn = stack.enter_context(mock.patch.object(install_dcgm, "log_warn"))
+            files_info = files.log_info          # patched by _patch_toolkit
             rc = install_dcgm.install(env)
         return rc, {"exec": exec_program, "capture": run_capture,
-                    "config_for": config_for, "record": record,
-                    "info": log_info, "warn": log_warn, "error": log_error, **seen}
+                    "config_for": config_for, "record": record, "info": log_info,
+                    "warn": log_warn, "error": log_error, "files_info": files_info,
+                    **seen}
 
     @staticmethod
     def _commands(mocks):
@@ -482,15 +498,14 @@ class InstallTests(unittest.TestCase):
         self.assertIn("unit file", m["error"].call_args_list[0].args[1])
 
     def test_dropin_created_then_replaced(self):
-        rc, m = self._install(_env())
         dropin = str(self.dropin_dir / "99-mndiag-hpcx.conf")
-        messages = {c.args[1]: c.kwargs for c in m["info"].call_args_list}
-        self.assertEqual(messages[f"Created {dropin} (nv-hostengine runs under screen with "
-                                  "mpi/hpcx loaded)"], {"path": dropin, "action": "created"})
-        rc, m = self._install(_env())
-        messages = {c.args[1]: c.kwargs for c in m["info"].call_args_list}
-        self.assertEqual(messages[f"Replaced {dropin} (nv-hostengine runs under screen "
-                                  "with mpi/hpcx loaded)"]["action"], "replaced")
+        for action in ("created", "replaced"):
+            rc, m = self._install(_env())
+            self.assertEqual(rc, 0)
+            writes = [c for c in m["files_info"].call_args_list
+                      if c.kwargs.get("path") == dropin]
+            self.assertEqual(writes[0].args[1], f"Wrote {dropin} ({action})")
+            self.assertEqual(writes[0].kwargs["action"], action)
 
     # ---- logging -----------------------------------------------------------
     def test_key_log_lines(self):
@@ -506,12 +521,13 @@ class InstallTests(unittest.TestCase):
         decision = [c for c in calls if "also installing the cuda12" in c.args[1]]
         self.assertEqual(decision[0].kwargs, {"cuda_major": 13, "sku_cuda_major": 12})
         ubuntu = [c for c in calls if c.args[1].startswith("Ubuntu:")]
-        self.assertEqual(ubuntu[0].kwargs["version_source"], "versions.json")
+        self.assertEqual(ubuntu[0].kwargs["dcgm_version"], _UBUNTU_DCGM)
+        self.assertTrue(ubuntu[0].kwargs["pinned"])
         resolved = by_message[f"Resolved 8 DCGM packages pinned to {_UBUNTU_DCGM}"]
         self.assertEqual(resolved["packages"], _ubuntu13()[len(_APT):])
         self.assertEqual(by_message[f"Recorded DCGM version {_UBUNTU_DCGM}"],
                          {"component": "DCGM", "version": _UBUNTU_DCGM})
-        self.assertEqual(by_message[f"nv-hostengine command from {self.unit}: {_HOSTENGINE}"]
+        self.assertEqual(by_message[f"nv-hostengine command: {_HOSTENGINE}"]
                          ["screen"], _SCREEN)
         self.assertIn("nvidia-dcgm service is active", by_message)
         self.assertEqual(calls[-1].args[1], "DCGM installed")
@@ -528,24 +544,24 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(os.listdir(self.scratch), [])
 
     def test_compile_failure_returns_3_and_cleans_up(self):
-        def fail_gcc(command, op, **kwargs):
-            return 1
-        with mock.patch.object(install_dcgm, "exec_program", side_effect=fail_gcc), \
-             mock.patch.object(install_dcgm, "run_capture") as run_capture, \
-             mock.patch.object(install_dcgm, "log_info"), \
-             mock.patch.object(install_dcgm, "log_error") as log_error:
+        exec_program = mock.Mock(return_value=1)
+        with contextlib.ExitStack() as stack:
+            _patch_toolkit(stack, exec_program)
+            run_capture = stack.enter_context(mock.patch.object(install_dcgm, "run_capture"))
+            stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
             rc = install_dcgm.install(_env())
         self.assertEqual(rc, 3)
+        self.assertEqual([c.args[0][0] for c in exec_program.call_args_list], ["gcc"])
         run_capture.assert_not_called()
-        self.assertIn("compile", log_error.call_args_list[0].args[1])
         self.assertEqual(os.listdir(self.scratch), [])
 
     def test_probe_dir_os_error_returns_3(self):
-        with mock.patch.object(install_dcgm.tempfile, "mkdtemp",
-                               side_effect=PermissionError("no tmp")), \
-             mock.patch.object(install_dcgm, "exec_program") as exec_program, \
-             mock.patch.object(install_dcgm, "log_info"), \
-             mock.patch.object(install_dcgm, "log_error") as log_error:
+        exec_program = mock.Mock(return_value=0)
+        with contextlib.ExitStack() as stack:
+            log_error = _patch_toolkit(stack, exec_program)
+            stack.enter_context(mock.patch.object(
+                install_dcgm.tempfile, "mkdtemp", side_effect=PermissionError("no tmp")))
+            stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
             rc = install_dcgm.install(_env())
         self.assertEqual(rc, 3)
         exec_program.assert_not_called()
@@ -557,7 +573,8 @@ class InstallTests(unittest.TestCase):
                 rc, m = self._install(_env(distribution), dcgm_cfg={})
                 self.assertEqual(rc, 3)
                 self.assertEqual(self._commands(m), [])
-                self.assertIn("dcgm version", m["error"].call_args_list[0].args[1])
+                self.assertIn("'dcgm' config: missing version",
+                              m["error"].call_args_list[0].args[1])
 
     def test_missing_sku_cuda_version_returns_3_on_ubuntu_and_rhel(self):
         for distribution in ["ubuntu24.04", "ubuntu26.04", "almalinux9.8"]:
@@ -590,7 +607,10 @@ class InstallTests(unittest.TestCase):
                                           fail_on=failing)
                     self.assertEqual(rc, 3)
                     self.assertEqual(self._commands(m), sequence[:index + 1])
-                    m["error"].assert_called()
+                    # (A failed dnf clean / systemctl is logged by exec_program,
+                    # which is mocked here; installs log through install_packages.)
+                    if "install" in failing:
+                        m["error"].assert_called()
                     # The version is recorded only after a successful install.
                     if index < len(installs):
                         m["record"].assert_not_called()
@@ -611,21 +631,20 @@ class InstallTests(unittest.TestCase):
                         rpms.mkdir(parents=True, exist_ok=True)
                         (rpms / f"{_MARKER}-1.0-1.noarch.rpm").touch()
                     return 1 if command[0] == _name else 0
-                with mock.patch.object(install_dcgm, "exec_program", side_effect=fail), \
-                     mock.patch.object(package_installer, "exec_program", side_effect=fail), \
-                     mock.patch.object(package_installer, "log_info"), \
-                     mock.patch.object(package_installer, "log_error"), \
-                     mock.patch.object(install_dcgm, "run_capture",
-                                       return_value=(0, "13000\n")), \
-                     mock.patch.object(install_dcgm, "config_for",
-                                       return_value={"version": _AZL_DCGM}), \
-                     mock.patch.object(install_dcgm, "write_component_version") as record, \
-                     mock.patch.object(install_dcgm, "log_info"), \
-                     mock.patch.object(install_dcgm, "log_error") as error:
+                exec_program = mock.Mock(side_effect=fail)
+                with contextlib.ExitStack() as stack:
+                    error = _patch_toolkit(stack, exec_program, config=mock.Mock(
+                        return_value={"version": _AZL_DCGM}))
+                    stack.enter_context(mock.patch.object(
+                        install_dcgm, "run_capture", return_value=(0, "13000\n")))
+                    record = stack.enter_context(mock.patch.object(
+                        install_dcgm, "write_component_version"))
+                    stack.enter_context(mock.patch.object(install_dcgm, "log_info"))
                     rc = install_dcgm.install(_env("azurelinux3.0"))
                 self.assertEqual(rc, 3)
                 record.assert_not_called()
-                error.assert_called()
+                if name == "dnf":
+                    error.assert_called()
                 self.assertEqual(os.listdir(self.scratch), [])
 
     def test_inactive_service_logs_dcgm_inactive(self):
