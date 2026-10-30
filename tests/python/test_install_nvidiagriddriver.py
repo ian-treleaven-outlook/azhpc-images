@@ -1,16 +1,16 @@
 """Unit tests for components/python/install_nvidiagriddriver.py.
 
-  * The pure helpers (gridd.conf edits, nvcc version parse, names/URLs) are
-    tested directly. Their results were also compared against real
-    grep/sed/echo and grep/awk/cut in bash (WSL), and CUDA_PROFILE_CONTENT
-    against the file the two `echo | tee` lines render.
+  * The pure helpers (gridd.conf edits, installer name) are tested
+    directly. Their results were also compared against real grep/sed/echo in
+    bash (WSL). The shared CUDA pieces (toolkit name, nvcc parse, cuda.sh)
+    are tested in test_cuda.py.
   * install() is tested with its external effects mocked where they run:
     utils.component_config.config_for, utils.download.download_and_verify,
     exec_program (utils.process's, behind run(), and
     utils.package_installer's, which runs the toolkit install, share one fake
     that performs `cp` so the licensing edits run on real temporary files),
     run_capture (nvcc), write_component_version and
-    install_cuda_samples.install. The module's and the toolkit's log calls
+    install_cuda_samples.install. The module's, utils.cuda's and the toolkit's log calls
     share one mock per level, so assertions see every message in order.
     Every path constant points into a temporary directory.
 
@@ -21,7 +21,6 @@ Run from the repo root:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import tempfile
 import unittest
@@ -29,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nvidiagriddriver as grid
-from utils import component_config, files, package_installer, process
+from utils import component_config, cuda, files, package_installer, process
 from utils import download as download_module
 from utils.build_config import BuildConfig, build_plan
 
@@ -77,10 +76,6 @@ class NameTests(unittest.TestCase):
     def test_installer_name(self):
         self.assertEqual(grid.driver_installer_name("595.91.07"), _INSTALLER)
 
-    def test_toolkit_package_replaces_every_dot(self):
-        self.assertEqual(grid.cuda_toolkit_package("13.2"), "cuda-toolkit-13-2")
-        self.assertEqual(grid.cuda_toolkit_package("12.9.1"), "cuda-toolkit-12-9-1")
-
 
 class GriddEditTests(unittest.TestCase):
     def test_split_lines_only_on_newline(self):
@@ -112,23 +107,6 @@ class GriddEditTests(unittest.TestCase):
                          ("a\n", 1))
 
 
-class NvccVersionTests(unittest.TestCase):
-    def test_release_line(self):
-        self.assertEqual(grid.nvcc_release_version(_NVCC_OUT), "13.2.51")
-
-    def test_first_word_wins_like_bash(self):
-        out = "x release 1 2 3 Vy\n" + _NVCC_OUT
-        self.assertEqual(grid.nvcc_release_version(out), "y")
-
-    def test_short_matching_line_is_dropped_like_word_splitting(self):
-        self.assertEqual(grid.nvcc_release_version("short release\n" + _NVCC_OUT),
-                         "13.2.51")
-
-    def test_no_match_is_none(self):
-        self.assertIsNone(grid.nvcc_release_version(""))
-        self.assertIsNone(grid.nvcc_release_version("nvcc: command not found\n"))
-
-
 class BashScriptTests(unittest.TestCase):
     def test_cuda_repo_setup_moved_to_the_bootstrap(self):
         # Upstream #643: the keyring/apt-get update lines left this script for
@@ -140,17 +118,6 @@ class BashScriptTests(unittest.TestCase):
                 self.assertNotIn(gone, script)
         bootstrap = (_REPO / "distros" / "ubuntu24.04" / "install_utils.sh").read_text()
         self.assertIn("$COMPONENT_DIR/install_cuda_repo_and_dkms.sh", bootstrap)
-
-
-class CudaProfileContentTests(unittest.TestCase):
-    def test_matches_the_echo_lines_in_the_bash_script(self):
-        # Each `echo '<text>' | tee [-a] /etc/profile.d/cuda.sh` writes <text>
-        # plus a newline; read the texts from the .sh so the two can't drift.
-        script = (_REPO / "components" / "install_nvidiagriddriver.sh").read_text()
-        texts = re.findall(r"^echo '([^']*)' \| tee (?:-a )?/etc/profile\.d/cuda\.sh",
-                           script, flags=re.M)
-        self.assertEqual(len(texts), 2)
-        self.assertEqual(grid.CUDA_PROFILE_CONTENT, "".join(t + "\n" for t in texts))
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +186,8 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(files, "log_info", log_info), \
              mock.patch.object(files, "log_error", log_error), \
+             mock.patch.object(cuda, "log_info", log_info), \
+             mock.patch.object(cuda, "log_warn", log_warn), \
              mock.patch.object(grid, "run_capture", return_value=nvcc) as run_capture, \
              mock.patch.object(grid, "write_component_version",
                                side_effect=write_error) as record, \
@@ -275,7 +244,7 @@ class InstallTests(unittest.TestCase):
         with open(self.conf, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), _EXPECTED_CONF)
         with open(self.profile, "rb") as handle:
-            self.assertEqual(handle.read(), grid.CUDA_PROFILE_CONTENT.encode())
+            self.assertEqual(handle.read(), cuda.CUDA_PROFILE_TEXT.encode())
         self.assertEqual(os.stat(self.profile).st_mode & 0o777, 0o644)
         self.assertFalse(os.path.exists(self.work))          # cleaned up
         m["error"].assert_not_called()
@@ -316,7 +285,7 @@ class InstallTests(unittest.TestCase):
         rc, m = self._install()
         self.assertEqual(rc, 0)
         with open(self.profile, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), grid.CUDA_PROFILE_CONTENT)
+            self.assertEqual(handle.read(), cuda.CUDA_PROFILE_TEXT)
         self.assertEqual(os.stat(self.profile).st_mode & 0o777, 0o644)
         self.assertIn(f"Wrote {self.profile} (replaced)", self._messages(m["info"]))
 

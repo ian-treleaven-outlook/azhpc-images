@@ -47,6 +47,8 @@ Behaviour kept from bash
     cut -c2-` plus the unquoted ${cuda_version} (first word recorded).
   * cuda.sh gets exactly the bytes bash's two `echo | tee` lines write (a
     test compares it with the .sh).
+  * The toolkit package name, cuda.sh text, nvcc parser and CUDA apt source
+    check are shared with install_nvidiagpudriver (utils/cuda.py).
   * Nothing checks the distro, like bash. Bash's apt only works on Ubuntu,
     so elsewhere we warn, carry on, and fail at the toolkit install, where
     bash's apt fails (without running install_packages(), which would pick
@@ -83,12 +85,14 @@ Bash quirks, kept and warned about
 
 from __future__ import annotations
 
-import glob
 import os
 import re
 
 from components.python import install_cuda_samples
 from utils.component_config import require_config, write_component_version
+from utils.cuda import (APT_SOURCES_DIR, CUDA_PROFILE, CUDA_PROFILE_TEXT,
+                        NVCC_VERSION_COMMAND, check_cuda_apt_source, cuda_toolkit_package,
+                        nvcc_cuda_version)
 from utils.distro import Distro
 from utils.download import fetch_verified
 from utils.files import remove_paths, write_file
@@ -103,10 +107,8 @@ _OP = "install-nv-grid"
 _WORK_DIR = "/tmp/azhpc-nvidia-grid"
 _GRIDD_TEMPLATE = "/etc/nvidia/gridd.conf.template"
 _GRIDD_CONF = "/etc/nvidia/gridd.conf"
-_CUDA_PROFILE = "/etc/profile.d/cuda.sh"
-# Where the bootstrap's cuda-keyring puts NVIDIA's CUDA apt source.
-_APT_SOURCES_DIR = "/etc/apt/sources.list.d"
-_CUDA_APT_SOURCE_GLOB = "cuda-*"
+_CUDA_PROFILE = CUDA_PROFILE
+_APT_SOURCES_DIR = APT_SOURCES_DIR
 
 _PERSISTENCE_SCRIPT = "configure_nvidia_persistence.sh"
 
@@ -116,20 +118,6 @@ _GRIDD_FALSE_KEYS = ("IgnoreSP", "EnableUI")
 _GRIDD_DELETE_PREFIX = "FeatureType=0"
 
 _DRIVER_INSTALLER_ARGS = ["--silent", "--dkms", "--kernel-module-type=open"]
-
-# bash: cuda_version=$(source /etc/profile; nvcc --version | ...). Its own bash
-# so /etc/profile can put nvcc on PATH; the pipe is nvcc_release_version().
-_NVCC_VERSION_SHELL = "source /etc/profile; nvcc --version"
-
-# /etc/profile.d/cuda.sh, byte for byte. The ${...} is literal here; a login
-# shell expands it when it sources the file.
-CUDA_PROFILE_CONTENT = (
-    'export PATH="${PATH:+$PATH:}/usr/local/cuda/bin"\n'
-    'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/usr/local/cuda/lib64"\n'
-)
-
-# awk field splitting / bash word splitting: spaces, tabs and newlines.
-_BLANKS = re.compile(r"[ \t\n]+")
 
 # gridd.conf is edited without changing any byte we don't touch: newline=""
 # keeps "\r\n", surrogateescape round-trips bytes that aren't UTF-8.
@@ -142,11 +130,6 @@ _TEXT_IO = {"encoding": "utf-8", "errors": "surrogateescape", "newline": ""}
 def driver_installer_name(version: str) -> str:
     """The installer file name bash runs: NVIDIA-Linux-x86_64-<V>-grid-azure.run."""
     return f"NVIDIA-Linux-x86_64-{version}-grid-azure.run"
-
-
-def cuda_toolkit_package(version: str) -> str:
-    """cuda-toolkit-${CUDA_DRIVER_VERSION//./-}: every "." becomes "-"."""
-    return "cuda-toolkit-" + version.replace(".", "-")
 
 
 def split_lines(text: str) -> list[str]:
@@ -181,24 +164,6 @@ def delete_lines(text: str, prefix: str) -> tuple[str, int]:
     lines = split_lines(text)
     kept = [line for line in lines if not line.startswith(prefix)]
     return "".join(kept), len(lines) - len(kept)
-
-
-def nvcc_release_version(output: str) -> str | None:
-    """nvcc --version | grep release | awk '{print $6}' | cut -c2-, first word.
-
-        "Cuda compilation tools, release 13.2, V13.2.51"  ->  "13.2.51"
-
-    A matching line with fewer than 6 fields gives "", which word splitting
-    drops. None when nothing is left.
-    """
-    values = []
-    for line in split_lines(output):
-        if "release" in line:
-            fields = _BLANKS.split(line.rstrip("\n"))
-            fields = [field for field in fields if field]
-            values.append(fields[5][1:] if len(fields) >= 6 else "")
-    words = [word for word in _BLANKS.split("\n".join(values)) if word]
-    return words[0] if words else None
 
 
 # --------------------------------------------------------------------------- #
@@ -352,23 +317,6 @@ def _configure_grid_licensing(env: dict[str, str]) -> bool:
 # --------------------------------------------------------------------------- #
 # 3-7. CUDA toolkit, cuda.sh, CUDA version, samples, persistence
 # --------------------------------------------------------------------------- #
-def _check_cuda_apt_source() -> None:
-    """Log whether NVIDIA's CUDA apt source is configured (bash doesn't check)."""
-    # TODO(ADO 1001): toolkit candidate: shared with install_nvidiagpudriver
-    # (with nvcc_release_version, cuda_toolkit_package and CUDA_PROFILE_CONTENT),
-    # e.g. a utils/cuda.py.
-    sources = sorted(glob.glob(os.path.join(_APT_SOURCES_DIR, _CUDA_APT_SOURCE_GLOB)))
-    if sources:
-        log_info(_OP, "NVIDIA CUDA apt source present (added by "
-                      "install_cuda_repo_and_dkms.sh in the bootstrap)",
-                 cuda_apt_sources=", ".join(sources))
-    else:
-        log_warn(_OP, f"no CUDA apt source ({_CUDA_APT_SOURCE_GLOB}) in "
-                      f"{_APT_SOURCES_DIR}: the bootstrap's install_cuda_repo_and_dkms.sh "
-                      "should have added it; installing the toolkit anyway, as bash does",
-                 path=_APT_SOURCES_DIR)
-
-
 def _install_cuda_toolkit(env: dict[str, str], distro: Distro, toolkit: str) -> bool:
     if not distro.is_ubuntu:
         # install_packages() would pick dnf here; bash runs apt and fails.
@@ -377,7 +325,7 @@ def _install_cuda_toolkit(env: dict[str, str], distro: Distro, toolkit: str) -> 
                        "doesn't have; failing here, where bash's apt fails",
                   package=toolkit, distro=distro.name)
         return False
-    _check_cuda_apt_source()
+    check_cuda_apt_source(_OP, _APT_SOURCES_DIR)
     log_info(_OP, f"Installing {toolkit} from the NVIDIA CUDA apt repository",
              package=toolkit)
     return install_packages([toolkit], env, _OP, cwd=_WORK_DIR)
@@ -385,9 +333,8 @@ def _install_cuda_toolkit(env: dict[str, str], distro: Distro, toolkit: str) -> 
 
 def _record_cuda_version(env: dict[str, str]) -> str | None:
     """Ask nvcc, through /etc/profile, for the CUDA version, and record it."""
-    rc, output = run_capture(["bash", "-c", _NVCC_VERSION_SHELL], _OP,
-                             cwd=_WORK_DIR, env=env)
-    version = nvcc_release_version(output) if rc == 0 else None
+    rc, output = run_capture(list(NVCC_VERSION_COMMAND), _OP, cwd=_WORK_DIR, env=env)
+    version = nvcc_cuda_version(output) if rc == 0 else None
     if version is None:
         log_error(_OP, "could not read the CUDA version from `nvcc --version`: "
                        f"{output.strip()!r}", exit_code=rc)
@@ -436,7 +383,7 @@ def _install_steps(env: dict[str, str], distro: Distro, grid: dict[str, str],
     if not (_install_grid_driver(env, grid)
             and _configure_grid_licensing(env)
             and _install_cuda_toolkit(env, distro, toolkit)
-            and write_file(_CUDA_PROFILE, CUDA_PROFILE_CONTENT, _OP, mode=0o644)):
+            and write_file(_CUDA_PROFILE, CUDA_PROFILE_TEXT, _OP, mode=0o644)):
         return None
     cuda_version = _record_cuda_version(env)
     if cuda_version is None or not (_install_cuda_samples(env)

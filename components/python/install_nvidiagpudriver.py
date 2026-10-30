@@ -35,7 +35,9 @@ rackscale NVLink SKUs GB200/GB300 (VR200 is built as GB200). install() runs:
   3. Unless azure_vm_akshost: install cuda-toolkit-<major>-<minor> (the RHEL
      family first adds NVIDIA's CUDA dnf repo, rhel_cuda_repo_commands),
      write /etc/profile.d/cuda.sh, record the nvcc version as CUDA, and build
-     the CUDA samples (install_cuda_samples.install).
+     the CUDA samples (install_cuda_samples.install). The package name,
+     cuda.sh text and nvcc parser are shared with install_nvidiagriddriver
+     (utils/cuda.py).
   4. Nested bash: install_gdrcopy.sh.
   5. Not rackscale: nested install_nvidia_fabric_manager.sh. Rackscale
      (NVLINK_RACKSCALE=true, any case): nvprofiling and CDMM
@@ -140,6 +142,9 @@ from dataclasses import dataclass
 from components.python import install_cuda_samples
 from utils.component_config import (DEFAULT_NODE_TYPE, config_for, require_config,
                                     write_component_version)
+from utils.cuda import (APT_SOURCES_DIR, CUDA_PROFILE, CUDA_PROFILE_TEXT,
+                        NVCC_VERSION_COMMAND, check_cuda_apt_source, cuda_toolkit_package,
+                        nvcc_cuda_version)
 from utils.distro import Distro
 from utils.download import fetch_verified
 from utils.files import remove_paths, write_file
@@ -191,9 +196,6 @@ _APT_PREFERENCES = "/etc/apt/preferences.d/00-nvidia-prefer"
 _APT_PREFERENCES_TEXT = 'Package: *\nPin: origin ""\nPin-Priority: 1001\n'
 _KEYRINGS_DIR = "/usr/share/keyrings"
 _KMS_CONF = "/etc/modprobe.d/nvidia-graphics-drivers-kms.conf"
-# Where the bootstrap's cuda-keyring install puts NVIDIA's CUDA apt source.
-_APT_SOURCES_DIR = "/etc/apt/sources.list.d"
-_CUDA_APT_SOURCE_GLOB = "cuda-*"
 # The one Ubuntu release whose recorded driver version comes from dpkg-query.
 _UBUNTU_DPKG_VERSION = "ubuntu26.04"
 _DPKG_VERSION_PACKAGE = "nvidia-open"
@@ -225,12 +227,6 @@ _GRDMA_LINE = "options nvidia NVreg_GrdmaPciTopoCheckOverride=1"
 _IMEX_CHANNEL_LINE = "options nvidia NVreg_CreateImexChannel0=1"
 _OPENRM_CONF = "/etc/modprobe.d/nvidia-openrm.conf"
 _OPENRM_TEXT = "options nvidia NVreg_CoherentGPUMemoryMode=driver\n"
-_CUDA_PROFILE = "/etc/profile.d/cuda.sh"
-# Single-quoted in bash's echo, so the ${...} are written literally.
-_CUDA_PROFILE_TEXT = (
-    'export PATH="${PATH:+$PATH:}/usr/local/cuda/bin"\n'
-    'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/usr/local/cuda/lib64"\n'
-)
 
 # ---- Nested bash scripts (in $COMPONENT_DIR) ----------------------------------
 _GDRCOPY_SCRIPT = "install_gdrcopy.sh"
@@ -297,22 +293,6 @@ def looks_like_version(value: str | None, pattern: str) -> bool:
     return value is not None and re.fullmatch(pattern, value) is not None
 
 
-def nvcc_cuda_version(nvcc_output: str) -> str | None:
-    """The CUDA version from `nvcc --version` output, or None.
-
-    Mirrors  nvcc --version | grep release | awk '{print $6}' | cut -c2-
-    and the unquoted ${cuda_version} (first word only):
-
-        "Cuda compilation tools, release 13.0, V13.0.88"  ->  "13.0.88"
-    """
-    values = []
-    for line in nvcc_output.split("\n"):
-        if "release" in line:
-            fields = [field for field in _BLANKS.split(line) if field]
-            values.append(fields[5][1:] if len(fields) >= 6 else "")
-    return first_word("\n".join(values))
-
-
 def local_repo_dir(repo_file: str) -> str:
     """bash: ${repo_file%%_*} (everything before the first _)."""
     return repo_file.split("_")[0]
@@ -336,11 +316,6 @@ def ubuntu_driver_packages(sku: str, rackscale: bool, major: str) -> tuple[str, 
         return "rackscale", [f"nvidia-dkms-{major}-open", f"nvidia-driver-{major}-open",
                              "nvidia-modprobe"]
     return "nvidia-open", ["nvidia-open"]
-
-
-def cuda_toolkit_package(cuda_version: str) -> str:
-    """cuda-toolkit-${CUDA_DRIVER_VERSION//./-}: "13.0" -> "cuda-toolkit-13-0"."""
-    return "cuda-toolkit-" + cuda_version.replace(".", "-")
 
 
 def rhel_cuda_excludes(cuda_version: str) -> str:
@@ -622,24 +597,6 @@ def _driver_azurelinux(env: dict[str, str], p: _Inputs) -> str | None:
     return version
 
 
-def _check_cuda_apt_source() -> None:
-    """Log whether NVIDIA's CUDA apt source is configured (bash doesn't check)."""
-    # TODO(ADO 1001): toolkit candidate: shared with install_nvidiagriddriver
-    # (with nvcc_cuda_version, cuda_toolkit_package and the cuda.sh text),
-    # e.g. a utils/cuda.py.
-    sources = sorted(glob.glob(_host(os.path.join(_APT_SOURCES_DIR,
-                                                  _CUDA_APT_SOURCE_GLOB))))
-    if sources:
-        log_info(_OP, "NVIDIA CUDA apt source present (added by "
-                      "install_cuda_repo_and_dkms.sh in the bootstrap)",
-                 cuda_apt_sources=", ".join(sources))
-    else:
-        log_warn(_OP, f"no CUDA apt source ({_CUDA_APT_SOURCE_GLOB}) in "
-                      f"{_APT_SOURCES_DIR}: the bootstrap's install_cuda_repo_and_dkms.sh "
-                      "should have added it; continuing, as bash does",
-                 path=_host(_APT_SOURCES_DIR))
-
-
 def _copy_local_repo_keyrings(p: _Inputs) -> bool:
     """cp /var/<repo dir>/nvidia-driver-local-*-keyring.gpg /usr/share/keyrings/"""
     # TODO(ADO 1001): toolkit candidate: copy_files(pattern, dest_dir, op) -> bool
@@ -680,7 +637,7 @@ def _add_local_repo(env: dict[str, str], p: _Inputs) -> bool:
 def _driver_ubuntu(env: dict[str, str], p: _Inputs) -> str | None:
     log_info(_OP, f"Ubuntu: installing NVIDIA driver {p.driver_version} from apt",
              driver_version=p.driver_version, version_source="versions.json")
-    _check_cuda_apt_source()
+    check_cuda_apt_source(_OP, _host(APT_SOURCES_DIR))
     if p.local_repo:
         if not _add_local_repo(env, p):
             return None
@@ -803,8 +760,7 @@ def _add_rhel_cuda_repo(env: dict[str, str], p: _Inputs) -> bool:
 
 
 def _nvcc_cuda_version(env: dict[str, str]) -> str | None:
-    rc, output = run_capture(["bash", "-c", "source /etc/profile; nvcc --version"],
-                             _OP, env=env)
+    rc, output = run_capture(list(NVCC_VERSION_COMMAND), _OP, env=env)
     cuda = nvcc_cuda_version(output) if rc == 0 else None
     if not looks_like_version(cuda, r"[0-9]+(\.[0-9]+)*"):
         log_error(_OP, f"could not read the CUDA version from `nvcc --version` "
@@ -824,7 +780,7 @@ def _install_toolkit(env: dict[str, str], p: _Inputs) -> str | None:
             or not install_packages([package], env, _OP)):
         log_error(_OP, f"CUDA toolkit installation failed ({package})", package=package)
         return None
-    if not write_file(_host(_CUDA_PROFILE), _CUDA_PROFILE_TEXT, _OP, mode=0o644):
+    if not write_file(_host(CUDA_PROFILE), CUDA_PROFILE_TEXT, _OP, mode=0o644):
         return None
     cuda = _nvcc_cuda_version(env)
     if cuda is None or not _record("CUDA", cuda):

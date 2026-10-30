@@ -1,7 +1,8 @@
 """Unit tests for components/python/install_nvidiagpudriver.py.
 
-  * Pure helpers are tested directly. The dnf/nvcc/awk parsers were also
-    compared against the real grep/sed/awk/cut in WSL on the same inputs.
+  * Pure helpers are tested directly. The dnf/dpkg parsers were also
+    compared against the real grep/sed in WSL on the same inputs. The shared
+    CUDA pieces (toolkit name, nvcc parse, cuda.sh) are tested in test_cuda.py.
   * Generated files are compared with fixtures in
     tests/python/fixtures/install_nvidiagpudriver/, rendered by running the
     bash script's own echo/tee/heredoc lines in real bash. (00-nvidia-prefer
@@ -33,7 +34,7 @@ from unittest import mock
 from components.python import install_nvidiagpudriver as m
 from contextlib import ExitStack
 
-from utils import component_config, files, package_installer, process
+from utils import component_config, cuda, files, package_installer, process
 from utils import download as download_module
 from utils.distro import Distro
 from utils.build_config import BuildConfig, build_plan
@@ -185,13 +186,6 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(m.looks_like_version("cuda-open.x86_64", r"[0-9.]+-[0-9]+"))
         self.assertFalse(m.looks_like_version(None, r"[0-9.]+-[0-9]+"))
 
-    def test_nvcc_cuda_version(self):
-        self.assertEqual(m.nvcc_cuda_version(_NVCC_13), "13.0.88")
-        self.assertEqual(m.nvcc_cuda_version(_NVCC_12), "12.9.86")
-        self.assertIsNone(m.nvcc_cuda_version(""))
-        self.assertIsNone(m.nvcc_cuda_version("bash: nvcc: command not found\n"))
-        self.assertIsNone(m.nvcc_cuda_version("release a b\n"))
-
     def test_local_repo_dir(self):
         # Checked against bash's ${repo_file%%_*} in WSL.
         self.assertEqual(m.local_repo_dir(_REPO_FILE),
@@ -216,10 +210,6 @@ class HelperTests(unittest.TestCase):
                          "rhel-8-for-aarch64-supplementary-rhui-rpms")
         self.assertEqual(m.rhel_supplementary_repo("rhel10", "x86_64"),
                          "rhel-10-for-x86_64-supplementary-rhui-rpms")
-
-    def test_cuda_toolkit_package(self):
-        self.assertEqual(m.cuda_toolkit_package("13.0"), "cuda-toolkit-13-0")
-        self.assertEqual(m.cuda_toolkit_package("12.9"), "cuda-toolkit-12-9")
 
     def test_ubuntu_driver_packages(self):
         self.assertEqual(m.ubuntu_driver_packages("V100", True, "580"),
@@ -260,7 +250,6 @@ class FixtureTests(unittest.TestCase):
     """The module's file texts are byte-identical to what bash writes."""
 
     def test_texts_match_bash_renders(self):
-        self.assertEqual(m._CUDA_PROFILE_TEXT, _fixture("cuda.sh"))
         self.assertEqual(m._APT_PREFERENCES_TEXT, _fixture("00-nvidia-prefer.txt"))
         self.assertEqual(m._NVPROFILING_TEXT, _fixture("nvprofiling.conf"))
         self.assertEqual(m._OPENRM_TEXT, _fixture("nvidia-openrm.conf"))
@@ -386,6 +375,7 @@ class _InstallBase(unittest.TestCase):
             # One recorder per level for the module and the toolkit it calls.
             (m, "log_info", log_info), (files, "log_info", log_info),
             (m, "log_warn", log_warn),
+            (cuda, "log_info", log_info), (cuda, "log_warn", log_warn),
             (m, "log_error", log_error), (files, "log_error", log_error),
             (component_config, "log_error", log_error),
             (download_module, "log_error", log_error),
