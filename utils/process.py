@@ -14,6 +14,7 @@ manager running as an orphan, still holding the dpkg lock.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -218,3 +219,49 @@ def run_capture(command: list[str], op: str, *, cwd: str | None = None, env=None
     _log_result(op, command, proc.returncode, time.monotonic() - started, tail,
                 failure_is_error)
     return (proc.returncode, proc.stdout or "")
+
+# --- Convenience wrappers --------------------------------------------------
+# Most ports only need "did it work?". These keep that one line long, so a
+# port reads as what it does rather than how it checks exit codes.
+
+def run(command: list[str], op: str, *, cwd: str | None = None, env=None) -> bool:
+    """Run one command; True if it exited 0.
+
+    exec_program logs the command, its exit code and, on failure, its last
+    output lines, so callers only need to say what the failure means.
+    """
+    return exec_program(command, op, cwd=cwd, env=env) == 0
+
+
+def run_all(commands: list[list[str]], op: str, *, cwd: str | None = None,
+            env=None) -> bool:
+    """Run commands in order, stopping at the first failure (bash's `set -e`)."""
+    for command in commands:
+        if not run(command, op, cwd=cwd, env=env):
+            return False
+    return True
+
+
+def run_script(lines: list[str], op: str, *, modules: list[str] | tuple[str, ...] = (),
+               cwd: str | None = None, env=None) -> bool:
+    """Run shell lines as one `bash -c` script with `set -e`.
+
+    For the steps that must share one shell, typically because they follow
+    `module load` (an environment-modules shell function, so it only affects
+    the shell it runs in). With `modules`, the script starts with
+        source /etc/profile.d/modules.sh
+        module load <module>...
+    Bash's matching `module unload` lines are not needed: the shell exits.
+    """
+    header = ["set -e"]
+    if modules:
+        header.append("source /etc/profile.d/modules.sh")
+        header += [f"module load {module}" for module in modules]
+    script = "\n".join(header + list(lines)) + "\n"
+    return run(["bash", "-c", script], op, cwd=cwd, env=env)
+
+
+def command_exists(name: str, env=None) -> bool:
+    """bash `command -v <name>`: True if `name` is on the build env's PATH."""
+    path = (env or os.environ).get("PATH")
+    return shutil.which(name, path=path) is not None

@@ -76,3 +76,17 @@ def download_and_verify(url, sha256, dest_dir=".") -> Path:
         raise ChecksumError(f"SHA256 verification failed for {dest}")
 
     return dest
+
+
+def fetch_verified(url, sha256, op: str, dest_dir=".") -> Path | None:
+    """download_and_verify() for ports: the file's Path, or None on failure.
+
+    Network errors, file errors and checksum mismatches are logged as an ERROR
+    under the step's `op` label (with the URL), so the caller only checks for
+    None and returns 3, instead of wrapping each download in try/except.
+    """
+    try:
+        return download_and_verify(url, sha256, dest_dir=dest_dir)
+    except (OSError, ChecksumError) as exc:
+        log_error(op, f"download of {url} failed: {exc}", url=url)
+        return None
