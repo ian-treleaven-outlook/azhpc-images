@@ -342,6 +342,20 @@ class MorePackageHelperTests(unittest.TestCase):
                          ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0",
                           "--only-upgrade", "python3-pip"])
 
+    def test_upgrade_all_packages(self):
+        ok, run, _, _ = self._run(package_installer.upgrade_all_packages,
+                                  distribution="almalinux9.8")
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.args[0], ["dnf", "update", "-y"])
+        _, run, _, _ = self._run(package_installer.upgrade_all_packages)
+        self.assertEqual(run.call_args.args[0],
+                         ["apt-get", "upgrade", "-y", "-o", "Dpkg::Use-Pty=0"])
+        ok, run, _, error = self._run(package_installer.upgrade_all_packages,
+                                      distribution="sles15")
+        self.assertFalse(ok)
+        run.assert_not_called()
+        error.assert_called_once()
+
     def test_installed_package_version(self):
         version, _, cap, _ = self._run(package_installer.installed_package_version, "rccl",
                                        capture=(0, "2.27.7\n"))
@@ -356,6 +370,17 @@ class MorePackageHelperTests(unittest.TestCase):
                                          capture=(1, ""))
         self.assertIsNone(version)
         error.assert_called_once()
+
+    def test_installed_package_version_missing_ok_is_not_an_error(self):
+        # bash `if ! rpm -q pkg`: "not installed" is an answer, not a failure.
+        version, _, cap, error = self._run(package_installer.installed_package_version,
+                                           "python3-setools", distribution="rocky9.8",
+                                           capture=(1, "package python3-setools is not "
+                                                       "installed\n"),
+                                           missing_ok=True)
+        self.assertIsNone(version)
+        error.assert_not_called()
+        self.assertFalse(cap.call_args.kwargs["failure_is_error"])
 
     def test_unknown_distribution(self):
         ok, run, _, error = self._run(package_installer.remove_packages, ["x"], distribution="sles15")

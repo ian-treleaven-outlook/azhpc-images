@@ -12,7 +12,8 @@ The last step of the Azure Linux build (install.sh runs it as
      and disabled, and the INPUT, OUTPUT and FORWARD policies set to ACCEPT.
 
 AlmaLinux, Rocky and RHEL have a different network-config.sh (NetworkManager
-and cloud-init settings); this module is only the Azure Linux one.
+and cloud-init settings), ported in rhel_family_network_config.py; this
+module is only the Azure Linux one.
 
 Deliberate difference: bash's `systemctl is-active systemd-networkd` prints
 the state; this uses `systemctl is-active --quiet` (service_is_active) and

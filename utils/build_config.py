@@ -280,7 +280,6 @@ class ImageBuilder:
         `counts` (python / bash / skipped) is updated for the summary line.
         """
         cfg = self.config
-        components = self.repo_root / "components"
         for step in steps:
             # (a) skip steps that don't apply to this target (e.g. rocm on NVIDIA).
             # A skip that may hide a problem (e.g. install.sh for this distro
@@ -315,9 +314,10 @@ class ImageBuilder:
                 if runner == "python":
                     rc = step.action(env)
                 else:
-                    # "distro" specific scripts live in build_dir; the rest in components/
-                    base_dir = build_dir if step.base == "distro" else components
-                    rc = exec_program([str(base_dir / step.script), *step.args],
+                    # The script is in components/, utils/ or the distro folder
+                    # (Step.base); like install.sh, it runs in the distro folder.
+                    script = step.script_path(self.repo_root, cfg.distro_dir)
+                    rc = exec_program([str(script), *step.args],
                                       step.op, cwd=str(build_dir), env=env)
             except Exception as exc:
                 elapsed = time.monotonic() - step_started

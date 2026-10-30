@@ -98,13 +98,26 @@ class ResolveConfigTests(unittest.TestCase):
         return resolve_config(Namespace(vendor=vendor, gpu=gpu, os=os_name,
                                         spec=None, fips=False))
 
+    def _without_a_plan(self, os_name, ticket):
+        """Patches that make os_name an OS still waiting for its plan (`ticket`).
+
+        Every --os has a plan today, so the refusal path is tested this way.
+        patch.dict puts both dicts back as they were afterwards; clear=True
+        empties PLANS first, then fills it with every plan but os_name's.
+        """
+        others = {name: plan for name, plan in PLANS.items() if name != os_name}
+        return (mock.patch.dict(build_config.PLANS, others, clear=True),
+                mock.patch.dict(build_config.PENDING, {os_name: ticket}))
+
     def test_an_os_without_a_plan_is_rejected_with_its_ticket(self):
-        for os_name, ticket in PENDING.items():
-            with self.subTest(os=os_name):
-                with self.assertRaises(ConfigError) as caught:
-                    self._resolve(os_name)
-                self.assertEqual(caught.exception.code, 1)
-                self.assertIn(ticket, str(caught.exception))
+        plans, pending = self._without_a_plan("RHEL9", "ADO 999")
+        with plans, pending:
+            with self.assertRaises(ConfigError) as caught:
+                self._resolve("RHEL9")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("ADO 999", str(caught.exception))
+        self.assertIn("distros/rhel9.x/install.sh", str(caught.exception))
+        self.assertIn("RHEL9", PLANS)                      # restored
 
     def test_a_vendor_the_install_sh_rejects_is_rejected(self):
         # e.g. AlmaLinux's install.sh: "AMD GPU support is not implemented yet".
@@ -117,10 +130,13 @@ class ResolveConfigTests(unittest.TestCase):
                              "AMD GPU support is not implemented yet for X.")
             self.assertEqual(self._resolve("Ubuntu24").vendor, "NVidia")
 
-    @unittest.skipUnless(PENDING, "every --os has a plan")
     def test_build_plan_refuses_an_os_without_a_plan(self):
-        with self.assertRaises(ConfigError):
-            build_plan(_cfg(next(iter(PENDING)), "NVidia", "A100"))
+        # resolve_config() refuses it first; this guards direct callers.
+        plans, pending = self._without_a_plan("Alma8", "ADO 999")
+        with plans, pending:
+            with self.assertRaises(ConfigError) as caught:
+                build_plan(_cfg("Alma8", "NVidia", "A100"))
+        self.assertIn("ADO 999", str(caught.exception))
 
 
 class InstallShParityTests(unittest.TestCase):
@@ -152,9 +168,8 @@ class InstallShParityTests(unittest.TestCase):
                 for step in _planned(cfg):
                     if not step.script:
                         continue
-                    base = _REPO / (cfg.distro_dir if step.base == "distro" else "components")
                     with self.subTest(os=os_name, gpu=gpu, script=step.script):
-                        self.assertTrue((base / step.script).is_file())
+                        self.assertTrue(step.script_path(_REPO, cfg.distro_dir).is_file())
 
     def test_cleanup_is_install_sh_text_word_for_word_in_the_distro_folder(self):
         for os_name in PLANS:
@@ -211,6 +226,28 @@ class PreBootstrapTests(unittest.TestCase):
         self.assertIn("pre-step", lines[1])
         self.assertTrue(lines[1].endswith("(python, before install_utils.sh)"))
         self.assertTrue(lines[2].endswith("(python)"))
+
+
+class EndOfBuildStepTests(unittest.TestCase):
+    """The shared steps some install.sh scripts end with (AlmaLinux, Rocky, RHEL)."""
+
+    def test_clear_history_runs_the_utils_script_as_bash(self):
+        step = steps.clear_history()
+        self.assertEqual((step.op, step.script, step.base),
+                         ("clear-history", "clear_history.sh", "utils"))
+        self.assertEqual(step.runner, "bash")
+        self.assertTrue(step.script_path(_REPO, "distros/rocky9.x").is_file())
+
+    def test_system_upgrade_is_inline_and_returns_the_contract_codes(self):
+        step = steps.system_upgrade()
+        self.assertEqual((step.op, step.script, step.runner), ("upgrade-all-packages", "", "python"))
+        for upgraded, rc in ((True, 0), (False, 3)):
+            with self.subTest(upgraded=upgraded):
+                with mock.patch.object(steps, "upgrade_all_packages",
+                                       return_value=upgraded) as upgrade:
+                    self.assertEqual(step.action({"DISTRIBUTION": "almalinux9.8"}), rc)
+                upgrade.assert_called_once_with({"DISTRIBUTION": "almalinux9.8"},
+                                                "upgrade-all-packages")
 
 
 if __name__ == "__main__":

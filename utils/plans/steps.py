@@ -31,7 +31,12 @@ from components.python import (
     trivy_scan, write_kernel_os_version,
 )
 from components.python import azurelinux_network_config as azl_network_config
+from components.python import fix_setools_cyclecloud
+# Imported under a short name: the step function below is called
+# rhel_family_network_config, and would hide the module's own name.
+from components.python import rhel_family_network_config as rhel_net_config
 from utils.logger import log_info
+from utils.package_installer import upgrade_all_packages
 from utils.plans.step import Step
 from utils.process import exec_program
 
@@ -211,6 +216,33 @@ def trivy(**kw):
     return Step("trivy-scan", "trivy_scan.sh", action=trivy_scan.install, **kw)
 
 
+# --- whole-system steps at the end of some install.sh scripts -----------------
+def system_upgrade_action(env: dict[str, str]) -> int:
+    """Upgrade every installed package. Returns 0, or 3 on failure."""
+    return 0 if upgrade_all_packages(env, "upgrade-all-packages") else 3
+
+
+def system_upgrade(**kw):
+    """Inline in install.sh: `dnf update -y` (today only AlmaLinux 9's, near the end)."""
+    return Step("upgrade-all-packages", action=system_upgrade_action, **kw)
+
+
+def clear_history(**kw):
+    """$UTILS_DIR/clear_history.sh, the last line of Rocky's and RHEL's install.sh.
+
+    It stays bash, on purpose. It is the image's deprovisioning (245 lines:
+    remove Defender, clean logs, caches, cloud-init state and shell history,
+    zero free disk space), and Packer's "Clear history and deprovision" step
+    runs the same script again after the build and its tests. Porting it means
+    porting both runs, a separate task.
+
+    Note that it truncates every *.log under /var/log, including this CLI's own
+    log file (/var/log/azhpc by default), so that file keeps only the lines
+    logged after this step; the console output Packer records keeps them all.
+    """
+    return Step("clear-history", "clear_history.sh", base="utils", **kw)
+
+
 # --- scripts in the distro folder (./name.sh) ---------------------------------
 def auto_upgrade(**kw):
     """./disable_auto_upgrade.sh (only Ubuntu 26.04's install.sh runs it now)."""
@@ -238,3 +270,15 @@ def azurelinux_network_config(**kw):
     """./network-config.sh in distros/azurelinux3.0 (the RHEL family's differs)."""
     return Step("network-config", "network-config.sh", base="distro",
                 action=azl_network_config.install, **kw)
+
+
+# --- AlmaLinux, Rocky Linux and RHEL -------------------------------------------
+def setools_cyclecloud(**kw):
+    """fix_setools_cyclecloud.sh, right after install_utils.sh."""
+    return Step("fix-setools-cyclecloud", "fix_setools_cyclecloud.sh",
+                action=fix_setools_cyclecloud.install, **kw)
+
+def rhel_family_network_config(**kw):
+    """./network-config.sh (the same script in all six AlmaLinux, Rocky and RHEL folders)."""
+    return Step("network-config", "network-config.sh", base="distro",
+                action=rhel_net_config.install, **kw)

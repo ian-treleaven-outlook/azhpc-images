@@ -139,13 +139,38 @@ def update_packages(packages, env: dict[str, str], op: str) -> bool:
     return exec_program(["dnf", "update", "-y", *packages], op, env=env) == 0
 
 
+def upgrade_all_packages(env: dict[str, str], op: str) -> bool:
+    """Upgrade every installed package: `dnf update -y` / `apt-get upgrade -y`.
+
+    AlmaLinux 9's install.sh ends with `dnf update -y`. (set_properties.sh's
+    `apt upgrade -y` doesn't use this: utils/system_prep.py runs it spelled
+    exactly as bash writes it.)
+    """
+    manager = _manager(env, op, "upgrade packages")
+    if manager is None:
+        return False
+    if manager == "apt-get":
+        # Dpkg::Use-Pty=0, as for installs: keeps dpkg's progress out of the log.
+        command = ["apt-get", "upgrade", "-y", "-o", "Dpkg::Use-Pty=0"]
+    else:
+        command = ["dnf", "update", "-y"]
+    log_info(op, f"Upgrading every installed package with {manager}",
+             package_manager=manager)
+    return exec_program(command, op, env=env) == 0
+
+
 def installed_package_version(package: str, env: dict[str, str], op: str, *,
-                              rpm_format: str = "%{VERSION}-%{RELEASE}") -> str | None:
+                              rpm_format: str = "%{VERSION}-%{RELEASE}",
+                              missing_ok: bool = False) -> str | None:
     """The installed version of `package`, or None if it isn't installed (logged).
 
     Ubuntu: `dpkg-query -W -f '${Version}' <package>`; RPM distros:
     `rpm -q --queryformat <rpm_format> <package>`. Pass rpm_format="%{VERSION}"
     where bash records the version without the release.
+
+    missing_ok=True is for bash's `if ! rpm -q <package>` checks, where "not
+    installed" is a normal answer: it returns None without logging an ERROR,
+    and the caller logs what it does instead.
     """
     manager = _manager(env, op, "query a package version")
     if manager is None:
@@ -154,11 +179,12 @@ def installed_package_version(package: str, env: dict[str, str], op: str, *,
         command = ["dpkg-query", "-W", "-f", "${Version}", package]
     else:
         command = ["rpm", "-q", "--queryformat", rpm_format, package]
-    rc, out = run_capture(command, op, env=env)
+    rc, out = run_capture(command, op, env=env, failure_is_error=not missing_ok)
     version = out.strip()
     if rc != 0 or not version:
-        log_error(op, f"{package} is not installed (no version from {command[0]})",
-                  package=package)
+        if not missing_ok:
+            log_error(op, f"{package} is not installed (no version from {command[0]})",
+                      package=package)
         return None
     return version
 
