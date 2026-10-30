@@ -41,8 +41,9 @@ Behaviour kept from bash
   * The gridd.conf edits behave like
         grep -q '^Key=' f && sed -i 's/^Key=.*/Key=FALSE/' f || echo 'Key=FALSE' >> f
         sed -i '/^FeatureType=0/d' f
-    line by line (see the pure helpers below), byte for byte, including a
-    file with no final newline. Checked against GNU grep/sed in WSL.
+    line by line (the pure helpers below, applied with edit_file, a
+    byte-preserving sed -i), including a file with no final newline.
+    Checked against GNU grep/sed in WSL.
   * The CUDA version is parsed like `grep release | awk '{print $6}' |
     cut -c2-` plus the unquoted ${cuda_version} (first word recorded).
   * cuda.sh gets exactly the bytes bash's two `echo | tee` lines write (a
@@ -72,13 +73,17 @@ Deliberate differences from bash
     only that, always (bash leaves its files behind when it fails). A
     warning records the bash behaviour.
   * cuda.sh is written in one go rather than by tee then tee -a; same file.
+  * `cp gridd.conf.template gridd.conf` is copy_file (shutil.copy): the
+    copy gets the template's permission bits, also when gridd.conf already
+    existed (cp would keep that file's mode).
 
 Bash quirks, kept and warned about
 ----------------------------------
   * `A && B || C` also runs the echo when the key IS present but sed fails
-    (or grep can't read the file). We do the same: if rewriting fails, we
-    warn and append "Key=FALSE" anyway, leaving the old line in place too.
-    Only a failing append fails the step, as under `set -e`.
+    (or grep can't read the file). We do the same: if edit_file can't read
+    or rewrite the file (it logs an error), we warn and append "Key=FALSE"
+    anyway, leaving the old line in place too. Only a failing append fails
+    the step, as under `set -e`.
   * `echo >>` onto a file without a final newline glues "Key=FALSE" onto its
     last line; a later rewrite of that glued line can then drop it.
 """
@@ -89,14 +94,14 @@ import os
 import re
 
 from components.python import install_cuda_samples
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.cuda import (APT_SOURCES_DIR, CUDA_PROFILE, CUDA_PROFILE_TEXT,
                         NVCC_VERSION_COMMAND, check_cuda_apt_source, cuda_toolkit_package,
                         nvcc_cuda_version)
 from utils.distro import Distro
 from utils.download import fetch_verified
-from utils.files import remove_paths, write_file
-from utils.logger import log_debug, log_error, log_info, log_warn
+from utils.files import copy_file, edit_file, fresh_dir, remove_paths, write_file
+from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
 from utils.process import run, run_capture
 
@@ -119,10 +124,6 @@ _GRIDD_DELETE_PREFIX = "FeatureType=0"
 
 _DRIVER_INSTALLER_ARGS = ["--silent", "--dkms", "--kernel-module-type=open"]
 
-# gridd.conf is edited without changing any byte we don't touch: newline=""
-# keeps "\r\n", surrogateescape round-trips bytes that aren't UTF-8.
-_TEXT_IO = {"encoding": "utf-8", "errors": "surrogateescape", "newline": ""}
-
 
 # --------------------------------------------------------------------------- #
 # Pure helpers: they only transform values, so tests call them directly.
@@ -138,16 +139,12 @@ def split_lines(text: str) -> list[str]:
     return re.findall(r"[^\n]*\n|[^\n]+$", text)
 
 
-def has_key(text: str, key: str) -> bool:
-    """grep -q '^<key>='"""
-    return any(line.startswith(f"{key}=") for line in split_lines(text))
-
-
 def set_key(text: str, key: str, value: str) -> tuple[str, int]:
     """sed 's/^<key>=.*/<key>=<value>/': (new text, lines changed).
 
     `.*` runs to the end of the line, so the whole line is replaced (a
     trailing "\\r" too); the line's newline, or lack of one, is kept.
+    0 lines changed is bash's `grep -q '^<key>='` finding nothing.
     """
     changed = 0
     out = []
@@ -164,47 +161,6 @@ def delete_lines(text: str, prefix: str) -> tuple[str, int]:
     lines = split_lines(text)
     kept = [line for line in lines if not line.startswith(prefix)]
     return "".join(kept), len(lines) - len(kept)
-
-
-# --------------------------------------------------------------------------- #
-# Small shared jobs
-# --------------------------------------------------------------------------- #
-def _fresh_work_dir() -> bool:
-    # TODO(ADO 1001): toolkit candidate: fresh_dir(path, op) -> bool
-    # (rm -rf, then mkdir -p; three driver/samples ports do this).
-    remove_paths(_WORK_DIR, op=_OP)
-    try:
-        os.makedirs(_WORK_DIR, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {_WORK_DIR}: {exc}", path=_WORK_DIR)
-        return False
-    return True
-
-
-def _record(component: str, version: str) -> bool:
-    # TODO(ADO 1001): toolkit candidate: record_component_version(component,
-    # version, op) -> bool (write_component_version that logs instead of raising).
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}",
-                  component=component, version=version)
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
-
-
-# TODO(ADO 1001): toolkit candidate: edit_file(path, transform, op) -> bool, a
-# byte-preserving `sed -i` (read, transform, write back; logs failures).
-def _read_gridd() -> str:
-    with open(_GRIDD_CONF, **_TEXT_IO) as handle:
-        return handle.read()
-
-
-def _write_gridd(text: str) -> None:
-    with open(_GRIDD_CONF, "w", **_TEXT_IO) as handle:
-        handle.write(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,7 +181,7 @@ def _install_grid_driver(env: dict[str, str], grid: dict[str, str]) -> bool:
                   "(open kernel modules, DKMS)", installer=installer,
              args=" ".join(_DRIVER_INSTALLER_ARGS))
     return (run(["bash", installer, *_DRIVER_INSTALLER_ARGS], _OP, cwd=_WORK_DIR, env=env)
-            and _record("NVIDIA_GRID", grid["version"]))
+            and record_version("NVIDIA_GRID", grid["version"], _OP))
 
 
 # --------------------------------------------------------------------------- #
@@ -261,54 +217,47 @@ def _append_key(key: str, reason: str) -> bool:
 
 def _ensure_key_false(key: str) -> bool:
     """grep -q '^Key=' f && sed -i 's/^Key=.*/Key=FALSE/' f || echo 'Key=FALSE' >> f"""
-    try:
-        text = _read_gridd()
-    except OSError as exc:
-        # grep can't read the file (exit 2), so bash's `||` runs the echo.
-        log_warn(_OP, f"could not read {_GRIDD_CONF} ({exc}); appending "
-                      f"{key}=FALSE anyway, as bash's `grep && sed || echo` does",
-                 path=_GRIDD_CONF, key=key)
-        return _append_key(key, "the file could not be read")
-    if not has_key(text, key):
-        return _append_key(key, f"no {key}= line")
+    replaced = []
 
-    new_text, changed = set_key(text, key, "FALSE")
-    try:
-        _write_gridd(new_text)
-    except OSError as exc:
-        # BASH QUIRK (kept): in `A && B || C`, C also runs when B fails.
-        log_warn(_OP, f"could not rewrite {key}= in {_GRIDD_CONF} ({exc}); "
-                      f"appending {key}=FALSE instead, as bash's "
-                      "`grep && sed || echo` does (the old line is kept)",
+    def rewrite(text: str) -> str:
+        new_text, changed = set_key(text, key, "FALSE")
+        replaced.append(changed)
+        return new_text
+
+    if not edit_file(_GRIDD_CONF, rewrite, _OP):
+        # BASH QUIRK (kept): in `A && B || C`, C also runs when grep can't
+        # read the file or sed fails (edit_file has logged which).
+        log_warn(_OP, f"appending {key}=FALSE to {_GRIDD_CONF} anyway, as bash's "
+                      "`grep && sed || echo` does (an existing line is kept)",
                  path=_GRIDD_CONF, key=key)
-        return _append_key(key, "rewriting the existing line failed")
-    log_info(_OP, f"Set {key}=FALSE in {_GRIDD_CONF} ({changed} line(s) replaced)",
-             path=_GRIDD_CONF, key=key, value="FALSE", action="replaced",
-             lines=changed)
+        return _append_key(key, "reading or rewriting the file failed")
+    if not replaced[0]:
+        return _append_key(key, f"no {key}= line")
+    log_info(_OP, f"Set {key}=FALSE in {_GRIDD_CONF} ({replaced[0]} line(s) replaced)",
+             path=_GRIDD_CONF, key=key, value="FALSE", lines=replaced[0])
     return True
 
 
 def _delete_feature_type_lines() -> bool:
     """sed -i '/^FeatureType=0/d' gridd.conf"""
-    try:
-        new_text, deleted = delete_lines(_read_gridd(), _GRIDD_DELETE_PREFIX)
-        _write_gridd(new_text)
-    except OSError as exc:
-        log_error(_OP, f"could not remove {_GRIDD_DELETE_PREFIX} lines from "
-                       f"{_GRIDD_CONF}: {exc}", path=_GRIDD_CONF)
+    deleted = []
+
+    def drop(text: str) -> str:
+        new_text, count = delete_lines(text, _GRIDD_DELETE_PREFIX)
+        deleted.append(count)
+        return new_text
+
+    if not edit_file(_GRIDD_CONF, drop, _OP):
         return False
-    log_info(_OP, f"Removed {deleted} line(s) starting with {_GRIDD_DELETE_PREFIX} "
-                  f"from {_GRIDD_CONF}", path=_GRIDD_CONF, action="edited",
-             lines=deleted)
-    log_debug(_OP, f"{_GRIDD_CONF} now contains:\n{new_text}")
+    log_info(_OP, f"Removed {deleted[0]} line(s) starting with {_GRIDD_DELETE_PREFIX} "
+                  f"from {_GRIDD_CONF}", path=_GRIDD_CONF, lines=deleted[0])
     return True
 
 
-def _configure_grid_licensing(env: dict[str, str]) -> bool:
+def _configure_grid_licensing() -> bool:
     log_info(_OP, f"Configuring GRID licensing: {_GRIDD_CONF} from {_GRIDD_TEMPLATE}",
              path=_GRIDD_CONF, template=_GRIDD_TEMPLATE)
-    # cp itself (not shutil) so a new file gets cp's permissions.
-    if not run(["cp", _GRIDD_TEMPLATE, _GRIDD_CONF], _OP, cwd=_WORK_DIR, env=env):
+    if not copy_file(_GRIDD_TEMPLATE, _GRIDD_CONF, _OP):
         return False
     return (all(_ensure_key_false(key) for key in _GRIDD_FALSE_KEYS)
             and _delete_feature_type_lines())
@@ -339,7 +288,7 @@ def _record_cuda_version(env: dict[str, str]) -> str | None:
         log_error(_OP, "could not read the CUDA version from `nvcc --version`: "
                        f"{output.strip()!r}", exit_code=rc)
         return None
-    return version if _record("CUDA", version) else None
+    return version if record_version("CUDA", version, _OP) else None
 
 
 def _install_cuda_samples(env: dict[str, str]) -> bool:
@@ -381,7 +330,7 @@ def _install_steps(env: dict[str, str], distro: Distro, grid: dict[str, str],
                    toolkit: str) -> str | None:
     """Steps 1-7 in the work dir; the recorded CUDA version, or None."""
     if not (_install_grid_driver(env, grid)
-            and _configure_grid_licensing(env)
+            and _configure_grid_licensing()
             and _install_cuda_toolkit(env, distro, toolkit)
             and write_file(_CUDA_PROFILE, CUDA_PROFILE_TEXT, _OP, mode=0o644)):
         return None
@@ -413,7 +362,7 @@ def install(env: dict[str, str]) -> int:
                       "doesn't check the distro; continuing like bash, so the "
                       "step fails at the CUDA toolkit install", distro=distro.name)
 
-    if not _fresh_work_dir():
+    if not fresh_dir(_WORK_DIR, _OP):
         return 3
     try:
         cuda_version = _install_steps(env, distro, grid, toolkit)
