@@ -287,8 +287,9 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(install_doca, "command_exists", return_value=rpmbuild_present), \
              mock.patch.object(install_doca, "check_dkms_status", return_value=dkms_ok) as dkms, \
              mock.patch.object(install_doca, "running_kernel", return_value=_KERNEL), \
-             mock.patch.object(install_doca, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
+             mock.patch.object(component_config, "log_info") as config_info, \
              mock.patch.object(install_doca, "log_info") as info, \
              mock.patch.object(install_doca, "log_warn") as warn, \
              mock.patch.object(install_doca, "log_error") as error:
@@ -296,6 +297,7 @@ class InstallTests(unittest.TestCase):
         self.checksum, self.dkms_check, self.record = checksum, dkms, record
         self.info, self.warn, self.error = info, warn, error
         self.file_info, self.config_error = file_info, config_error
+        self.config_info = config_info
         self.download_error_log = download_error
         return rc
 
@@ -622,7 +624,7 @@ class InstallTests(unittest.TestCase):
 
     def test_unwritable_versions_file_returns_3(self):
         self.assertEqual(self._install(write_error=PermissionError("denied")), 3)
-        self.assertIn("denied", self.error.call_args.args[1])
+        self.assertIn("denied", self.config_error.call_args.args[1])     # record_version
 
     # ---- logging --------------------------------------------------------------
     def test_key_log_lines(self):
@@ -637,13 +639,14 @@ class InstallTests(unittest.TestCase):
         conf = str(self.dkms / "mlnx-ofed-kernel.conf")
         self.assertEqual(self._messages(self.file_info)[f"Wrote {conf} (created)"],
                          {"path": conf, "action": "created"})
-        self.assertIn(f"Installed DKMS patch "
-                      f"{self.dkms / 'mlnx-ofed-kernel' / 'patches' / 'xdp-fragments.patch'}",
-                      messages)
+        patch = self.dkms / "mlnx-ofed-kernel" / "patches" / "xdp-fragments.patch"
+        self.assertIn(f"Copied {_PATCHES / 'mlnx-ofed-kernel-xdp-fragments.patch'} -> "
+                      f"{patch} (created)", self._messages(self.file_info))
         marker = [k for k in messages if k.startswith("Building the equivs marker")][0]
         self.assertEqual(messages[marker]["sharp_provided"], True)
-        self.assertIn("Recorded DOCA=3.2.3", messages)
-        self.assertIn("Recorded OFED=25.10-1.7.1", messages)
+        recorded = self._messages(self.config_info)
+        self.assertIn("Recorded DOCA 3.2.3", recorded)
+        self.assertIn("Recorded OFED 25.10-1.7.1", recorded)
         self.assertEqual(self.info.call_args_list[-1].args[1], "DOCA-OFED 3.2.3 installed")
 
 

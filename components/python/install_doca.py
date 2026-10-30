@@ -63,7 +63,8 @@ Deliberate differences from bash
   * OFED: a failing `ofed_info` or a first line with fewer than four
     '-'-separated fields fails the step (bash would record "" or "-").
   * RHEL family: dnf.conf is restored from the .bak even if the install
-    fails (bash's `set -e` exits first and leaves the edited copy).
+    fails (bash's `set -e` exits first and leaves the edited copy). The
+    exclude= edit (edit_file) keeps every other byte, like sed -i.
   * Package lists bash sorts with `sort -u` (locale order) are sorted in
     plain character order; only the order of names in the marker spec's
     Provides lines and in excludepkgs can differ, which rpm/dnf ignore.
@@ -87,18 +88,17 @@ from __future__ import annotations
 import glob
 import os
 import re
-import shutil
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from utils.component_config import config_for, require_config, write_component_version
+from utils.component_config import config_for, record_version, require_config
 from utils.distro import Distro
 from utils.dkms import check_dkms_status, running_kernel
 from utils.download import fetch_verified, verify_checksum
-from utils.files import remove_paths, write_file
+from utils.files import (copy_file, edit_file, make_dirs, move_file, remove_paths,
+                         write_file)
 from utils.logger import log_error, log_info, log_warn
-from utils.package_installer import install_packages
+from utils.package_installer import install_packages, refresh_package_index
 from utils.process import command_exists, exec_program, run, run_all, run_capture
 from utils.services import systemctl
 from utils.sku import sku_uses_ipoib
@@ -384,7 +384,11 @@ def _get_package(env: dict[str, str], doca: _Doca, work_dir: str) -> str | None:
         path = os.path.join(env.get("TOP_DIR", ""), "internal_bits", doca.repo_file)
         log_info(_OP, f"Using the private DOCA package {path}", path=path,
                  source="private", sha256=doca.sha256)
-        return path if verify_checksum(path, doca.sha256) else None
+        try:
+            return path if verify_checksum(path, doca.sha256) else None
+        except OSError as exc:
+            log_error(_OP, f"could not read the private DOCA package: {exc}", path=path)
+            return None
     if not _download(doca, work_dir):
         return None
     return os.path.basename(doca.url)
@@ -518,8 +522,8 @@ def _install_rpm_marker(env: dict[str, str], doca_version: str) -> bool:
     topdir = os.path.join(_MARKER_WORK_DIR, f"{_MARKER}-rpmbuild")
     spec_file = os.path.join(topdir, "SPECS", f"{_MARKER}.spec")
     remove_paths(topdir, op=_OP)
-    for sub in _RPMBUILD_DIRS:
-        os.makedirs(os.path.join(topdir, sub), exist_ok=True)
+    if not make_dirs(*(os.path.join(topdir, sub) for sub in _RPMBUILD_DIRS), op=_OP):
+        return False
 
     provides = _rpm_marker_provides(env)
     if provides is None:
@@ -548,14 +552,10 @@ def _add_patch(env: dict[str, str], patch: tuple[str, str], module: str,
     """cp the patch into /etc/dkms/<module>/patches and list it in `dkms_conf`
     (`cat >`, or `cat >>` with append=True)."""
     patch_dir = os.path.join(_DKMS_ETC_DIR, module, "patches")
-    os.makedirs(patch_dir, exist_ok=True)
     source = os.path.join(env.get("COMPONENT_DIR", ""), "patches", patch[0])
-    dest = os.path.join(patch_dir, patch[1])
-    # TODO(ADO 1001): toolkit candidate: copy_file(source, dest, op) -> bool (bash `cp`)
-    shutil.copy(source, dest)
-    log_info(_OP, f"Installed DKMS patch {dest}", source=source, path=dest,
-             patch=patch[1])
-    return write_file(dkms_conf, f'PATCH+=("{patch[1]}")\n', _OP, append=append)
+    return (make_dirs(patch_dir, op=_OP)
+            and copy_file(source, os.path.join(patch_dir, patch[1]), _OP)
+            and write_file(dkms_conf, f'PATCH+=("{patch[1]}")\n', _OP, append=append))
 
 
 def _kernel_needs_dpll_patch() -> bool:
@@ -583,7 +583,8 @@ def _configure_doca_dkms_patches(env: dict[str, str], module: str) -> bool:
     V100) and, for mlnx-ofa_kernel, the DPLL patch when the kernel needs it."""
     dkms_conf = os.path.join(_DKMS_ETC_DIR, f"{module}.conf")
     # bash: mkdir -p "${patch_dir}", even when no patch goes in it.
-    os.makedirs(os.path.join(_DKMS_ETC_DIR, module, "patches"), exist_ok=True)
+    if not make_dirs(os.path.join(_DKMS_ETC_DIR, module, "patches"), op=_OP):
+        return False
     sku = env.get("SKU", "")
     if sku == _NO_PEER_MEM_PATCH_SKU:
         log_info(_OP, "V100: not adding the PeerDirect GPL-export DKMS patch (its "
@@ -622,8 +623,7 @@ def _install_ubuntu(env: dict[str, str], doca: _Doca, doca_file: str,
         return False
     if not write_file(_DKMS_PIN, _DKMS_PIN_CONTENT, _OP):
         return False
-    # TODO(ADO 1001): toolkit candidate: refresh_package_index(env, op) (apt-get update)
-    if not run(["apt-get", "update"], _OP, env=env):
+    if not refresh_package_index(env, _OP):
         return False
     if not _install_apt_marker(env, doca.version):
         return False
@@ -643,34 +643,23 @@ def _install_azurelinux(env: dict[str, str], doca: _Doca, doca_file: str,
             and install_packages([_DOCA_OFED], env, _OP))
 
 
-@contextmanager
-def _dnf_excludes_lifted():
-    """bash: cp dnf.conf dnf.conf.bak; sed -i '/^exclude=/d' dnf.conf; ...;
-    mv dnf.conf.bak dnf.conf. We restore on failure too."""
-    backup = f"{_DNF_CONF}.bak"
-    shutil.copy(_DNF_CONF, backup)
-    original = Path(_DNF_CONF).read_text(encoding="utf-8")
-    Path(_DNF_CONF).write_text(strip_dnf_excludes(original), encoding="utf-8")
-    log_info(_OP, f"Backed up {_DNF_CONF} to {backup} and removed its exclude= lines",
-             path=_DNF_CONF, backup=backup, action="edited")
-    try:
-        yield
-    finally:
-        os.replace(backup, _DNF_CONF)
-        log_info(_OP, f"Restored {_DNF_CONF} from {backup}", path=_DNF_CONF,
-                 action="restored")
-
-
 def _install_rhel(env: dict[str, str], doca: _Doca, doca_file: str,
                   work_dir: str) -> bool:
-    if not _add_doca_repo_rpm(env, doca, doca_file, work_dir):
+    """bash: cp dnf.conf dnf.conf.bak; sed -i '/^exclude=/d' dnf.conf; <install>;
+    mv dnf.conf.bak dnf.conf (restored on failure too); then the baseos pin."""
+    backup = f"{_DNF_CONF}.bak"
+    if not (_add_doca_repo_rpm(env, doca, doca_file, work_dir)
+            and copy_file(_DNF_CONF, backup, _OP)
+            and edit_file(_DNF_CONF, strip_dnf_excludes, _OP)):
         return False
-    with _dnf_excludes_lifted():
+    try:
         ok = (_install_rpm_marker(env, doca.version)
               and _configure_doca_dkms_patches(env, _RHEL_KERNEL_MODULE)
               and install_packages([_DOCA_OFED], env, _OP)
               and check_dkms_status(_RHEL_DKMS_MODULES, _OP, env))
-    return ok and _pin_baseos_conflicts(env)
+    finally:
+        restored = move_file(backup, _DNF_CONF, _OP)
+    return ok and restored and _pin_baseos_conflicts(env)
 
 
 _INSTALLERS = {
@@ -721,8 +710,9 @@ def _pin_baseos_conflicts(env: dict[str, str]) -> bool:
 # Common tail
 # --------------------------------------------------------------------------- #
 def _record_versions(env: dict[str, str], doca_version: str) -> bool:
-    write_component_version("DOCA", doca_version)
-    log_info(_OP, f"Recorded DOCA={doca_version}", component="DOCA", version=doca_version)
+    """Record DOCA, then OFED as ofed_info reports it."""
+    if not record_version("DOCA", doca_version, _OP):
+        return False
     rc, output = run_capture(["ofed_info"], _OP, env=env)
     ofed = parse_ofed_version(output) if rc == 0 else None
     if not ofed:
@@ -730,9 +720,7 @@ def _record_versions(env: dict[str, str], doca_version: str) -> bool:
         log_error(_OP, "could not read the OFED version from ofed_info",
                   exit_code=rc, first_line=first)
         return False
-    write_component_version("OFED", ofed)
-    log_info(_OP, f"Recorded OFED={ofed}", component="OFED", version=ofed)
-    return True
+    return record_version("OFED", ofed, _OP)
 
 
 def _disable_ipoib_if_unused(env: dict[str, str]) -> bool:
@@ -788,20 +776,14 @@ def install(env: dict[str, str]) -> int:
              url=doca.url, repo_file=doca.repo_file, distro=str(distro), branch=branch,
              architecture=env.get("ARCHITECTURE", ""), sku=env.get("SKU", ""),
              node_type=env.get("TARGET_NODE_TYPE", ""), work_dir=work_dir)
-    try:
-        doca_file = _get_package(env, doca, work_dir)
-        if doca_file is None:
-            return 3
-        if not _INSTALLERS[branch](env, doca, doca_file, work_dir):
-            log_error(_OP, "DOCA-OFED installation failed", distro=str(distro),
-                      branch=branch)
-            return 3
-        if not _record_versions(env, doca.version) or not _configure_openibd(env):
-            return 3
-    except OSError as exc:
-        # Patch copies, dnf.conf, the marker build dirs and the versions file.
-        log_error(_OP, f"file operation failed: {exc}",
-                  path=getattr(exc, "filename", None))
+    doca_file = _get_package(env, doca, work_dir)
+    if doca_file is None:
+        return 3
+    if not _INSTALLERS[branch](env, doca, doca_file, work_dir):
+        log_error(_OP, "DOCA-OFED installation failed", distro=str(distro),
+                  branch=branch)
+        return 3
+    if not _record_versions(env, doca.version) or not _configure_openibd(env):
         return 3
     log_info(_OP, f"DOCA-OFED {doca.version} installed", version=doca.version,
              distro=str(distro), branch=branch)
