@@ -139,6 +139,26 @@ def update_packages(packages, env: dict[str, str], op: str) -> bool:
     return exec_program(["dnf", "update", "-y", *packages], op, env=env) == 0
 
 
+def upgrade_all_packages(env: dict[str, str], op: str) -> bool:
+    """Upgrade every installed package: `dnf update -y` / `apt-get upgrade -y`.
+
+    AlmaLinux 9's install.sh ends with `dnf update -y`. (set_properties.sh's
+    `apt upgrade -y` doesn't use this: utils/system_prep.py runs it spelled
+    exactly as bash writes it.)
+    """
+    manager = _manager(env, op, "upgrade packages")
+    if manager is None:
+        return False
+    if manager == "apt-get":
+        # Dpkg::Use-Pty=0, as for installs: keeps dpkg's progress out of the log.
+        command = ["apt-get", "upgrade", "-y", "-o", "Dpkg::Use-Pty=0"]
+    else:
+        command = ["dnf", "update", "-y"]
+    log_info(op, f"Upgrading every installed package with {manager}",
+             package_manager=manager)
+    return exec_program(command, op, env=env) == 0
+
+
 def installed_package_version(package: str, env: dict[str, str], op: str, *,
                               rpm_format: str = "%{VERSION}-%{RELEASE}",
                               missing_ok: bool = False) -> str | None:

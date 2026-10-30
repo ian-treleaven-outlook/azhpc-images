@@ -319,11 +319,9 @@ class GatingTests(unittest.TestCase):
             for step in build_plan(cfg):
                 if not step.script or not step.when(cfg):
                     continue
-                base = (_REPO_ROOT / cfg.distro_dir if step.base == "distro"
-                        else _REPO_ROOT / "components")
+                path = step.script_path(_REPO_ROOT, cfg.distro_dir)
                 with self.subTest(gpu=gpu, script=step.script):
-                    self.assertTrue((base / step.script).is_file(),
-                                    f"{base / step.script} does not exist")
+                    self.assertTrue(path.is_file(), f"{path} does not exist")
 
 
 # component_env() provides what set_properties.sh exports.
@@ -519,6 +517,28 @@ class BuildFailureHandlingTests(unittest.TestCase):
         self.assertEqual(Step("a", "a.sh", action=port).runner, "python")
         self.assertEqual(Step("a", "a.sh").runner, "bash")
         self.assertEqual(Step("a", "a.sh", action=port, resync="ADO 1").runner, "bash")
+
+    def test_script_path_follows_the_base(self):
+        # install.sh: $COMPONENT_DIR/x.sh, ./x.sh and $UTILS_DIR/x.sh.
+        root, distro_dir = Path("/repo"), "distros/rocky9.x"
+        for base, expected in (("component", "/repo/components/x.sh"),
+                               ("distro", "/repo/distros/rocky9.x/x.sh"),
+                               ("utils", "/repo/utils/x.sh")):
+            with self.subTest(base=base):
+                self.assertEqual(Step("a", "x.sh", base=base).script_path(root, distro_dir),
+                                 Path(expected))
+
+    def test_unknown_base_is_refused_when_the_step_is_made(self):
+        with self.assertRaises(ValueError):
+            Step("a", "x.sh", base="component_dir")
+
+    def test_utils_script_runs_from_the_distro_folder(self):
+        # Like install.sh's $UTILS_DIR/clear_history.sh: the script is in
+        # utils/, the working directory is still the distro folder.
+        rc, bash, _, _ = self._run_one_step(Step("test-step", "clear_history.sh", base="utils"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(bash.call_args.args[0], [str(_REPO_ROOT / "utils" / "clear_history.sh")])
+        self.assertEqual(bash.call_args.kwargs["cwd"], str(_REPO_ROOT / "distros" / "ubuntu24.04"))
 
     def test_dry_run_shows_the_runner_a_build_would_use(self):
         import contextlib

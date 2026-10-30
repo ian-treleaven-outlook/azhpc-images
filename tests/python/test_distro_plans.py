@@ -152,9 +152,8 @@ class InstallShParityTests(unittest.TestCase):
                 for step in _planned(cfg):
                     if not step.script:
                         continue
-                    base = _REPO / (cfg.distro_dir if step.base == "distro" else "components")
                     with self.subTest(os=os_name, gpu=gpu, script=step.script):
-                        self.assertTrue((base / step.script).is_file())
+                        self.assertTrue(step.script_path(_REPO, cfg.distro_dir).is_file())
 
     def test_cleanup_is_install_sh_text_word_for_word_in_the_distro_folder(self):
         for os_name in PLANS:
@@ -211,6 +210,28 @@ class PreBootstrapTests(unittest.TestCase):
         self.assertIn("pre-step", lines[1])
         self.assertTrue(lines[1].endswith("(python, before install_utils.sh)"))
         self.assertTrue(lines[2].endswith("(python)"))
+
+
+class EndOfBuildStepTests(unittest.TestCase):
+    """The shared steps some install.sh scripts end with (AlmaLinux, Rocky, RHEL)."""
+
+    def test_clear_history_runs_the_utils_script_as_bash(self):
+        step = steps.clear_history()
+        self.assertEqual((step.op, step.script, step.base),
+                         ("clear-history", "clear_history.sh", "utils"))
+        self.assertEqual(step.runner, "bash")
+        self.assertTrue(step.script_path(_REPO, "distros/rocky9.x").is_file())
+
+    def test_system_upgrade_is_inline_and_returns_the_contract_codes(self):
+        step = steps.system_upgrade()
+        self.assertEqual((step.op, step.script, step.runner), ("upgrade-all-packages", "", "python"))
+        for upgraded, rc in ((True, 0), (False, 3)):
+            with self.subTest(upgraded=upgraded):
+                with mock.patch.object(steps, "upgrade_all_packages",
+                                       return_value=upgraded) as upgrade:
+                    self.assertEqual(step.action({"DISTRIBUTION": "almalinux9.8"}), rc)
+                upgrade.assert_called_once_with({"DISTRIBUTION": "almalinux9.8"},
+                                                "upgrade-all-packages")
 
 
 if __name__ == "__main__":
