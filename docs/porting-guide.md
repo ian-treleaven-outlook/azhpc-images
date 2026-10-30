@@ -504,7 +504,7 @@ the Ubuntu 22.04/24.04 `disable_auto_upgrade.sh`.
 Every port needs tests. This isn't ceremony: the parity suite is what caught 54
 commits of upstream drift during the last rebase.
 
-The suite is **1244 tests, ~standard library only** — `unittest` and
+The suite is **1249 tests, ~standard library only** — `unittest` and
 `unittest.mock`, no pytest. A few compare against real bash, git, jq or sed in
 the test environment and skip themselves when those tools are missing.
 
@@ -646,9 +646,11 @@ register it in `PLANS` and drop it from `PENDING`; add its folder to
 automatically: the same order, every script covered across representative
 SKUs, every script present, and the cleanup word for word.
 
-The Python code needs Python 3.10 or newer. AlmaLinux/Rocky 8 ship 3.6 and 9
-ship 3.9, so those plans need a newer `python3` on the build VM: Packer will
-install python3.11 or python3.12 and run `azhpc.py` with it (ADO 1008).
+The Python code needs Python 3.10 or newer. AlmaLinux/Rocky/RHEL 8 ship 3.6
+and 9 ship 3.9 as `python3`, so Packer's `packer/scripts/run_python_cli.sh`
+runs `azhpc.py` with the newer Python their `install_utils.sh` installs anyway
+(python3.12; python3.11 on Rocky 8), installing it first if needed (ADO 1008).
+Steps still call the system `python3` wherever bash does.
 
 ---
 ## 13. Where this is headed
