@@ -263,5 +263,13 @@ def run_script(lines: list[str], op: str, *, modules: list[str] | tuple[str, ...
 
 def command_exists(name: str, env=None) -> bool:
     """bash `command -v <name>`: True if `name` is on the build env's PATH."""
-    path = (env or os.environ).get("PATH")
-    return shutil.which(name, path=path) is not None
+    return command_path(name, env) is not None
+
+def command_path(name: str, env=None) -> str | None:
+    """bash `$(command -v <name>)`: its full path on the build env's PATH, or None."""
+    return shutil.which(name, path=(env or os.environ).get("PATH"))
+
+
+def cpu_count() -> int:
+    """bash `$(nproc)`: the CPUs this process may run on (its affinity set)."""
+    return len(os.sched_getaffinity(0))

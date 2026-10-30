@@ -176,19 +176,25 @@ belongs here.
 |---|---|---|
 | Read a component's config, failing clearly if keys are missing | `require_config(component, env, op, "version", "sha256")` → dict or None | `utils.component_config` |
 | Read a config without required keys | `config_for(component, env)` | `utils.component_config` |
-| Record an installed version | `write_component_version(component, version)` | `utils.component_config` |
+| Record an installed version | `record_version(component, version, op)` → bool | `utils.component_config` |
 | Record a git checkout's commit/ref | `write_repo_source_info(component, repo_dir, op, commit=, ref=)` | `utils.repo_source` |
+| Clone at a ref, check out a commit; resolve `.ref // .branch // v<version>` | `git_clone(url, op, ref=, commit=, dest=, cwd=)` → dir or None; `configured_ref(cfg, version)` | `utils.repo_source` |
 | Which distro is this? | `Distro.from_env(env)` → `.is_ubuntu`, `.is_azurelinux`, `.is_rhel_family`, `.is_rpm`, `.major` | `utils.distro` |
 | Install distro packages | `install_packages(packages, env, op, options=, cwd=)` → bool | `utils.package_installer` |
+| Refresh / remove / upgrade packages; installed version | `refresh_package_index(env, op)`, `remove_packages(pkgs, env, op, purge=)`, `update_packages(pkgs, env, op)`, `installed_package_version(pkg, env, op)` | `utils.package_installer` |
 | Pin packages against dnf updates | `dnf_pin_packages(packages, op, env=)` → bool | `utils.package_pinning` |
 | Download + SHA256 verify | `fetch_verified(url, sha256, op, dest_dir)` → Path or None | `utils.download` |
+| Download with no checksum (only where bash has none) | `fetch(url, op, dest_dir)` → Path or None | `utils.download` |
 | Unpack a tarball (with `tar`, like bash) | `extract_tarball(tarball, op, dest=, strip_components=, cwd=)` → bool | `utils.files` |
 | Write a file (`cat >`, `>>`), logging created/replaced/appended | `write_file(path, text, op, mode=, append=)` → bool | `utils.files` |
 | `rm -rf` | `remove_paths(*paths, op=)` | `utils.files` |
+| `mkdir -p`, `rm -rf && mkdir -p`, `mktemp -d`, `touch` | `make_dirs(*paths, op=)`, `fresh_dir(path, op)`, `make_temp_dir(op)`, `touch(path, op)` | `utils.files` |
+| `cp`, `cp <glob> <dir>`, `mv`, `ln -s[f]` | `copy_file(src, dest, op, mode=)`, `copy_files(pattern, dir, op)`, `move_file(src, dest, op)`, `symlink(target, link, op, force=)` | `utils.files` |
+| `sed -i` (keeps line endings and bytes); `grep -qxF ... \|\| echo ... >>` | `edit_file(path, transform, op, create=)`; `ensure_line(path, line, op)`, `file_has_line(path, line)` | `utils.files` |
 | Run a command / several, stopping at the first failure | `run(command, op, cwd=, env=)`, `run_all(commands, op, ...)` → bool | `utils.process` |
 | Run lines in one shell (e.g. after `module load`) | `run_script(lines, op, modules=["mpi/hpcx"], cwd=)` → bool | `utils.process` |
 | Run and parse stdout | `run_capture(command, op, ...)` → (rc, stdout) | `utils.process` |
-| `command -v` | `command_exists(name, env)` | `utils.process` |
+| `command -v`, `$(command -v x)`, `$(nproc)` | `command_exists(name, env)`, `command_path(name, env)`, `cpu_count()` | `utils.process` |
 | systemd | `systemctl(verb, *units, op=)`, `service_is_active(unit, op=)` | `utils.services` |
 | DKMS module check (bash `check_dkms_status`) | `check_dkms_status(module, op, ...)` | `utils.dkms` |
 | SKU capabilities | `sku_has_infiniband`, `sku_network_mode`, `sku_uses_ipoib`, `sku_family` | `utils.sku` |

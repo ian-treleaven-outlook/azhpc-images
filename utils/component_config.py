@@ -38,7 +38,7 @@ import os
 import re
 from pathlib import Path
 
-from utils.logger import log_error
+from utils.logger import log_error, log_info
 
 # The deployment targets bash understands (utils/set_properties.sh documents
 # them, and packer/variables.pkr.hcl validates against the same list). They are
@@ -154,6 +154,24 @@ def config_for(component, env):
         sku=env.get("SKU"),
         node_type=env.get("TARGET_NODE_TYPE", DEFAULT_NODE_TYPE),
     )
+
+
+def record_version(component, version, op) -> bool:
+    """write_component_version() for ports: True, or False with the error logged.
+
+    Records `component` = `version` in /opt/azurehpc/component_versions.txt
+    (bash write_component_version) and logs it, so a port doesn't need its own
+    try/except around the file write.
+    """
+    try:
+        path = write_component_version(component, version)
+    except OSError as exc:
+        log_error(op, f"could not record {component} {version}: {exc}",
+                  component=component, version=version)
+        return False
+    log_info(op, f"Recorded {component} {version}", component=component,
+             version=version, path=str(path))
+    return True
 
 
 def require_config(component, env, op, *keys):
