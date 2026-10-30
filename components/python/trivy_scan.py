@@ -49,7 +49,7 @@ import json
 import os
 import time
 
-from utils.files import extract_tarball, remove_paths
+from utils.files import extract_tarball, make_dirs, remove_paths
 from utils.logger import log_error, log_info
 from utils.process import run, run_capture
 
@@ -166,19 +166,6 @@ def _latest_version(env: dict[str, str]) -> str | None:
     return version
 
 
-# TODO(ADO 1001): toolkit candidate: make_dirs(*paths, op) -> bool (bash `mkdir -p`,
-# logging the path that failed).
-def _make_dirs(*paths: str) -> bool:
-    """bash `mkdir -p <paths>`."""
-    try:
-        for path in paths:
-            os.makedirs(path, exist_ok=True)
-    except OSError as exc:
-        log_error(_OP, f"could not create {exc.filename}: {exc}", path=str(exc.filename))
-        return False
-    return True
-
-
 def _download_trivy(version: str, architecture: str, env: dict[str, str]) -> bool:
     """Step 3: wget the tarball into the work dir, unpack it into trivy/, delete
     it and make the binary executable (bash's commands, run from the work dir)."""
@@ -187,12 +174,13 @@ def _download_trivy(version: str, architecture: str, env: dict[str, str]) -> boo
                cwd=_WORK_DIR, env=env):
         return False
     trivy_dir = os.path.join(_WORK_DIR, "trivy")
-    if not (_make_dirs(trivy_dir)
+    if not (make_dirs(trivy_dir, op=_OP)
             and extract_tarball(name, _OP, dest="trivy", cwd=_WORK_DIR, env=env)):
         return False
     binary = os.path.join(trivy_dir, "trivy")
     try:
-        os.remove(os.path.join(_WORK_DIR, name))                 # bash: rm (no -f)
+        # Stays local: bash's plain `rm` fails the step (remove_paths never does).
+        os.remove(os.path.join(_WORK_DIR, name))
         os.chmod(binary, os.stat(binary).st_mode | 0o111)        # chmod a+x
     except OSError as exc:
         log_error(_OP, f"could not prepare the trivy binary: {exc}", path=binary)
@@ -214,7 +202,7 @@ def install(env: dict[str, str]) -> int:
     if version is None:
         return 3
     try:
-        ok = (_make_dirs(_REPORT_DIR, _WORK_DIR)
+        ok = (make_dirs(_REPORT_DIR, _WORK_DIR, op=_OP)
               and _download_trivy(version, env.get("ARCHITECTURE", ""), env)
               and _run_scans(env))
     finally:
