@@ -172,9 +172,10 @@ class InstallTests(unittest.TestCase):
         """Run install(env) with its external effects mocked.
 
         Returns the exit code plus the mocks: run (exec_program), capture
-        (run_capture), record (write_component_version) and log_error.
-        install_packages()'s own error log is kept as self.pkg_error, and
-        require_config()'s as self.config_error.
+        (run_capture), record (utils.component_config.write_component_version)
+        and log_error. install_packages()'s own error log is kept as
+        self.pkg_error, and require_config()'s / record_version()'s as
+        self.config_error.
         """
         if list_result is None:
             output = _DNF_LIST if env["DISTRIBUTION"] == "azurelinux3.0" else _APT_LIST
@@ -184,9 +185,10 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error") as pkg_error, \
              mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(component_config, "log_info"), \
              mock.patch.object(install_nvshmem, "run_capture",
                                return_value=list_result) as capture, \
-             mock.patch.object(install_nvshmem, "write_component_version",
+             mock.patch.object(component_config, "write_component_version",
                                side_effect=write_error) as record, \
              mock.patch.object(install_nvshmem, "log_warn") as log_warn, \
              mock.patch.object(install_nvshmem, "log_error") as log_error:
@@ -315,12 +317,14 @@ class InstallTests(unittest.TestCase):
                 log_error.assert_called()
 
     def test_unwritable_versions_file_returns_3_without_raising(self):
-        rc, _, _, _, log_error = self._install(
+        rc, _, _, record, _ = self._install(
             _env("ubuntu24.04"),
             write_error=PermissionError("/opt/azurehpc: permission denied"))
 
         self.assertEqual(rc, 3)
-        self.assertIn("permission denied", log_error.call_args[0][1])
+        record.assert_called_once_with("NVSHMEM", "3.4.5-1")
+        # record_version() logs the failure itself.
+        self.assertIn("permission denied", self.config_error.call_args[0][1])
 
 
 # --------------------------------------------------------------------------- #

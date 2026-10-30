@@ -49,7 +49,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from utils.component_config import require_config, write_component_version
+from utils.component_config import record_version, require_config
 from utils.distro import Distro
 from utils.logger import log_error, log_info, log_warn
 from utils.package_installer import install_packages
@@ -194,19 +194,6 @@ def _installed_version(recipe: _Recipe, cuda_major: str,
     return version
 
 
-def _record(component: str, version: str) -> bool:
-    # TODO(ADO 1001): toolkit candidate: record_component_version(component,
-    # version, op) -> bool (write_component_version that logs instead of raising).
-    try:
-        write_component_version(component, version)
-    except OSError as exc:
-        log_error(_OP, f"could not record {component}={version}: {exc}")
-        return False
-    log_info(_OP, f"Recorded {component} version {version}",
-             component=component, version=version)
-    return True
-
-
 def install(env: dict[str, str]) -> int:
     """Install NVSHMEM for the image's CUDA major version and record its version.
 
@@ -234,6 +221,6 @@ def install(env: dict[str, str]) -> int:
     if not _install_packages(recipe, packages, env):
         return 3
     version = _installed_version(recipe, cuda_major, env)
-    if version is None or not _record("NVSHMEM", version):
+    if version is None or not record_version("NVSHMEM", version, _OP):
         return 3
     return 0
