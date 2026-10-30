@@ -7,8 +7,8 @@ Three kinds of test:
   * install() is tested against a small fake "tests" tree in a temporary
     directory. The module's path constants (destination, nvcc) are pointed
     into that directory, so real files are copied but nothing under /opt or
-    /usr is touched. gcc and nvcc never run: run_capture and exec_program are
-    replaced by mocks.
+    /usr is touched. gcc and nvcc never run: the module's run_capture and
+    utils.process.exec_program (where nvcc runs) are replaced by mocks.
   * component_env() must provide AZHPC_IMAGES_TEST_DIR, and the build plan
     must call this module.
 
@@ -28,7 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import copy_test_file
-from utils import build_config
+from utils import build_config, process
 from utils.build_config import BuildConfig, build_plan
 
 
@@ -122,7 +122,7 @@ class InstallTests(unittest.TestCase):
         tests can see that it is compiled before health_checks is copied.
         Returns (rc, run_capture mock, exec_program mock, log_error mock).
         """
-        def fake_nvcc(command, op, env=None):
+        def fake_nvcc(command, op, *, cwd=None, env=None):
             if nvcc_rc == 0:
                 Path(command[-1]).write_text("binary\n")
             return nvcc_rc
@@ -131,7 +131,7 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(copy_test_file, "_NVCC", str(self.nvcc)), \
              mock.patch.object(copy_test_file, "run_capture",
                                return_value=gcc_result) as gcc, \
-             mock.patch.object(copy_test_file, "exec_program",
+             mock.patch.object(process, "exec_program",
                                side_effect=fake_nvcc) as nvcc, \
              mock.patch.object(copy_test_file, "log_error") as log_error:
             rc = copy_test_file.install(self.env if env is None else env)
@@ -173,7 +173,7 @@ class InstallTests(unittest.TestCase):
                                     env=self.env)
         nvcc.assert_called_once_with(
             [str(self.nvcc), "-lnuma", self.cufile, "-o", self.outfile],
-            "copy-test-file", env=self.env)
+            "copy-test-file", cwd=None, env=self.env)
         # The binary is written next to its source (as in bash), then copied.
         self.assertTrue(Path(self.outfile).is_file())
         self.assertEqual(
@@ -189,7 +189,7 @@ class InstallTests(unittest.TestCase):
         nvcc.assert_called_once_with(
             [str(self.nvcc), "--compiler-bindir", "/opt/gcc-9.2.0/bin",
              "-lnuma", self.cufile, "-o", self.outfile],
-            "copy-test-file", env=self.env)
+            "copy-test-file", cwd=None, env=self.env)
 
     def test_merges_into_an_existing_destination(self):
         # Like cp -r: existing files stay, matching files are overwritten.
@@ -282,11 +282,12 @@ class InstallTests(unittest.TestCase):
     def test_compile_failure_returns_3_before_copying_health_checks(self):
         self.nvcc.write_text("")
 
-        rc, _, _, log_error = self._install(nvcc_rc=1)
+        rc, _, nvcc, log_error = self._install(nvcc_rc=1)
 
         self.assertEqual(rc, 3)
+        nvcc.assert_called_once()
         self.assertFalse((self.dest / "health_checks").exists())
-        log_error.assert_called_once()
+        log_error.assert_not_called()      # exec_program logs the failed command
 
     def test_health_checks_copy_failure_returns_3(self):
         # A regular file where the health_checks directory should go.
