@@ -170,13 +170,18 @@ class MpifileutilsDepsTests(unittest.TestCase):
         self.error.assert_called_once()
 
 
-# install_nccl.install_deps runs install_nccl.sh's exact apt/dnf commands (one
-# command per bash line, stopping at the first failure), chosen by DISTRIBUTION.
+# install_nccl.install_deps installs install_nccl.sh's package lists with
+# install_packages() (one command per bash line, stopping at the first
+# failure), chosen by DISTRIBUTION.
 class NcclDepsTests(unittest.TestCase):
+    _APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+    _DNF = ["dnf", "install", "-y"]
+
     def _deps(self, distro, rc=0):
-        with mock.patch.object(install_nccl, "exec_program", return_value=rc) as run, \
-             mock.patch.object(install_nccl, "log_info"), \
-             mock.patch.object(install_nccl, "log_error"):
+        with mock.patch.object(package_installer, "exec_program", return_value=rc) as run, \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error"), \
+             mock.patch.object(install_nccl, "log_info"):
             result = install_nccl.install_deps(env={"DISTRIBUTION": distro})
         return result, [c.args[0] for c in run.call_args_list]
 
@@ -187,30 +192,30 @@ class NcclDepsTests(unittest.TestCase):
                 rc, commands = self._deps(distro)
                 self.assertEqual(rc, 0)
                 self.assertEqual(commands, [
-                    ["apt", "install", "-y", "build-essential", "devscripts",
-                     "debhelper", "fakeroot", "patchelf"],
-                    ["apt", "install", "-y", "zlib1g-dev"]])
+                    [*self._APT, "build-essential", "devscripts", "debhelper", "fakeroot",
+                     "patchelf"],
+                    [*self._APT, "zlib1g-dev"]])
 
     def test_ubuntu26_04_commands(self):
         rc, commands = self._deps("ubuntu26.04")
         self.assertEqual(rc, 0)
         self.assertEqual(commands, [
-            ["apt", "install", "-y", "build-essential", "patchelf", "zlib1g-dev"]])
+            [*self._APT, "build-essential", "patchelf", "zlib1g-dev"]])
 
     def test_azure_linux_commands(self):
         rc, commands = self._deps("azurelinux3.0")
         self.assertEqual(rc, 0)
         self.assertEqual(commands, [
-            ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "autoconf",
-             "automake", "git", "libtool", "patchelf"]])
+            [*self._DNF, "rpm-build", "rpmdevtools", "autoconf", "automake", "git",
+             "libtool", "patchelf"]])
 
     def test_rhel_family_commands(self):
-        for distro in ("almalinux9.8", "rocky8.10", ""):
+        for distro in ("almalinux9.8", "rocky8.10", "rhel9.8"):
             with self.subTest(distro=distro):
                 rc, commands = self._deps(distro)
                 self.assertEqual(rc, 0)
                 self.assertEqual(commands, [
-                    ["dnf", "install", "-y", "rpm-build", "rpmdevtools", "patchelf"]])
+                    [*self._DNF, "rpm-build", "rpmdevtools", "patchelf"]])
 
     def test_failure_returns_3_and_stops(self):
         rc, commands = self._deps("ubuntu24.04", rc=100)

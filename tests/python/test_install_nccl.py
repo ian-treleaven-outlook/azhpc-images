@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from components.python import install_nccl
+from utils import package_installer
 from utils.build_config import BuildConfig, build_plan
 
 _V = "2.30.4-1"
@@ -41,17 +42,20 @@ _NPROC = 96
 _TARBALL = f"v{_V}.tar.gz"
 _URL = f"https://github.com/NVIDIA/nccl/archive/refs/tags/{_TARBALL}"
 
+# What install_packages() runs on Ubuntu / the RPM distros.
+_APT = ["apt-get", "install", "-y", "-o", "Dpkg::Use-Pty=0"]
+_DNF = ["dnf", "install", "-y"]
+
 _UBUNTU_DEPS = [
-    ["apt", "install", "-y", "build-essential", "devscripts", "debhelper", "fakeroot",
-     "patchelf"],
-    ["apt", "install", "-y", "zlib1g-dev"]]
-_UBUNTU2604_DEPS = [["apt", "install", "-y", "build-essential", "patchelf", "zlib1g-dev"]]
-_AZL_DEPS = [["dnf", "install", "-y", "rpm-build", "rpmdevtools", "autoconf", "automake",
-              "git", "libtool", "patchelf"]]
-_RHEL_DEPS = [["dnf", "install", "-y", "rpm-build", "rpmdevtools", "patchelf"]]
+    [*_APT, "build-essential", "devscripts", "debhelper", "fakeroot", "patchelf"],
+    [*_APT, "zlib1g-dev"]]
+_UBUNTU2604_DEPS = [[*_APT, "build-essential", "patchelf", "zlib1g-dev"]]
+_AZL_DEPS = [[*_DNF, "rpm-build", "rpmdevtools", "autoconf", "automake", "git", "libtool",
+              "patchelf"]]
+_RHEL_DEPS = [[*_DNF, "rpm-build", "rpmdevtools", "patchelf"]]
 
 _BUILD = [["tar", "-xvf", _TARBALL], ["make", "-j", "95", "src.build"]]
-_APT_NCCL = [["apt-get", "install", "-y", "libnccl2", "libnccl-dev"],
+_APT_NCCL = [[*_APT, "libnccl2", "libnccl-dev"],
              ["apt-mark", "hold", "libnccl2"], ["apt-mark", "hold", "libnccl-dev"]]
 _TESTS_CLONE = ["git", "clone", "https://github.com/NVIDIA/nccl-tests.git"]
 _PURGE = ["apt-get", "purge", "-y", "patchelf"]
@@ -288,6 +292,9 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(install_nccl, "config_for",
                                side_effect=lambda c, e: configs[c]), \
              mock.patch.object(install_nccl, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "exec_program", side_effect=self._fake_exec), \
+             mock.patch.object(package_installer, "log_info"), \
+             mock.patch.object(package_installer, "log_error") as install_error, \
              mock.patch.object(install_nccl, "run_capture", side_effect=self._fake_capture), \
              mock.patch.object(install_nccl, "download_and_verify",
                                side_effect=self._fake_download), \
@@ -302,6 +309,7 @@ class InstallTests(unittest.TestCase):
             result = install_nccl.install(env)
         self.pin, self.record, self.source_mock = pin, record, source
         self.info, self.warn, self.error = info, warn, error
+        self.install_error = install_error
         return result
 
     def _commands(self):
@@ -315,8 +323,8 @@ class InstallTests(unittest.TestCase):
         suffix = f"_{_V}+cuda{_CUDA}_{arch_distro}.deb"
         return (_UBUNTU_DEPS + _BUILD + [
             ["make", "pkg.debian.build"],
-            ["apt", "install", "-y", f"./libnccl2{suffix}"], ["apt-mark", "hold", "libnccl2"],
-            ["apt", "install", "-y", f"./libnccl-dev{suffix}"],
+            [*_APT, f"./libnccl2{suffix}"], ["apt-mark", "hold", "libnccl2"],
+            [*_APT, f"./libnccl-dev{suffix}"],
             ["apt-mark", "hold", "libnccl-dev"],
         ] + (_sharp(distro) if sharp else []) + _tests()
             + ([_PURGE] if distro == "ubuntu22.04" else []))
@@ -324,7 +332,7 @@ class InstallTests(unittest.TestCase):
     @staticmethod
     def _azl_commands(arch="aarch64"):
         return _AZL_DEPS + _BUILD + [["make", "pkg.redhat.build"]] + [
-            ["dnf", "install", "-y", f"./build/pkg/rpm/{arch}/{n}-{_V}+cuda{_CUDA}.{arch}.rpm"]
+            [*_DNF, f"./build/pkg/rpm/{arch}/{n}-{_V}+cuda{_CUDA}.{arch}.rpm"]
             for n in ("libnccl", "libnccl-devel", "libnccl-static")
         ] + _sharp("azurelinux3.0") + _tests()
 
@@ -442,7 +450,7 @@ class InstallTests(unittest.TestCase):
         rc = self._install("azurelinux3.0", rpm_names=("libnccl", "libnccl-devel"))
         self.assertEqual(rc, 0)       # the mocked dnf "accepts" it; real dnf would fail
         pattern = f"./build/pkg/rpm/x86_64/libnccl-static-{_V}+cuda*.x86_64.rpm"
-        self.assertIn(["dnf", "install", "-y", pattern], self._commands())
+        self.assertIn([*_DNF, pattern], self._commands())
         self.warn.assert_called_once()
         self.assertEqual(self.warn.call_args.kwargs["pattern"], pattern)
 
@@ -610,7 +618,8 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual("NCCL-RDMA_SHARP_PLUGIN" in versions,
                                      index > sharp_build)
                     self.assertEqual("NCCL" in versions, command == _PURGE)
-                    self.error.assert_called()
+                    # install_packages() logs failed installs itself.
+                    self.assertTrue(self.error.called or self.install_error.called)
                     self.assertFalse(os.path.exists(self.work))
 
     def test_download_failure_returns_3(self):
