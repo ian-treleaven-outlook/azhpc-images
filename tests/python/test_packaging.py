@@ -130,49 +130,44 @@ class PackageInstallerTests(unittest.TestCase):
         logged.assert_called_once()   # "no package manager detected" is reported as an error
 
 
-# install_deps picks a different dependency list depending on the package manager
-# (apt names vs rpm names). We give it a fake installer so we can assert *which* list
-# it chose without doing any real installs.
+# install_mpifileutils.install_deps runs install_mpifileutils.sh's exact apt-get/dnf
+# command (upstream 0c2b8f9), chosen by DISTRIBUTION like bash's if/elif/else.
 class MpifileutilsDepsTests(unittest.TestCase):
-    def _fake_installer(self, manager_name, succeeds=True):
-        # stand-in PackageInstaller: .manager selects the branch, .install_package just
-        # reports success/failure so we can inspect the chosen deps.
-        fake = mock.Mock()
-        fake.manager = (None if manager_name is None
-                        else PackageManager(name=manager_name,
-                                            path=f"/usr/bin/{manager_name}"))
-        fake.install_package.return_value = succeeds
-        return fake
+    def _deps(self, distro, rc=0):
+        with mock.patch.object(install_mpifileutils, "exec_program", return_value=rc) as run, \
+             mock.patch.object(install_mpifileutils, "log_info") as info, \
+             mock.patch.object(install_mpifileutils, "log_error") as error:
+            result = install_mpifileutils.install_deps(env={"DISTRIBUTION": distro})
+        self.info, self.error = info, error
+        return result, [c.args[0] for c in run.call_args_list]
 
-    def test_selects_apt_dep_list(self):
-        fake = self._fake_installer("apt-get")
-        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
-            rc = install_mpifileutils.install_deps(env={})
-        self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["libbz2-dev", "libattr1-dev", "libarchive-dev", "libssl-dev", "libcap-dev"]
-        )
+    def test_ubuntu_command(self):
+        for distro in ("ubuntu22.04", "ubuntu24.04", "ubuntu26.04"):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["apt-get", "install", "-y", "libbz2-dev", "libattr1-dev",
+                     "libarchive-dev", "libssl-dev", "libcap-dev"]])
+                self.assertEqual(self.info.call_args.kwargs["branch"], "ubuntu")
 
-    def test_selects_rpm_dep_list(self):
-        fake = self._fake_installer("tdnf")
-        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
-            rc = install_mpifileutils.install_deps(env={})
-        self.assertEqual(rc, 0)
-        fake.install_package.assert_called_once_with(
-            ["bzip2-devel", "libattr-devel", "libarchive-devel"]
-        )
+    def test_azure_linux_and_rhel_family_command(self):
+        for distro, branch in (("azurelinux3.0", "azurelinux"), ("almalinux9.8", "rhel-family"),
+                               ("rocky8.10", "rhel-family"), ("rhel10.0", "rhel-family"),
+                               ("", "rhel-family")):
+            with self.subTest(distro=distro):
+                rc, commands = self._deps(distro)
+                self.assertEqual(rc, 0)
+                self.assertEqual(commands, [
+                    ["dnf", "install", "-y", "bzip2-devel", "libattr-devel",
+                     "libarchive-devel"]])
+                self.assertEqual(self.info.call_args.kwargs["branch"], branch)
 
     def test_returns_3_when_install_fails(self):
-        fake = self._fake_installer("apt-get", succeeds=False)
-        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
-            rc = install_mpifileutils.install_deps(env={})
+        rc, commands = self._deps("ubuntu24.04", rc=100)
         self.assertEqual(rc, 3)
-
-    def test_returns_3_when_no_manager(self):
-        fake = self._fake_installer(None)
-        with mock.patch.object(install_mpifileutils, "PackageInstaller", return_value=fake):
-            rc = install_mpifileutils.install_deps(env={})
-        self.assertEqual(rc, 3)
+        self.assertEqual(len(commands), 1)
+        self.error.assert_called_once()
 
 
 # install_nccl.install_deps runs install_nccl.sh's exact apt/dnf commands (one
@@ -264,6 +259,8 @@ class MpifileutilsConfigTests(unittest.TestCase):
 
 
 class MpifileutilsInstallTests(unittest.TestCase):
+    # The full command-list tests (tar, build, rm -rf, ls -la) are in
+    # test_install_mpifileutils.py; these cover the early exits.
     def _env(self):
         return {
             "COMPONENT_VERSIONS": json.dumps({
@@ -279,25 +276,6 @@ class MpifileutilsInstallTests(unittest.TestCase):
             "SKU": "A100",
             "TARGET_NODE_TYPE": "azure_vm_regular",
         }
-
-    def test_install_orchestrates_all_steps(self):
-        # Happy path. Stub out every real step — deps, download, the build subprocess,
-        # the version write, and the tar/mkdir/cleanup calls — so nothing actually runs,
-        # then confirm install() drove the key steps once each and returned 0.
-        env = self._env()
-        with mock.patch.object(install_mpifileutils, "install_deps", return_value=0) as deps, \
-             mock.patch.object(install_mpifileutils, "download_and_verify",
-                               return_value="/tmp/mpifileutils-src/mpifileutils-v0.12.tgz") as dl, \
-             mock.patch.object(install_mpifileutils, "exec_program", return_value=0) as build, \
-             mock.patch.object(install_mpifileutils, "write_component_version"), \
-             mock.patch("tarfile.open"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("shutil.rmtree"):
-            rc = install_mpifileutils.install(env)
-        self.assertEqual(rc, 0)
-        deps.assert_called_once()
-        dl.assert_called_once()
-        build.assert_called_once()
 
     def test_install_fails_when_no_version(self):
         env = {"COMPONENT_VERSIONS": json.dumps({})}
