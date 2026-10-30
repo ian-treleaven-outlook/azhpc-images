@@ -529,14 +529,16 @@ class MonitoringToolsTests(unittest.TestCase):
 
     def _install(self, env, *, fail=None, script_mode=0o755, real_configure=False,
                  download_error=None):
-        """Run install(env) with commands faked (also those run by
-        install_packages, in the same record). The fake tar creates
+        """Run install(env) with commands faked where the toolkit runs them
+        (utils.process and utils.package_installer exec_program, one record)
+        and the download faked in utils.download. The fake tar creates
         Moneo/linux_service/configure_service.sh (mode `script_mode`).
         fail: {first word of command: exit code}. Returns (rc, calls, mocks),
         calls being [(command, cwd)]."""
+        from utils import component_config, download, files, process
         fail = fail or {}
         calls = []
-        real_exec = install_monitoring_tools.exec_program
+        real_exec = process.exec_program
 
         def fake_download(url, sha256, dest_dir="."):
             if download_error:
@@ -551,7 +553,8 @@ class MonitoringToolsTests(unittest.TestCase):
             self.assertIs(env, self.env)
             calls.append((command, cwd))
             if command[0] == "tar" and "tar" not in fail:
-                script = os.path.join(cwd, command[-1], "linux_service",
+                dest = command[command.index("-C") + 1]
+                script = os.path.join(cwd, dest, "linux_service",
                                       "configure_service.sh")
                 os.makedirs(os.path.dirname(script))
                 with open(script, "w") as handle:
@@ -562,24 +565,27 @@ class MonitoringToolsTests(unittest.TestCase):
             return fail.get(command[0], 0)
 
         self.env = env
-        with mock.patch.object(install_monitoring_tools, "download_and_verify",
-                               side_effect=fake_download) as download, \
-             mock.patch.object(install_monitoring_tools, "exec_program",
-                               side_effect=fake_exec), \
+        with mock.patch.object(download, "download_and_verify",
+                               side_effect=fake_download) as download_mock, \
+             mock.patch.object(download, "log_error"), \
+             mock.patch.object(component_config, "log_error") as config_error, \
+             mock.patch.object(process, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "exec_program", side_effect=fake_exec), \
              mock.patch.object(package_installer, "log_info"), \
              mock.patch.object(package_installer, "log_error"), \
+             mock.patch.object(files, "log_info") as files_info, \
              mock.patch.object(install_monitoring_tools, "write_component_version") as wcv, \
              mock.patch.object(install_monitoring_tools, "log_info") as info, \
              mock.patch.object(install_monitoring_tools, "log_warn") as warn, \
              mock.patch.object(install_monitoring_tools, "log_error") as error:
             rc = install_monitoring_tools.install(env)
-        return rc, calls, {"download": download, "record": wcv, "info": info,
-                           "warn": warn, "error": error}
+        return rc, calls, {"download": download_mock, "record": wcv, "info": info,
+                           "warn": warn, "error": error, "files_info": files_info,
+                           "config_error": config_error}
 
     def _expected(self, pip):
         return [(pip, None),
-                (["tar", "-xvf", "v0.3.5.tar.gz", "--strip-components=1", "-C", "Moneo"],
+                (["tar", "-xf", "v0.3.5.tar.gz", "-C", "Moneo", "--strip-components=1"],
                  self.tools),
                 (["./configure_service.sh"], self.service_dir)]
 
@@ -599,7 +605,7 @@ class MonitoringToolsTests(unittest.TestCase):
                 self.assertEqual(install_monitoring_tools.pip_package_options(distro),
                                  options)
 
-    def test_ensure_line_matches_grep_qxF(self):
+    def test_add_line_once_matches_grep_qxF(self):
         line = "alias x='y'"
         cases = [
             # (existing content, appended?, final content)
@@ -617,8 +623,11 @@ class MonitoringToolsTests(unittest.TestCase):
                 if before is not None:
                     with open(self.bashrc, "wb") as handle:
                         handle.write(before)
-                self.assertIs(install_monitoring_tools.ensure_line(self.bashrc, line),
-                              appended)
+                self.assertIs(install_monitoring_tools.has_line(self.bashrc, line),
+                              not appended)
+                with mock.patch("utils.files.log_info"), \
+                     mock.patch.object(install_monitoring_tools, "log_info"):
+                    self.assertTrue(install_monitoring_tools.add_line_once(self.bashrc, line))
                 with open(self.bashrc, "rb") as handle:
                     self.assertEqual(handle.read(), after)
 
@@ -656,7 +665,8 @@ class MonitoringToolsTests(unittest.TestCase):
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")
         messages = [c.args[1] for c in m["info"].call_args_list]
-        self.assertIn(f"Appended the moneo alias to {self.bashrc}", messages)
+        self.assertEqual(m["files_info"].call_args.kwargs,
+                         {"path": self.bashrc, "action": "created"})
         self.assertIn("Recorded MONEO version 0.3.5", messages)
         self.assertEqual(m["info"].call_args_list[-1].args[1], "Moneo 0.3.5 installed")
 
@@ -671,8 +681,9 @@ class MonitoringToolsTests(unittest.TestCase):
         self.assertEqual(m["warn"].call_args.kwargs, {"path": self.moneo})
         with open(self.bashrc) as handle:
             self.assertEqual(handle.read(), self._ALIAS + "\n")      # not appended twice
-        self.assertIn(f"{self.bashrc} already has the moneo alias",
+        self.assertIn(f"{self.bashrc} already has the line",
                       [c.args[1] for c in m["info"].call_args_list])
+        m["files_info"].assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "runs a real script")
     def test_configure_service_runs_from_its_folder_with_the_exec_bit(self):
@@ -716,7 +727,7 @@ class MonitoringToolsTests(unittest.TestCase):
                 self.assertEqual(rc, 3)
                 self.assertEqual(calls, [])
                 m["download"].assert_not_called()
-                m["error"].assert_called_once()
+                m["config_error"].assert_called_once()
 
 
 class AznfsTests(unittest.TestCase):
